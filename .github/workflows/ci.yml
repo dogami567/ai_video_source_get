@@ -1,0 +1,88 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-package:
+    name: build-and-package (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: vidunpack-toolserver
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Build web
+        run: npm -w @vidunpack/web run build
+
+      - name: Build orchestrator
+        run: npm -w @vidunpack/orchestrator run build
+
+      - name: Test toolserver
+        run: cargo test -p vidunpack-toolserver
+
+      - name: Build toolserver (release)
+        run: cargo build -p vidunpack-toolserver --release
+
+      - name: Prepare package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf package
+          mkdir -p package/apps/web package/apps/orchestrator package/bin package/packaging
+
+          # runtime env template + run instructions
+          cp .env.example package/
+          cp README.md package/
+          cp packaging/RUNNING.md package/RUNNING.md
+          cp packaging/run.ps1 package/run.ps1
+          cp packaging/run.sh package/run.sh
+
+          # built outputs
+          cp -R apps/web/dist package/apps/web/dist
+          cp -R apps/orchestrator/dist package/apps/orchestrator/dist
+          cp apps/orchestrator/package.json package/apps/orchestrator/package.json
+          cp apps/web/package.json package/apps/web/package.json
+
+          # minimal runtime deps install metadata (user runs npm ci --omit=dev)
+          cp package.json package/
+          cp package-lock.json package/
+
+          # toolserver binary
+          if [[ -f target/release/vidunpack-toolserver.exe ]]; then
+            cp target/release/vidunpack-toolserver.exe package/bin/vidunpack-toolserver.exe
+          else
+            cp target/release/vidunpack-toolserver package/bin/vidunpack-toolserver
+            chmod +x package/bin/vidunpack-toolserver || true
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vidunpack-${{ runner.os }}-${{ github.sha }}
+          path: package
+          if-no-files-found: error
+

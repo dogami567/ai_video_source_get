@@ -18,4 +18,16 @@ npm run dev
 - Rust（后端工具服务）
 - ffmpeg（后续媒体处理会用到）
 
-> CI 打包与跨平台发布在后续 issue 中完善。
+## GitHub Actions 打包（Windows / macOS）
+
+仓库的 CI 会在 Push/PR 时构建并产出可下载的 artifacts（包含 web UI + orchestrator + toolserver 二进制）。
+
+下载并解压后：
+
+```powershell
+copy .env.example .env
+npm ci --omit=dev
+powershell -ExecutionPolicy Bypass -File .\run.ps1
+```
+
+macOS 参考 `RUNNING.md`。

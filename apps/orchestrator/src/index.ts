@@ -1,6 +1,8 @@
 import path from "node:path";
 import process from "node:process";
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import { Readable } from "node:stream";
 
 import "dotenv/config";
 import dotenv from "dotenv";
@@ -396,6 +398,62 @@ app.post("/api/projects/:projectId/exa/fetch", async (req, res) => {
     return res.status(500).json({ ok: false, error: message });
   }
 });
+
+// Production-style routing helpers:
+// - Proxy /tool/* to the Rust toolserver (needed for built web bundles)
+// - Serve built web UI from apps/web/dist if present
+app.use("/tool", async (req, res) => {
+  try {
+    const targetPath = req.originalUrl.replace(/^\/tool/, "");
+    const url = `${toolserverBaseUrl}${targetPath}`;
+
+    const headers: Record<string, string> = {};
+    for (const [k, v] of Object.entries(req.headers)) {
+      const key = k.toLowerCase();
+      if (key === "host" || key === "connection" || key === "content-length") continue;
+      if (typeof v === "string") headers[k] = v;
+      else if (Array.isArray(v) && v.length > 0) headers[k] = v.join(", ");
+    }
+
+    const method = req.method.toUpperCase();
+    let body: any = undefined;
+    let duplex: any = undefined;
+    if (method !== "GET" && method !== "HEAD") {
+      if (req.is("application/json") && req.body != null) {
+        body = JSON.stringify(req.body);
+      } else {
+        body = req;
+        duplex = "half";
+      }
+    }
+
+    const upstream = await fetch(url, { method, headers, body, duplex } as any);
+    res.status(upstream.status);
+    upstream.headers.forEach((value, key) => {
+      if (key.toLowerCase() === "transfer-encoding") return;
+      res.setHeader(key, value);
+    });
+
+    if (upstream.body) {
+      Readable.fromWeb(upstream.body as any).pipe(res);
+    } else {
+      res.end();
+    }
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    res.status(502).json({ ok: false, error: `tool proxy failed: ${message}` });
+  }
+});
+
+const webDistDir = path.resolve(repoRoot, "apps/web/dist");
+const webIndexHtml = path.resolve(webDistDir, "index.html");
+if (existsSync(webIndexHtml)) {
+  app.use(express.static(webDistDir));
+  app.get("*", (req, res, next) => {
+    if (req.path.startsWith("/api") || req.path.startsWith("/tool")) return next();
+    return res.sendFile(webIndexHtml);
+  });
+}
 
 const port = Number(process.env.ORCHESTRATOR_PORT || 6790);
 app.listen(port, "127.0.0.1", () => {
