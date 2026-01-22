@@ -37,6 +37,10 @@ body {
   color: #6ee7b7;
 }
 
+.warn {
+  color: #fbbf24;
+}
+
 .error {
   color: #fb7185;
 }
@@ -45,3 +49,153 @@ body {
   color: #9bb0c9;
 }
 
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+}
+
+.row {
+  display: flex;
+  flex-wrap: wrap;
+}
+
+.row-gap {
+  gap: 10px;
+}
+
+.row-center {
+  align-items: center;
+}
+
+.row-between {
+  justify-content: space-between;
+}
+
+.row-right {
+  justify-content: flex-end;
+}
+
+.grid {
+  display: grid;
+  gap: 12px;
+}
+
+.grid-2 {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+@media (max-width: 720px) {
+  .grid-2 {
+    grid-template-columns: 1fr;
+  }
+}
+
+.btn {
+  appearance: none;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.1);
+  color: #e7eef8;
+  border-radius: 10px;
+  padding: 10px 12px;
+  cursor: pointer;
+}
+
+.btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.btn-secondary {
+  background: transparent;
+}
+
+.input {
+  flex: 1 1 280px;
+  min-width: 240px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.06);
+  padding: 10px 12px;
+  color: #e7eef8;
+}
+
+.divider {
+  height: 1px;
+  background: rgba(255, 255, 255, 0.08);
+  margin: 16px 0;
+}
+
+.pill {
+  padding: 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.pill-title {
+  font-size: 12px;
+  color: #9bb0c9;
+  margin-bottom: 6px;
+}
+
+.table {
+  margin-top: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+.table-row {
+  display: grid;
+  grid-template-columns: 1fr 180px 120px;
+  gap: 12px;
+  padding: 10px 12px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  align-items: center;
+}
+
+.table-row:first-child {
+  border-top: none;
+}
+
+.table-head {
+  background: rgba(255, 255, 255, 0.04);
+  color: #9bb0c9;
+  font-size: 12px;
+}
+
+.right {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.list {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.toggle {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: #9bb0c9;
+  user-select: none;
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+
+.modal {
+  width: 100%;
+  max-width: 560px;
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: #0b0f14;
+  padding: 16px;
+}

@@ -1,18 +1,19 @@
 use anyhow::Context;
 use axum::{
-    extract::{Path, State},
+    extract::{DefaultBodyLimit, Multipart, Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
     net::SocketAddr,
     path::{Path as FsPath, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
+use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 #[derive(Serialize)]
@@ -54,6 +55,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(health))
         .route("/projects", post(create_project).get(list_projects))
         .route("/projects/{id}", get(get_project))
+        .route("/projects/{id}/consent", get(get_consent).post(upsert_consent))
+        .route("/projects/{id}/artifacts", get(list_artifacts))
+        .route("/projects/{id}/inputs/url", post(add_input_url))
+        .route("/projects/{id}/media/local", post(import_local_video))
+        .layer(DefaultBodyLimit::disable())
         .with_state(state);
 
     let port: u16 = std::env::var("TOOLSERVER_PORT")
@@ -289,6 +295,378 @@ async fn get_project(State(state): State<AppState>, Path(id): Path<String>) -> A
         Some(p) => Ok(Json(p)),
         None => Err(AppError::NotFound("project not found".to_string())),
     }
+}
+
+#[derive(Serialize)]
+struct ConsentResponse {
+    project_id: String,
+    consented: bool,
+    auto_confirm: bool,
+    updated_at_ms: i64,
+}
+
+async fn get_consent(State(state): State<AppState>, Path(project_id): Path<String>) -> AppResult<Json<ConsentResponse>> {
+    if project_id.trim().is_empty() {
+        return Err(AppError::BadRequest("missing project id".to_string()));
+    }
+
+    let db_path = state.db_path.clone();
+    let consent = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<ConsentResponse>> {
+        let conn = Connection::open(&db_path)?;
+
+        let exists: bool =
+            conn.query_row("SELECT 1 FROM projects WHERE id = ?1", [&project_id], |_row| Ok(()))
+                .optional()?
+                .is_some();
+        if !exists {
+            return Ok(None);
+        }
+
+        let mut stmt = conn.prepare("SELECT consented, auto_confirm, updated_at_ms FROM consents WHERE project_id = ?1")?;
+        let mut rows = stmt.query([&project_id])?;
+        if let Some(row) = rows.next()? {
+            let consented_i: i64 = row.get(0)?;
+            let auto_i: i64 = row.get(1)?;
+            let updated_at_ms: i64 = row.get(2)?;
+            return Ok(Some(ConsentResponse {
+                project_id,
+                consented: consented_i != 0,
+                auto_confirm: auto_i != 0,
+                updated_at_ms,
+            }));
+        }
+
+        Ok(Some(ConsentResponse {
+            project_id,
+            consented: false,
+            auto_confirm: false,
+            updated_at_ms: 0,
+        }))
+    })
+    .await
+    .context("get_consent task failed")??;
+
+    match consent {
+        Some(c) => Ok(Json(c)),
+        None => Err(AppError::NotFound("project not found".to_string())),
+    }
+}
+
+#[derive(Deserialize)]
+struct UpsertConsentRequest {
+    consented: Option<bool>,
+    auto_confirm: Option<bool>,
+}
+
+async fn upsert_consent(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    Json(req): Json<UpsertConsentRequest>,
+) -> AppResult<Json<ConsentResponse>> {
+    if project_id.trim().is_empty() {
+        return Err(AppError::BadRequest("missing project id".to_string()));
+    }
+
+    let db_path = state.db_path.clone();
+    let consent = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<ConsentResponse>> {
+        let conn = Connection::open(&db_path)?;
+
+        let exists: bool =
+            conn.query_row("SELECT 1 FROM projects WHERE id = ?1", [&project_id], |_row| Ok(()))
+                .optional()?
+                .is_some();
+        if !exists {
+            return Ok(None);
+        }
+
+        let mut stmt = conn.prepare("SELECT consented, auto_confirm FROM consents WHERE project_id = ?1")?;
+        let mut rows = stmt.query([&project_id])?;
+        let mut existing_consented = false;
+        let mut existing_auto_confirm = false;
+        if let Some(row) = rows.next()? {
+            let consented_i: i64 = row.get(0)?;
+            let auto_i: i64 = row.get(1)?;
+            existing_consented = consented_i != 0;
+            existing_auto_confirm = auto_i != 0;
+        }
+
+        let consented = req.consented.unwrap_or(existing_consented);
+        let mut auto_confirm = req.auto_confirm.unwrap_or(existing_auto_confirm);
+        if !consented {
+            auto_confirm = false;
+        }
+
+        let updated_at_ms = now_ms();
+        conn.execute(
+            "INSERT INTO consents (project_id, consented, auto_confirm, updated_at_ms) VALUES (?1, ?2, ?3, ?4)\n             ON CONFLICT(project_id) DO UPDATE SET consented = excluded.consented, auto_confirm = excluded.auto_confirm, updated_at_ms = excluded.updated_at_ms",
+            params![
+                &project_id,
+                if consented { 1 } else { 0 },
+                if auto_confirm { 1 } else { 0 },
+                updated_at_ms
+            ],
+        )?;
+
+        conn.execute(
+            "INSERT INTO events (project_id, ts_ms, level, message, data_json) VALUES (?1, ?2, 'info', 'consent_updated', ?3)",
+            params![
+                &project_id,
+                updated_at_ms,
+                serde_json::json!({ "consented": consented, "auto_confirm": auto_confirm }).to_string()
+            ],
+        )?;
+
+        Ok(Some(ConsentResponse {
+            project_id,
+            consented,
+            auto_confirm,
+            updated_at_ms,
+        }))
+    })
+    .await
+    .context("upsert_consent task failed")??;
+
+    match consent {
+        Some(c) => Ok(Json(c)),
+        None => Err(AppError::NotFound("project not found".to_string())),
+    }
+}
+
+#[derive(Serialize)]
+struct ArtifactResponse {
+    id: String,
+    project_id: String,
+    kind: String,
+    path: String,
+    created_at_ms: i64,
+}
+
+async fn list_artifacts(State(state): State<AppState>, Path(project_id): Path<String>) -> AppResult<Json<Vec<ArtifactResponse>>> {
+    if project_id.trim().is_empty() {
+        return Err(AppError::BadRequest("missing project id".to_string()));
+    }
+
+    let db_path = state.db_path.clone();
+    let artifacts = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Vec<ArtifactResponse>>> {
+        let conn = Connection::open(&db_path)?;
+
+        let exists: bool =
+            conn.query_row("SELECT 1 FROM projects WHERE id = ?1", [&project_id], |_row| Ok(()))
+                .optional()?
+                .is_some();
+        if !exists {
+            return Ok(None);
+        }
+
+        let mut stmt = conn.prepare(
+            "SELECT id, project_id, kind, path, created_at_ms FROM artifacts WHERE project_id = ?1 ORDER BY created_at_ms DESC LIMIT 200",
+        )?;
+        let rows = stmt.query_map([&project_id], |row| {
+            Ok(ArtifactResponse {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                kind: row.get(2)?,
+                path: row.get(3)?,
+                created_at_ms: row.get(4)?,
+            })
+        })?;
+
+        Ok(Some(rows.filter_map(Result::ok).collect()))
+    })
+    .await
+    .context("list_artifacts task failed")??;
+
+    match artifacts {
+        Some(a) => Ok(Json(a)),
+        None => Err(AppError::NotFound("project not found".to_string())),
+    }
+}
+
+#[derive(Deserialize)]
+struct AddInputUrlRequest {
+    url: String,
+}
+
+async fn add_input_url(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    Json(req): Json<AddInputUrlRequest>,
+) -> AppResult<Json<ArtifactResponse>> {
+    let url = req.url.trim().to_string();
+    if project_id.trim().is_empty() {
+        return Err(AppError::BadRequest("missing project id".to_string()));
+    }
+    if url.is_empty() {
+        return Err(AppError::BadRequest("missing url".to_string()));
+    }
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err(AppError::BadRequest("url must start with http:// or https://".to_string()));
+    }
+
+    let db_path = state.db_path.clone();
+    let artifact = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<ArtifactResponse>> {
+        let conn = Connection::open(&db_path)?;
+
+        let exists: bool =
+            conn.query_row("SELECT 1 FROM projects WHERE id = ?1", [&project_id], |_row| Ok(()))
+                .optional()?
+                .is_some();
+        if !exists {
+            return Ok(None);
+        }
+
+        let id = Uuid::new_v4().to_string();
+        let created_at_ms = now_ms();
+        conn.execute(
+            "INSERT INTO artifacts (id, project_id, kind, path, created_at_ms) VALUES (?1, ?2, 'input_url', ?3, ?4)",
+            params![&id, &project_id, &url, created_at_ms],
+        )?;
+
+        conn.execute(
+            "INSERT INTO events (project_id, ts_ms, level, message, data_json) VALUES (?1, ?2, 'info', 'input_url_added', ?3)",
+            params![
+                &project_id,
+                created_at_ms,
+                serde_json::json!({ "url": &url }).to_string()
+            ],
+        )?;
+
+        Ok(Some(ArtifactResponse {
+            id,
+            project_id,
+            kind: "input_url".to_string(),
+            path: url,
+            created_at_ms,
+        }))
+    })
+    .await
+    .context("add_input_url task failed")??;
+
+    match artifact {
+        Some(a) => Ok(Json(a)),
+        None => Err(AppError::NotFound("project not found".to_string())),
+    }
+}
+
+#[derive(Serialize)]
+struct ImportLocalResponse {
+    artifact: ArtifactResponse,
+    bytes: u64,
+    file_name: String,
+}
+
+fn sanitize_file_name(name: &str) -> String {
+    let mut out = String::new();
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '_' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    while out.starts_with('.') {
+        out.remove(0);
+    }
+    if out.is_empty() {
+        "video".to_string()
+    } else {
+        out
+    }
+}
+
+async fn import_local_video(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    mut multipart: Multipart,
+) -> AppResult<Json<ImportLocalResponse>> {
+    if project_id.trim().is_empty() {
+        return Err(AppError::BadRequest("missing project id".to_string()));
+    }
+
+    // Ensure project exists first.
+    let project_id_for_check = project_id.clone();
+    let db_path = state.db_path.clone();
+    let exists = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+        let conn = Connection::open(&db_path)?;
+        Ok(conn
+            .query_row("SELECT 1 FROM projects WHERE id = ?1", [&project_id_for_check], |_row| Ok(()))
+            .optional()?
+            .is_some())
+    })
+    .await
+    .context("project existence check failed")??;
+    if !exists {
+        return Err(AppError::NotFound("project not found".to_string()));
+    }
+
+    while let Some(mut field) = multipart.next_field().await.context("multipart read failed")? {
+        let field_name = field.name().unwrap_or("");
+        if !field_name.is_empty() && field_name != "file" {
+            continue;
+        }
+
+        let original_name = field.file_name().unwrap_or("video");
+        let sanitized = sanitize_file_name(original_name);
+        let file_name = format!("{}_{}", Uuid::new_v4(), sanitized);
+        let rel_path = format!("projects/{}/media/{}", project_id, file_name);
+        let abs_path = state.data_dir.join(&rel_path);
+
+        if let Some(parent) = abs_path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("failed to create dir {}", parent.display()))?;
+        }
+
+        let mut out = tokio::fs::File::create(&abs_path)
+            .await
+            .with_context(|| format!("failed to create file {}", abs_path.display()))?;
+
+        let mut bytes: u64 = 0;
+        while let Some(chunk) = field.chunk().await.context("multipart chunk read failed")? {
+            out.write_all(&chunk).await.context("write failed")?;
+            bytes = bytes.saturating_add(chunk.len() as u64);
+        }
+        out.flush().await.context("flush failed")?;
+
+        let db_path = state.db_path.clone();
+        let artifact = tokio::task::spawn_blocking(move || -> anyhow::Result<ArtifactResponse> {
+            let conn = Connection::open(&db_path)?;
+            let id = Uuid::new_v4().to_string();
+            let created_at_ms = now_ms();
+
+            conn.execute(
+                "INSERT INTO artifacts (id, project_id, kind, path, created_at_ms) VALUES (?1, ?2, 'input_video', ?3, ?4)",
+                params![&id, &project_id, &rel_path, created_at_ms],
+            )?;
+
+            conn.execute(
+                "INSERT INTO events (project_id, ts_ms, level, message, data_json) VALUES (?1, ?2, 'info', 'input_video_imported', ?3)",
+                params![
+                    &project_id,
+                    created_at_ms,
+                    serde_json::json!({ "path": &rel_path, "bytes": bytes }).to_string()
+                ],
+            )?;
+
+            Ok(ArtifactResponse {
+                id,
+                project_id,
+                kind: "input_video".to_string(),
+                path: rel_path,
+                created_at_ms,
+            })
+        })
+        .await
+        .context("import_local_video db task failed")??;
+
+        return Ok(Json(ImportLocalResponse {
+            artifact,
+            bytes,
+            file_name,
+        }));
+    }
+
+    Err(AppError::BadRequest("missing multipart field 'file'".to_string()))
 }
 
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {

@@ -10,6 +10,7 @@ dotenv.config({ path: path.resolve(process.cwd(), "../../.env") });
 
 const webPort = Number(process.env.WEB_PORT || 6785);
 const orchestratorPort = Number(process.env.ORCHESTRATOR_PORT || 6790);
+const toolserverPort = Number(process.env.TOOLSERVER_PORT || 6791);
 
 export default defineConfig({
   plugins: [react()],
@@ -22,7 +23,11 @@ export default defineConfig({
         target: `http://127.0.0.1:${orchestratorPort}`,
         changeOrigin: true,
       },
+      "/tool": {
+        target: `http://127.0.0.1:${toolserverPort}`,
+        changeOrigin: true,
+        rewrite: (p) => p.replace(/^\/tool/, ""),
+      },
     },
   },
 });
-
