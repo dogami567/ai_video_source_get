@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     net::SocketAddr,
     path::{Path as FsPath, PathBuf},
+    process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::io::AsyncWriteExt;
@@ -22,6 +23,7 @@ struct HealthResponse {
     service: &'static str,
     data_dir: String,
     ffmpeg: bool,
+    ffprobe: bool,
     db_path: String,
 }
 
@@ -38,8 +40,9 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("failed to create DATA_DIR at {}", data_dir.display()))?;
 
     let ffmpeg = detect_ffmpeg();
-    if !ffmpeg {
-        tracing::warn!("ffmpeg not found on PATH; ffmpeg-dependent features will be unavailable");
+    let ffprobe = detect_ffprobe();
+    if !ffmpeg || !ffprobe {
+        tracing::warn!("ffmpeg/ffprobe not found on PATH; ffmpeg-dependent features will be unavailable");
     }
 
     let db_path = data_dir.join("vidunpack.sqlite3");
@@ -49,6 +52,7 @@ async fn main() -> anyhow::Result<()> {
         data_dir,
         db_path,
         ffmpeg,
+        ffprobe,
     };
 
     let app = Router::new()
@@ -59,6 +63,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/projects/{id}/artifacts", get(list_artifacts))
         .route("/projects/{id}/inputs/url", post(add_input_url))
         .route("/projects/{id}/media/local", post(import_local_video))
+        .route("/projects/{id}/pipeline/ffmpeg", post(ffmpeg_pipeline))
         .layer(DefaultBodyLimit::disable())
         .with_state(state);
 
@@ -82,12 +87,20 @@ struct AppState {
     data_dir: PathBuf,
     db_path: PathBuf,
     ffmpeg: bool,
+    ffprobe: bool,
 }
 
 fn detect_ffmpeg() -> bool {
-    let output = std::process::Command::new("ffmpeg")
-        .arg("-version")
-        .output();
+    let output = Command::new("ffmpeg").arg("-version").output();
+
+    match output {
+        Ok(out) => out.status.success(),
+        Err(_) => false,
+    }
+}
+
+fn detect_ffprobe() -> bool {
+    let output = Command::new("ffprobe").arg("-version").output();
 
     match output {
         Ok(out) => out.status.success(),
@@ -168,6 +181,7 @@ CREATE INDEX IF NOT EXISTS idx_events_project_id ON events(project_id);
 enum AppError {
     BadRequest(String),
     NotFound(String),
+    PreconditionFailed(String),
     Internal(anyhow::Error),
 }
 
@@ -182,6 +196,7 @@ impl IntoResponse for AppError {
         let (status, message) = match self {
             Self::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
             Self::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
+            Self::PreconditionFailed(msg) => (StatusCode::PRECONDITION_FAILED, msg),
             Self::Internal(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
         };
         (status, Json(serde_json::json!({ "ok": false, "error": message }))).into_response()
@@ -675,6 +690,258 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         service: "toolserver",
         data_dir: state.data_dir.display().to_string(),
         ffmpeg: state.ffmpeg,
+        ffprobe: state.ffprobe,
         db_path: state.db_path.display().to_string(),
     })
+}
+
+#[derive(Deserialize)]
+struct FfmpegPipelineRequest {
+    input_video_artifact_id: String,
+}
+
+#[derive(Serialize)]
+struct FfmpegPipelineResponse {
+    input_video_artifact_id: String,
+    fingerprint: String,
+    metadata: ArtifactResponse,
+    clips: Vec<ArtifactResponse>,
+    audio: ArtifactResponse,
+    thumbnails: Vec<ArtifactResponse>,
+}
+
+fn file_fingerprint(path: &FsPath) -> anyhow::Result<String> {
+    let meta = std::fs::metadata(path)?;
+    let size = meta.len();
+    let mtime_ms = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    Ok(format!("{size}_{mtime_ms}"))
+}
+
+fn ensure_artifact(conn: &Connection, project_id: &str, kind: &str, path: &str, created_at_ms: i64) -> anyhow::Result<ArtifactResponse> {
+    if let Some(existing) = conn
+        .query_row(
+            "SELECT id, created_at_ms FROM artifacts WHERE project_id = ?1 AND kind = ?2 AND path = ?3 LIMIT 1",
+            params![project_id, kind, path],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?
+    {
+        return Ok(ArtifactResponse {
+            id: existing.0,
+            project_id: project_id.to_string(),
+            kind: kind.to_string(),
+            path: path.to_string(),
+            created_at_ms: existing.1,
+        });
+    }
+
+    let id = Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO artifacts (id, project_id, kind, path, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![&id, project_id, kind, path, created_at_ms],
+    )?;
+    Ok(ArtifactResponse {
+        id,
+        project_id: project_id.to_string(),
+        kind: kind.to_string(),
+        path: path.to_string(),
+        created_at_ms,
+    })
+}
+
+fn run_cmd(cmd: &mut Command) -> anyhow::Result<()> {
+    let output = cmd.output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    anyhow::bail!("command failed: {stderr}");
+}
+
+async fn ffmpeg_pipeline(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    Json(req): Json<FfmpegPipelineRequest>,
+) -> AppResult<Json<FfmpegPipelineResponse>> {
+    if project_id.trim().is_empty() {
+        return Err(AppError::BadRequest("missing project id".to_string()));
+    }
+    let input_artifact_id = req.input_video_artifact_id.trim().to_string();
+    if input_artifact_id.is_empty() {
+        return Err(AppError::BadRequest("missing input_video_artifact_id".to_string()));
+    }
+    if !state.ffmpeg || !state.ffprobe {
+        return Err(AppError::PreconditionFailed(
+            "ffmpeg/ffprobe not found on PATH; please install ffmpeg and restart".to_string(),
+        ));
+    }
+
+    let data_dir = state.data_dir.clone();
+    let db_path = state.db_path.clone();
+
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<FfmpegPipelineResponse>> {
+        let conn = Connection::open(&db_path)?;
+
+        let exists: bool = conn
+            .query_row("SELECT 1 FROM projects WHERE id = ?1", [&project_id], |_row| Ok(()))
+            .optional()?
+            .is_some();
+        if !exists {
+            return Ok(None);
+        }
+
+        let mut stmt = conn.prepare(
+            "SELECT kind, path FROM artifacts WHERE id = ?1 AND project_id = ?2 LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![&input_artifact_id, &project_id])?;
+        let Some(row) = rows.next()? else {
+            return Err(anyhow::anyhow!("input artifact not found"));
+        };
+        let kind: String = row.get(0)?;
+        let rel_path: String = row.get(1)?;
+        if kind != "input_video" {
+            return Err(anyhow::anyhow!("artifact kind must be input_video"));
+        }
+
+        let input_abs = data_dir.join(&rel_path);
+        if !input_abs.exists() {
+            return Err(anyhow::anyhow!("input file missing on disk: {}", input_abs.display()));
+        }
+
+        let fingerprint = file_fingerprint(&input_abs)?;
+        let out_dir_rel = format!("projects/{}/out/ffmpeg/{}", project_id, fingerprint);
+        let out_dir_abs = data_dir.join(&out_dir_rel);
+        std::fs::create_dir_all(&out_dir_abs)?;
+
+        let metadata_rel = format!("{out_dir_rel}/metadata.json");
+        let metadata_abs = data_dir.join(&metadata_rel);
+        if !metadata_abs.exists() {
+            let output = Command::new("ffprobe")
+                .args(["-v", "error", "-show_format", "-show_streams", "-print_format", "json"])
+                .arg(&input_abs)
+                .output()?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                anyhow::bail!("ffprobe failed: {stderr}");
+            }
+            std::fs::write(&metadata_abs, &output.stdout)?;
+        }
+
+        let metadata_json: serde_json::Value = serde_json::from_slice(&std::fs::read(&metadata_abs)?)?;
+        let duration_s: f64 = metadata_json
+            .get("format")
+            .and_then(|f| f.get("duration"))
+            .and_then(|d| d.as_str())
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0);
+
+        let clip_len_s: f64 = 6.0;
+        let start_s = 0.0;
+        let mid_s = (duration_s / 2.0 - clip_len_s / 2.0).max(0.0);
+        let end_s = if duration_s > clip_len_s {
+            (duration_s - clip_len_s).max(0.0)
+        } else {
+            0.0
+        };
+
+        let clip_start_rel = format!("{out_dir_rel}/clip_start.mp4");
+        let clip_mid_rel = format!("{out_dir_rel}/clip_mid.mp4");
+        let clip_end_rel = format!("{out_dir_rel}/clip_end.mp4");
+        let audio_rel = format!("{out_dir_rel}/audio.wav");
+        let thumb_start_rel = format!("{out_dir_rel}/thumb_start.jpg");
+        let thumb_mid_rel = format!("{out_dir_rel}/thumb_mid.jpg");
+        let thumb_end_rel = format!("{out_dir_rel}/thumb_end.jpg");
+
+        let clip_specs = [
+            (start_s, &clip_start_rel),
+            (mid_s, &clip_mid_rel),
+            (end_s, &clip_end_rel),
+        ];
+        for (ss, rel) in clip_specs {
+            let abs = data_dir.join(rel);
+            if abs.exists() {
+                continue;
+            }
+            let mut cmd = Command::new("ffmpeg");
+            cmd.args(["-y", "-hide_banner", "-loglevel", "error"])
+                .arg("-ss")
+                .arg(format!("{ss:.3}"))
+                .arg("-t")
+                .arg(format!("{clip_len_s:.3}"))
+                .arg("-i")
+                .arg(&input_abs)
+                .args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "28"])
+                .args(["-c:a", "aac", "-b:a", "128k"])
+                .arg(&abs);
+            run_cmd(&mut cmd)?;
+        }
+
+        let audio_abs = data_dir.join(&audio_rel);
+        if !audio_abs.exists() {
+            let mut cmd = Command::new("ffmpeg");
+            cmd.args(["-y", "-hide_banner", "-loglevel", "error"])
+                .arg("-i")
+                .arg(&input_abs)
+                .args(["-vn", "-ac", "1", "-ar", "16000"])
+                .arg(&audio_abs);
+            run_cmd(&mut cmd)?;
+        }
+
+        let thumb_specs = [(start_s, &thumb_start_rel), (mid_s, &thumb_mid_rel), (end_s, &thumb_end_rel)];
+        for (ss, rel) in thumb_specs {
+            let abs = data_dir.join(rel);
+            if abs.exists() {
+                continue;
+            }
+            let mut cmd = Command::new("ffmpeg");
+            cmd.args(["-y", "-hide_banner", "-loglevel", "error"])
+                .arg("-ss")
+                .arg(format!("{ss:.3}"))
+                .arg("-i")
+                .arg(&input_abs)
+                .args(["-frames:v", "1", "-q:v", "2"])
+                .arg(&abs);
+            run_cmd(&mut cmd)?;
+        }
+
+        let created_at_ms = now_ms();
+        let metadata_art = ensure_artifact(&conn, &project_id, "metadata_json", &metadata_rel, created_at_ms)?;
+        let clip_start_art = ensure_artifact(&conn, &project_id, "clip_start", &clip_start_rel, created_at_ms)?;
+        let clip_mid_art = ensure_artifact(&conn, &project_id, "clip_mid", &clip_mid_rel, created_at_ms)?;
+        let clip_end_art = ensure_artifact(&conn, &project_id, "clip_end", &clip_end_rel, created_at_ms)?;
+        let audio_art = ensure_artifact(&conn, &project_id, "audio_wav", &audio_rel, created_at_ms)?;
+        let thumb_start_art = ensure_artifact(&conn, &project_id, "thumb_start", &thumb_start_rel, created_at_ms)?;
+        let thumb_mid_art = ensure_artifact(&conn, &project_id, "thumb_mid", &thumb_mid_rel, created_at_ms)?;
+        let thumb_end_art = ensure_artifact(&conn, &project_id, "thumb_end", &thumb_end_rel, created_at_ms)?;
+
+        conn.execute(
+            "INSERT INTO events (project_id, ts_ms, level, message, data_json) VALUES (?1, ?2, 'info', 'ffmpeg_pipeline', ?3)",
+            params![
+                &project_id,
+                created_at_ms,
+                serde_json::json!({ "input_artifact_id": &input_artifact_id, "fingerprint": &fingerprint, "duration_s": duration_s }).to_string()
+            ],
+        )?;
+
+        Ok(Some(FfmpegPipelineResponse {
+            input_video_artifact_id: input_artifact_id,
+            fingerprint,
+            metadata: metadata_art,
+            clips: vec![clip_start_art, clip_mid_art, clip_end_art],
+            audio: audio_art,
+            thumbnails: vec![thumb_start_art, thumb_mid_art, thumb_end_art],
+        }))
+    })
+    .await
+    .context("ffmpeg_pipeline task failed")??;
+
+    match result {
+        Some(r) => Ok(Json(r)),
+        None => Err(AppError::NotFound("project not found".to_string())),
+    }
 }
