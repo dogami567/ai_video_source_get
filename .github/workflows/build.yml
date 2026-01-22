@@ -30,6 +30,7 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then python -m pip install -r requirements.txt; fi
           python -m pip install pyinstaller
+          python -m pip install -e .
 
       - name: Build binary
         shell: bash
@@ -59,4 +60,3 @@ jobs:
         with:
           files: |
             artifacts/**/ai-video-source-get*
-
