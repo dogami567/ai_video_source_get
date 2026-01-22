@@ -6,6 +6,7 @@ type OrchestratorConfig = { ok: boolean; default_model: string; base_url: string
 
 type Project = { id: string; title: string; created_at_ms: number };
 type Consent = { project_id: string; consented: boolean; auto_confirm: boolean; updated_at_ms: number };
+type ProjectSettings = { project_id: string; think_enabled: boolean; updated_at_ms: number };
 type Artifact = { id: string; project_id: string; kind: string; path: string; created_at_ms: number };
 type ImportLocalResponse = { artifact: Artifact; bytes: number; file_name: string };
 
@@ -66,6 +67,7 @@ export default function App() {
 
   const [project, setProject] = React.useState<Project | null>(null);
   const [consent, setConsent] = React.useState<Consent | null>(null);
+  const [settings, setSettings] = React.useState<ProjectSettings | null>(null);
   const [artifacts, setArtifacts] = React.useState<Artifact[]>([]);
   const [projectError, setProjectError] = React.useState<string | null>(null);
   const [projectLoading, setProjectLoading] = React.useState(false);
@@ -85,6 +87,9 @@ export default function App() {
   const [analysisText, setAnalysisText] = React.useState<string | null>(null);
   const [analysisParsed, setAnalysisParsed] = React.useState<unknown | null>(null);
   const [analysisArtifact, setAnalysisArtifact] = React.useState<Artifact | null>(null);
+
+  const [lastPlan, setLastPlan] = React.useState<unknown | null>(null);
+  const [lastPlanArtifact, setLastPlanArtifact] = React.useState<Artifact | null>(null);
 
   const [exaQuery, setExaQuery] = React.useState("");
   const [exaBusy, setExaBusy] = React.useState(false);
@@ -134,13 +139,15 @@ export default function App() {
     setProjectLoading(true);
     setProjectError(null);
     try {
-      const [p, c, a] = await Promise.all([
+      const [p, c, s, a] = await Promise.all([
         fetchJson<Project>(`/tool/projects/${projectId}`),
         fetchJson<Consent>(`/tool/projects/${projectId}/consent`),
+        fetchJson<ProjectSettings>(`/tool/projects/${projectId}/settings`),
         fetchJson<Artifact[]>(`/tool/projects/${projectId}/artifacts`),
       ]);
       setProject(p);
       setConsent(c);
+      setSettings(s);
       setArtifacts(a);
     } catch (e) {
       setProjectError(e instanceof Error ? e.message : String(e));
@@ -196,12 +203,15 @@ export default function App() {
   const onBackToList = () => {
     setProject(null);
     setConsent(null);
+    setSettings(null);
     setArtifacts([]);
     setProjectError(null);
     setLocalFile(null);
     setImportError(null);
     setInputUrl("");
     setSaveUrlError(null);
+    setLastPlan(null);
+    setLastPlanArtifact(null);
     setView({ kind: "list" });
   };
 
@@ -210,6 +220,16 @@ export default function App() {
     try {
       const updated = await postJson<Consent>(`/tool/projects/${view.projectId}/consent`, { auto_confirm: next });
       setConsent(updated);
+    } catch (e) {
+      setProjectError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const onToggleThink = async (next: boolean) => {
+    if (view.kind !== "project") return;
+    try {
+      const updated = await postJson<ProjectSettings>(`/tool/projects/${view.projectId}/settings`, { think_enabled: next });
+      setSettings(updated);
     } catch (e) {
       setProjectError(e instanceof Error ? e.message : String(e));
     }
@@ -281,6 +301,8 @@ export default function App() {
     setAnalysisText(null);
     setAnalysisParsed(null);
     setAnalysisArtifact(null);
+    setLastPlan(null);
+    setLastPlanArtifact(null);
 
     const model = analysisModel.trim();
     if (!model) {
@@ -296,6 +318,8 @@ export default function App() {
     try {
       const resp = await postJson<{
         ok: boolean;
+        plan: unknown | null;
+        plan_artifact?: Artifact | null;
         model: string;
         artifact: Artifact;
         text: string;
@@ -308,6 +332,8 @@ export default function App() {
       setAnalysisText(resp.text || "");
       setAnalysisParsed(resp.parsed ?? null);
       setAnalysisArtifact(resp.artifact);
+      setLastPlan(resp.plan ?? null);
+      setLastPlanArtifact(resp.plan_artifact ?? null);
       await refreshProject(view.projectId);
     } catch (e) {
       setAnalysisError(e instanceof Error ? e.message : String(e));
@@ -333,12 +359,16 @@ export default function App() {
     try {
       const resp = await postJson<{
         ok: boolean;
+        plan: unknown | null;
+        plan_artifact?: Artifact | null;
         round: number;
         query: string;
         results: Array<{ title?: string; url?: string }>;
       }>(`/api/projects/${view.projectId}/exa/search`, { query });
       setExaRound(resp.round);
       setExaResults(resp.results || []);
+      setLastPlan(resp.plan ?? null);
+      setLastPlanArtifact(resp.plan_artifact ?? null);
       await refreshProject(view.projectId);
     } catch (e) {
       setExaError(e instanceof Error ? e.message : String(e));
@@ -355,8 +385,13 @@ export default function App() {
 
     setFetchBusy(true);
     try {
-      const resp = await postJson<{ ok: boolean; url: string; raw: unknown }>(`/api/projects/${view.projectId}/exa/fetch`, { url });
+      const resp = await postJson<{ ok: boolean; plan: unknown | null; plan_artifact?: Artifact | null; url: string; raw: unknown }>(
+        `/api/projects/${view.projectId}/exa/fetch`,
+        { url },
+      );
       setFetchRaw(resp.raw);
+      setLastPlan(resp.plan ?? null);
+      setLastPlanArtifact(resp.plan_artifact ?? null);
       await refreshProject(view.projectId);
     } catch (e) {
       setFetchError(e instanceof Error ? e.message : String(e));
@@ -534,6 +569,34 @@ export default function App() {
               <span>以后自动确认（本项目）</span>
             </label>
           </div>
+
+          <div className="divider" />
+
+          <h3>Think plan</h3>
+          <div className="row row-between row-center">
+            <label className="toggle">
+              <input
+                type="checkbox"
+                checked={settings?.think_enabled ?? true}
+                onChange={(e) => void onToggleThink(e.target.checked)}
+              />
+              <span>启用 think() 面板（本项目）</span>
+            </label>
+            {lastPlanArtifact ? (
+              <span className="muted">
+                stored: <span className="mono">{lastPlanArtifact.path}</span>
+              </span>
+            ) : null}
+          </div>
+          {(settings?.think_enabled ?? true) ? (
+            lastPlan ? (
+              <pre className="code">{JSON.stringify(lastPlan, null, 2)}</pre>
+            ) : (
+              <p className="muted">no plan yet.</p>
+            )
+          ) : (
+            <p className="muted">disabled.</p>
+          )}
 
           <div className="divider" />
 

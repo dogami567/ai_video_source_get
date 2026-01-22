@@ -60,6 +60,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/projects", post(create_project).get(list_projects))
         .route("/projects/{id}", get(get_project))
         .route("/projects/{id}/consent", get(get_consent).post(upsert_consent))
+        .route("/projects/{id}/settings", get(get_project_settings).post(update_project_settings))
         .route("/projects/{id}/artifacts", get(list_artifacts))
         .route("/projects/{id}/artifacts/text", post(create_text_artifact))
         .route("/projects/{id}/inputs/url", post(add_input_url))
@@ -151,6 +152,13 @@ CREATE TABLE IF NOT EXISTS consents (
   project_id TEXT PRIMARY KEY,
   consented INTEGER NOT NULL DEFAULT 0,
   auto_confirm INTEGER NOT NULL DEFAULT 0,
+  updated_at_ms INTEGER NOT NULL,
+  FOREIGN KEY(project_id) REFERENCES projects(id)
+);
+
+CREATE TABLE IF NOT EXISTS project_settings (
+  project_id TEXT PRIMARY KEY,
+  think_enabled INTEGER NOT NULL DEFAULT 1,
   updated_at_ms INTEGER NOT NULL,
   FOREIGN KEY(project_id) REFERENCES projects(id)
 );
@@ -444,6 +452,118 @@ async fn upsert_consent(
 
     match consent {
         Some(c) => Ok(Json(c)),
+        None => Err(AppError::NotFound("project not found".to_string())),
+    }
+}
+
+#[derive(Serialize)]
+struct ProjectSettingsResponse {
+    project_id: String,
+    think_enabled: bool,
+    updated_at_ms: i64,
+}
+
+async fn get_project_settings(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+) -> AppResult<Json<ProjectSettingsResponse>> {
+    if project_id.trim().is_empty() {
+        return Err(AppError::BadRequest("missing project id".to_string()));
+    }
+
+    let db_path = state.db_path.clone();
+    let settings = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<ProjectSettingsResponse>> {
+        let conn = Connection::open(&db_path)?;
+
+        let exists: bool = conn
+            .query_row("SELECT 1 FROM projects WHERE id = ?1", [&project_id], |_row| Ok(()))
+            .optional()?
+            .is_some();
+        if !exists {
+            return Ok(None);
+        }
+
+        let mut stmt =
+            conn.prepare("SELECT think_enabled, updated_at_ms FROM project_settings WHERE project_id = ?1")?;
+        let mut rows = stmt.query([&project_id])?;
+        if let Some(row) = rows.next()? {
+            let think_enabled_i: i64 = row.get(0)?;
+            let updated_at_ms: i64 = row.get(1)?;
+            return Ok(Some(ProjectSettingsResponse {
+                project_id,
+                think_enabled: think_enabled_i != 0,
+                updated_at_ms,
+            }));
+        }
+
+        Ok(Some(ProjectSettingsResponse {
+            project_id,
+            think_enabled: true,
+            updated_at_ms: 0,
+        }))
+    })
+    .await
+    .context("get_project_settings task failed")??;
+
+    match settings {
+        Some(s) => Ok(Json(s)),
+        None => Err(AppError::NotFound("project not found".to_string())),
+    }
+}
+
+#[derive(Deserialize)]
+struct UpdateProjectSettingsRequest {
+    think_enabled: bool,
+}
+
+async fn update_project_settings(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    Json(req): Json<UpdateProjectSettingsRequest>,
+) -> AppResult<Json<ProjectSettingsResponse>> {
+    if project_id.trim().is_empty() {
+        return Err(AppError::BadRequest("missing project id".to_string()));
+    }
+
+    let db_path = state.db_path.clone();
+    let settings = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<ProjectSettingsResponse>> {
+        let conn = Connection::open(&db_path)?;
+
+        let exists: bool = conn
+            .query_row("SELECT 1 FROM projects WHERE id = ?1", [&project_id], |_row| Ok(()))
+            .optional()?
+            .is_some();
+        if !exists {
+            return Ok(None);
+        }
+
+        let think_enabled = req.think_enabled;
+        let updated_at_ms = now_ms();
+        conn.execute(
+            "INSERT INTO project_settings (project_id, think_enabled, updated_at_ms) VALUES (?1, ?2, ?3)\n             ON CONFLICT(project_id) DO UPDATE SET think_enabled = excluded.think_enabled, updated_at_ms = excluded.updated_at_ms",
+            params![&project_id, if think_enabled { 1 } else { 0 }, updated_at_ms],
+        )?;
+
+        conn.execute(
+            "INSERT INTO events (project_id, ts_ms, level, message, data_json) VALUES (?1, ?2, 'info', 'project_settings', ?3)",
+            params![
+                &project_id,
+                updated_at_ms,
+                serde_json::json!({ "think_enabled": think_enabled }).to_string()
+            ],
+        )?;
+
+        Ok(Some(ProjectSettingsResponse {
+            project_id,
+            think_enabled,
+            updated_at_ms,
+        }))
+    })
+    .await
+    .context("update_project_settings task failed")??;
+
+    match settings {
+        Some(s) => Ok(Json(s)),
         None => Err(AppError::NotFound("project not found".to_string())),
     }
 }

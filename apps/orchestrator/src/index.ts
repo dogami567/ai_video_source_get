@@ -13,6 +13,7 @@ const app = express();
 app.use(express.json({ limit: "2mb" }));
 
 type ToolserverArtifact = { id: string; project_id: string; kind: string; path: string; created_at_ms: number };
+type ToolserverSettings = { project_id: string; think_enabled: boolean; updated_at_ms: number };
 type ToolserverFfmpegPipeline = {
   input_video_artifact_id: string;
   fingerprint: string;
@@ -60,6 +61,31 @@ async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
 
 async function toolserverJson<T>(pathName: string, init?: RequestInit): Promise<T> {
   return fetchJson<T>(`${toolserverBaseUrl}${pathName}`, init);
+}
+
+async function getThinkEnabled(projectId: string): Promise<boolean> {
+  try {
+    const s = await toolserverJson<ToolserverSettings>(`/projects/${projectId}/settings`);
+    return !!s.think_enabled;
+  } catch {
+    return true;
+  }
+}
+
+async function maybeStorePlan(projectId: string, action: string, plan: unknown): Promise<ToolserverArtifact | null> {
+  try {
+    return await toolserverJson<ToolserverArtifact>(`/projects/${projectId}/artifacts/text`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        kind: "think_plan",
+        out_path: `think/${action}-${Date.now()}.json`,
+        content: JSON.stringify(plan, null, 2),
+      }),
+    });
+  } catch {
+    return null;
+  }
 }
 
 function extractGeminiText(payload: any): string {
@@ -110,6 +136,8 @@ app.post("/api/projects/:projectId/gemini/analyze", async (req, res) => {
     const projectId = String(req.params.projectId || "").trim();
     if (!projectId) return res.status(400).json({ ok: false, error: "missing project id" });
 
+    const thinkEnabled = await getThinkEnabled(projectId);
+
     const apiKey = String(process.env.GEMINI_API_KEY || "").trim();
     if (!apiKey) {
       return res.status(400).json({
@@ -128,6 +156,18 @@ app.post("/api/projects/:projectId/gemini/analyze", async (req, res) => {
       if (!input) return res.status(400).json({ ok: false, error: "no input_video found; import a local video first" });
       inputVideoArtifactId = input.id;
     }
+
+    const plan = thinkEnabled
+      ? {
+          action: "gemini_analyze",
+          steps: [
+            { action: "ffmpeg_pipeline", input_video_artifact_id: inputVideoArtifactId },
+            { action: "gemini_generate", model },
+            { action: "store_analysis" },
+          ],
+        }
+      : null;
+    const planArtifact = plan ? await maybeStorePlan(projectId, "gemini-analyze", plan) : null;
 
     const pipeline = await toolserverJson<ToolserverFfmpegPipeline>(`/projects/${projectId}/pipeline/ffmpeg`, {
       method: "POST",
@@ -199,7 +239,16 @@ app.post("/api/projects/:projectId/gemini/analyze", async (req, res) => {
       }),
     });
 
-    return res.json({ ok: true, model, input_video_artifact_id: inputVideoArtifactId, artifact, text, parsed });
+    return res.json({
+      ok: true,
+      plan,
+      plan_artifact: planArtifact,
+      model,
+      input_video_artifact_id: inputVideoArtifactId,
+      artifact,
+      text,
+      parsed,
+    });
   } catch (e) {
     if (e instanceof HttpError) {
       const status = e.status >= 400 && e.status < 600 ? e.status : 500;
@@ -214,6 +263,8 @@ app.post("/api/projects/:projectId/exa/search", async (req, res) => {
   try {
     const projectId = String(req.params.projectId || "").trim();
     if (!projectId) return res.status(400).json({ ok: false, error: "missing project id" });
+
+    const thinkEnabled = await getThinkEnabled(projectId);
 
     const apiKey = String(process.env.EXA_API_KEY || "").trim();
     if (!apiKey) {
@@ -233,6 +284,14 @@ app.post("/api/projects/:projectId/exa/search", async (req, res) => {
     }
     const round = roundsUsed + 1;
 
+    const plan = thinkEnabled
+      ? {
+          action: "exa_search",
+          steps: [{ action: "exa.search", query, num_results: 5 }, { action: "store_search_results", round }],
+        }
+      : null;
+    const planArtifact = plan ? await maybeStorePlan(projectId, "exa-search", plan) : null;
+
     const exa = new Exa(apiKey);
     const raw = await withTimeout(exa.search(query, { numResults: 5 }), 20_000);
     const results = Array.isArray((raw as any)?.results) ? (raw as any).results : [];
@@ -247,7 +306,7 @@ app.post("/api/projects/:projectId/exa/search", async (req, res) => {
       }),
     });
 
-    return res.json({ ok: true, round, query, artifact, results });
+    return res.json({ ok: true, plan, plan_artifact: planArtifact, round, query, artifact, results });
   } catch (e) {
     if (e instanceof HttpError) {
       const status = e.status >= 400 && e.status < 600 ? e.status : 500;
@@ -262,6 +321,8 @@ app.post("/api/projects/:projectId/exa/fetch", async (req, res) => {
   try {
     const projectId = String(req.params.projectId || "").trim();
     if (!projectId) return res.status(400).json({ ok: false, error: "missing project id" });
+
+    const thinkEnabled = await getThinkEnabled(projectId);
 
     const apiKey = String(process.env.EXA_API_KEY || "").trim();
     if (!apiKey) {
@@ -284,6 +345,17 @@ app.post("/api/projects/:projectId/exa/fetch", async (req, res) => {
     }
     const nth = fetchesUsed + 1;
 
+    const plan = thinkEnabled
+      ? {
+          action: "web_fetch",
+          steps: [
+            { action: "exa.getContents", url, max_characters: 5000 },
+            { action: "store_fetch_content", nth },
+          ],
+        }
+      : null;
+    const planArtifact = plan ? await maybeStorePlan(projectId, "web-fetch", plan) : null;
+
     const exa = new Exa(apiKey);
     const raw = await withTimeout(
       exa.getContents([url], {
@@ -302,7 +374,7 @@ app.post("/api/projects/:projectId/exa/fetch", async (req, res) => {
       }),
     });
 
-    return res.json({ ok: true, url, artifact, raw });
+    return res.json({ ok: true, plan, plan_artifact: planArtifact, url, artifact, raw });
   } catch (e) {
     if (e instanceof HttpError) {
       const status = e.status >= 400 && e.status < 600 ? e.status : 500;
