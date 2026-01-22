@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "dotenv": "^16.4.7",
+    "exa-js": "^2.1.1",
     "express": "^4.19.2"
   },
   "devDependencies": {
@@ -18,4 +19,3 @@
     "typescript": "^5.7.3"
   }
 }
-

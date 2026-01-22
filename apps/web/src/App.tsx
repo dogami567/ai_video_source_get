@@ -86,6 +86,17 @@ export default function App() {
   const [analysisParsed, setAnalysisParsed] = React.useState<unknown | null>(null);
   const [analysisArtifact, setAnalysisArtifact] = React.useState<Artifact | null>(null);
 
+  const [exaQuery, setExaQuery] = React.useState("");
+  const [exaBusy, setExaBusy] = React.useState(false);
+  const [exaError, setExaError] = React.useState<string | null>(null);
+  const [exaRound, setExaRound] = React.useState<number | null>(null);
+  const [exaResults, setExaResults] = React.useState<Array<{ title?: string; url?: string }>>([]);
+
+  const [fetchBusy, setFetchBusy] = React.useState(false);
+  const [fetchError, setFetchError] = React.useState<string | null>(null);
+  const [fetchUrl, setFetchUrl] = React.useState<string | null>(null);
+  const [fetchRaw, setFetchRaw] = React.useState<unknown | null>(null);
+
   const [consentModalOpen, setConsentModalOpen] = React.useState(false);
   const [consentModalAutoConfirm, setConsentModalAutoConfirm] = React.useState(true);
   const [consentModalUrl, setConsentModalUrl] = React.useState<string | null>(null);
@@ -305,6 +316,55 @@ export default function App() {
     }
   };
 
+  const onExaSearch = async () => {
+    if (view.kind !== "project") return;
+    setExaError(null);
+    setFetchError(null);
+    setFetchUrl(null);
+    setFetchRaw(null);
+
+    const query = exaQuery.trim();
+    if (!query) {
+      setExaError("请输入 search query");
+      return;
+    }
+
+    setExaBusy(true);
+    try {
+      const resp = await postJson<{
+        ok: boolean;
+        round: number;
+        query: string;
+        results: Array<{ title?: string; url?: string }>;
+      }>(`/api/projects/${view.projectId}/exa/search`, { query });
+      setExaRound(resp.round);
+      setExaResults(resp.results || []);
+      await refreshProject(view.projectId);
+    } catch (e) {
+      setExaError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setExaBusy(false);
+    }
+  };
+
+  const onWebFetch = async (url: string) => {
+    if (view.kind !== "project") return;
+    setFetchError(null);
+    setFetchUrl(url);
+    setFetchRaw(null);
+
+    setFetchBusy(true);
+    try {
+      const resp = await postJson<{ ok: boolean; url: string; raw: unknown }>(`/api/projects/${view.projectId}/exa/fetch`, { url });
+      setFetchRaw(resp.raw);
+      await refreshProject(view.projectId);
+    } catch (e) {
+      setFetchError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setFetchBusy(false);
+    }
+  };
+
   const onConfirmConsentAndSaveUrl = async () => {
     if (view.kind !== "project") return;
     if (!consentModalUrl) return;
@@ -331,6 +391,8 @@ export default function App() {
 
   const inputVideos = artifacts.filter((a) => a.kind === "input_video");
   const inputUrls = artifacts.filter((a) => a.kind === "input_url");
+  const exaSearchCount = artifacts.filter((a) => a.kind === "exa_search").length;
+  const webFetchCount = artifacts.filter((a) => a.kind === "web_fetch").length;
 
   React.useEffect(() => {
     if (view.kind !== "project") return;
@@ -586,6 +648,61 @@ export default function App() {
           ) : (
             <p className="muted">no result yet.</p>
           )}
+
+          <div className="divider" />
+
+          <h3>Web search (Exa)</h3>
+          <p className="muted">
+            budgets: search {exaSearchCount}/3, web_fetch {webFetchCount}/3 (per project)
+          </p>
+          <div className="row row-gap row-center">
+            <input
+              className="input"
+              placeholder="Search query"
+              value={exaQuery}
+              onChange={(e) => setExaQuery(e.target.value)}
+              disabled={exaBusy || fetchBusy}
+            />
+            <button className="btn" onClick={() => void onExaSearch()} disabled={exaBusy || fetchBusy}>
+              {exaBusy ? "Searching…" : "Search"}
+            </button>
+          </div>
+          {exaError ? <p className="error">{exaError}</p> : null}
+          {exaRound ? <p className="muted">latest round: {exaRound}</p> : null}
+          {exaResults.length === 0 ? (
+            <p className="muted">no results.</p>
+          ) : (
+            <div className="table">
+              <div className="table-row table-head">
+                <div>Title</div>
+                <div>URL</div>
+                <div />
+              </div>
+              {exaResults.map((r, idx) => (
+                <div key={`${r.url || "no-url"}-${idx}`} className="table-row">
+                  <div className="mono">{r.title || "(untitled)"}</div>
+                  <div className="mono">{r.url || ""}</div>
+                  <div className="right">
+                    <button
+                      className="btn btn-secondary"
+                      onClick={() => (r.url ? void onWebFetch(r.url) : undefined)}
+                      disabled={!r.url || fetchBusy || exaBusy}
+                    >
+                      {fetchBusy && fetchUrl === r.url ? "Fetching…" : "Fetch"}
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {fetchUrl ? (
+            <>
+              <h4 className="mono">web_fetch: {fetchUrl}</h4>
+              {fetchError ? <p className="error">{fetchError}</p> : null}
+              {fetchRaw ? <pre className="code">{JSON.stringify(fetchRaw, null, 2)}</pre> : <p className="muted">no content yet.</p>}
+            </>
+          ) : null}
         </section>
       )}
 

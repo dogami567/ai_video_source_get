@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 
 import "dotenv/config";
 import dotenv from "dotenv";
+import Exa from "exa-js";
 import express from "express";
 
 dotenv.config({ path: path.resolve(process.cwd(), "../../.env") });
@@ -23,6 +24,16 @@ const dataDir = path.resolve(repoRoot, process.env.DATA_DIR || "data");
 
 const toolserverPort = Number(process.env.TOOLSERVER_PORT || 6791);
 const toolserverBaseUrl = `http://127.0.0.1:${toolserverPort}`;
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new HttpError(504, `timeout after ${ms}ms`)), ms);
+    promise
+      .then((v) => resolve(v))
+      .catch(reject)
+      .finally(() => clearTimeout(timer));
+  });
+}
 
 class HttpError extends Error {
   constructor(
@@ -189,6 +200,109 @@ app.post("/api/projects/:projectId/gemini/analyze", async (req, res) => {
     });
 
     return res.json({ ok: true, model, input_video_artifact_id: inputVideoArtifactId, artifact, text, parsed });
+  } catch (e) {
+    if (e instanceof HttpError) {
+      const status = e.status >= 400 && e.status < 600 ? e.status : 500;
+      return res.status(status).json({ ok: false, error: e.message });
+    }
+    const message = e instanceof Error ? e.message : String(e);
+    return res.status(500).json({ ok: false, error: message });
+  }
+});
+
+app.post("/api/projects/:projectId/exa/search", async (req, res) => {
+  try {
+    const projectId = String(req.params.projectId || "").trim();
+    if (!projectId) return res.status(400).json({ ok: false, error: "missing project id" });
+
+    const apiKey = String(process.env.EXA_API_KEY || "").trim();
+    if (!apiKey) {
+      return res.status(400).json({
+        ok: false,
+        error: "EXA_API_KEY is not set; set EXA_API_KEY in .env and restart",
+      });
+    }
+
+    const query = String(req.body?.query || "").trim();
+    if (!query) return res.status(400).json({ ok: false, error: "missing query" });
+
+    const artifacts = await toolserverJson<ToolserverArtifact[]>(`/projects/${projectId}/artifacts`);
+    const roundsUsed = artifacts.filter((a) => a.kind === "exa_search").length;
+    if (roundsUsed >= 3) {
+      return res.status(400).json({ ok: false, error: "search rounds budget exceeded (max 3)" });
+    }
+    const round = roundsUsed + 1;
+
+    const exa = new Exa(apiKey);
+    const raw = await withTimeout(exa.search(query, { numResults: 5 }), 20_000);
+    const results = Array.isArray((raw as any)?.results) ? (raw as any).results : [];
+
+    const artifact = await toolserverJson<ToolserverArtifact>(`/projects/${projectId}/artifacts/text`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        kind: "exa_search",
+        out_path: `search/exa-round-${round}.json`,
+        content: JSON.stringify({ query, round, results }, null, 2),
+      }),
+    });
+
+    return res.json({ ok: true, round, query, artifact, results });
+  } catch (e) {
+    if (e instanceof HttpError) {
+      const status = e.status >= 400 && e.status < 600 ? e.status : 500;
+      return res.status(status).json({ ok: false, error: e.message });
+    }
+    const message = e instanceof Error ? e.message : String(e);
+    return res.status(500).json({ ok: false, error: message });
+  }
+});
+
+app.post("/api/projects/:projectId/exa/fetch", async (req, res) => {
+  try {
+    const projectId = String(req.params.projectId || "").trim();
+    if (!projectId) return res.status(400).json({ ok: false, error: "missing project id" });
+
+    const apiKey = String(process.env.EXA_API_KEY || "").trim();
+    if (!apiKey) {
+      return res.status(400).json({
+        ok: false,
+        error: "EXA_API_KEY is not set; set EXA_API_KEY in .env and restart",
+      });
+    }
+
+    const url = String(req.body?.url || "").trim();
+    if (!url) return res.status(400).json({ ok: false, error: "missing url" });
+    if (!(url.startsWith("http://") || url.startsWith("https://"))) {
+      return res.status(400).json({ ok: false, error: "url must start with http:// or https://" });
+    }
+
+    const artifacts = await toolserverJson<ToolserverArtifact[]>(`/projects/${projectId}/artifacts`);
+    const fetchesUsed = artifacts.filter((a) => a.kind === "web_fetch").length;
+    if (fetchesUsed >= 3) {
+      return res.status(400).json({ ok: false, error: "web_fetch budget exceeded (max 3)" });
+    }
+    const nth = fetchesUsed + 1;
+
+    const exa = new Exa(apiKey);
+    const raw = await withTimeout(
+      exa.getContents([url], {
+        text: { maxCharacters: 5000 },
+      }),
+      20_000,
+    );
+
+    const artifact = await toolserverJson<ToolserverArtifact>(`/projects/${projectId}/artifacts/text`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        kind: "web_fetch",
+        out_path: `fetch/web-${nth}.json`,
+        content: JSON.stringify({ url, nth, raw }, null, 2),
+      }),
+    });
+
+    return res.json({ ok: true, url, artifact, raw });
   } catch (e) {
     if (e instanceof HttpError) {
       const status = e.status >= 400 && e.status < 600 ? e.status : 500;
