@@ -63,6 +63,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/projects/{id}/settings", get(get_project_settings).post(update_project_settings))
         .route("/projects/{id}/artifacts", get(list_artifacts))
         .route("/projects/{id}/artifacts/text", post(create_text_artifact))
+        .route("/projects/{id}/pool/items", get(list_pool_items).post(add_pool_item))
+        .route("/projects/{id}/pool/items/{item_id}/selected", post(set_pool_item_selected))
         .route("/projects/{id}/inputs/url", post(add_input_url))
         .route("/projects/{id}/media/local", post(import_local_video))
         .route("/projects/{id}/pipeline/ffmpeg", post(ffmpeg_pipeline))
@@ -162,6 +164,22 @@ CREATE TABLE IF NOT EXISTS project_settings (
   updated_at_ms INTEGER NOT NULL,
   FOREIGN KEY(project_id) REFERENCES projects(id)
 );
+
+CREATE TABLE IF NOT EXISTS pool_items (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  title TEXT,
+  source_url TEXT,
+  license TEXT,
+  dedup_key TEXT NOT NULL,
+  data_json TEXT,
+  selected INTEGER NOT NULL DEFAULT 1,
+  created_at_ms INTEGER NOT NULL,
+  FOREIGN KEY(project_id) REFERENCES projects(id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pool_items_dedup ON pool_items(project_id, dedup_key);
+CREATE INDEX IF NOT EXISTS idx_pool_items_project_id ON pool_items(project_id);
 
 CREATE TABLE IF NOT EXISTS profile (
   id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -565,6 +583,268 @@ async fn update_project_settings(
     match settings {
         Some(s) => Ok(Json(s)),
         None => Err(AppError::NotFound("project not found".to_string())),
+    }
+}
+
+#[derive(Serialize)]
+struct PoolItemResponse {
+    id: String,
+    project_id: String,
+    kind: String,
+    title: Option<String>,
+    source_url: Option<String>,
+    license: Option<String>,
+    dedup_key: String,
+    data_json: Option<String>,
+    selected: bool,
+    created_at_ms: i64,
+}
+
+async fn list_pool_items(State(state): State<AppState>, Path(project_id): Path<String>) -> AppResult<Json<Vec<PoolItemResponse>>> {
+    if project_id.trim().is_empty() {
+        return Err(AppError::BadRequest("missing project id".to_string()));
+    }
+
+    let db_path = state.db_path.clone();
+    let items = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Vec<PoolItemResponse>>> {
+        let conn = Connection::open(&db_path)?;
+
+        let exists: bool = conn
+            .query_row("SELECT 1 FROM projects WHERE id = ?1", [&project_id], |_row| Ok(()))
+            .optional()?
+            .is_some();
+        if !exists {
+            return Ok(None);
+        }
+
+        let mut stmt = conn.prepare(
+            "SELECT id, project_id, kind, title, source_url, license, dedup_key, data_json, selected, created_at_ms\n             FROM pool_items WHERE project_id = ?1 ORDER BY created_at_ms DESC LIMIT 500",
+        )?;
+        let rows = stmt.query_map([&project_id], |row| {
+            Ok(PoolItemResponse {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                kind: row.get(2)?,
+                title: row.get(3)?,
+                source_url: row.get(4)?,
+                license: row.get(5)?,
+                dedup_key: row.get(6)?,
+                data_json: row.get(7)?,
+                selected: row.get::<_, i64>(8)? != 0,
+                created_at_ms: row.get(9)?,
+            })
+        })?;
+
+        Ok(Some(rows.filter_map(Result::ok).collect()))
+    })
+    .await
+    .context("list_pool_items task failed")??;
+
+    match items {
+        Some(v) => Ok(Json(v)),
+        None => Err(AppError::NotFound("project not found".to_string())),
+    }
+}
+
+#[derive(Deserialize)]
+struct AddPoolItemRequest {
+    kind: String,
+    title: Option<String>,
+    url: Option<String>,
+    source_url: Option<String>,
+    license: Option<String>,
+    dedup_key: Option<String>,
+    data: Option<serde_json::Value>,
+    selected: Option<bool>,
+}
+
+fn normalize_url_for_dedup(url: &str) -> String {
+    let trimmed = url.trim();
+    let no_hash = trimmed.split('#').next().unwrap_or(trimmed);
+    let no_trailing = no_hash.trim_end_matches('/');
+    no_trailing.to_lowercase()
+}
+
+async fn add_pool_item(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    Json(req): Json<AddPoolItemRequest>,
+) -> AppResult<Json<PoolItemResponse>> {
+    if project_id.trim().is_empty() {
+        return Err(AppError::BadRequest("missing project id".to_string()));
+    }
+
+    let kind = req.kind.trim().to_string();
+    if kind.is_empty() {
+        return Err(AppError::BadRequest("missing kind".to_string()));
+    }
+
+    let title = req.title.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let source_url = req
+        .source_url
+        .or(req.url)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let license = req.license.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+
+    let dedup_key = req
+        .dedup_key
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| source_url.as_ref().map(|u| format!("url:{}", normalize_url_for_dedup(u))))
+        .unwrap_or_else(|| format!("random:{}", Uuid::new_v4()));
+
+    let data_json = if let Some(v) = req.data {
+        Some(v.to_string())
+    } else if let Some(u) = &source_url {
+        Some(serde_json::json!({ "url": u }).to_string())
+    } else {
+        None
+    };
+
+    let selected = req.selected.unwrap_or(true);
+
+    let db_path = state.db_path.clone();
+    let item = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<PoolItemResponse>> {
+        let conn = Connection::open(&db_path)?;
+
+        let exists: bool = conn
+            .query_row("SELECT 1 FROM projects WHERE id = ?1", [&project_id], |_row| Ok(()))
+            .optional()?
+            .is_some();
+        if !exists {
+            return Ok(None);
+        }
+
+        let id = Uuid::new_v4().to_string();
+        let created_at_ms = now_ms();
+        conn.execute(
+            "INSERT INTO pool_items (id, project_id, kind, title, source_url, license, dedup_key, data_json, selected, created_at_ms)\n             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)\n             ON CONFLICT(project_id, dedup_key) DO UPDATE SET kind = excluded.kind, title = excluded.title, source_url = excluded.source_url, license = excluded.license, data_json = excluded.data_json, selected = excluded.selected",
+            params![
+                &id,
+                &project_id,
+                &kind,
+                title.as_deref(),
+                source_url.as_deref(),
+                license.as_deref(),
+                &dedup_key,
+                data_json.as_deref(),
+                if selected { 1 } else { 0 },
+                created_at_ms
+            ],
+        )?;
+
+        conn.execute(
+            "INSERT INTO events (project_id, ts_ms, level, message, data_json) VALUES (?1, ?2, 'info', 'pool_item_upsert', ?3)",
+            params![
+                &project_id,
+                created_at_ms,
+                serde_json::json!({ "kind": &kind, "dedup_key": &dedup_key, "source_url": source_url.as_deref() }).to_string()
+            ],
+        )?;
+
+        let mut stmt = conn.prepare(
+            "SELECT id, project_id, kind, title, source_url, license, dedup_key, data_json, selected, created_at_ms\n             FROM pool_items WHERE project_id = ?1 AND dedup_key = ?2 LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![&project_id, &dedup_key])?;
+        let Some(row) = rows.next()? else {
+            return Err(anyhow::anyhow!("failed to read back pool item"));
+        };
+
+        Ok(Some(PoolItemResponse {
+            id: row.get(0)?,
+            project_id: row.get(1)?,
+            kind: row.get(2)?,
+            title: row.get(3)?,
+            source_url: row.get(4)?,
+            license: row.get(5)?,
+            dedup_key: row.get(6)?,
+            data_json: row.get(7)?,
+            selected: row.get::<_, i64>(8)? != 0,
+            created_at_ms: row.get(9)?,
+        }))
+    })
+    .await
+    .context("add_pool_item task failed")??;
+
+    match item {
+        Some(v) => Ok(Json(v)),
+        None => Err(AppError::NotFound("project not found".to_string())),
+    }
+}
+
+#[derive(Deserialize)]
+struct SetPoolItemSelectedRequest {
+    selected: bool,
+}
+
+async fn set_pool_item_selected(
+    State(state): State<AppState>,
+    Path((project_id, item_id)): Path<(String, String)>,
+    Json(req): Json<SetPoolItemSelectedRequest>,
+) -> AppResult<Json<PoolItemResponse>> {
+    if project_id.trim().is_empty() {
+        return Err(AppError::BadRequest("missing project id".to_string()));
+    }
+    if item_id.trim().is_empty() {
+        return Err(AppError::BadRequest("missing item_id".to_string()));
+    }
+
+    let db_path = state.db_path.clone();
+    let item = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<PoolItemResponse>> {
+        let conn = Connection::open(&db_path)?;
+
+        let exists: bool = conn
+            .query_row("SELECT 1 FROM projects WHERE id = ?1", [&project_id], |_row| Ok(()))
+            .optional()?
+            .is_some();
+        if !exists {
+            return Ok(None);
+        }
+
+        let selected = req.selected;
+        conn.execute(
+            "UPDATE pool_items SET selected = ?1 WHERE project_id = ?2 AND id = ?3",
+            params![if selected { 1 } else { 0 }, &project_id, &item_id],
+        )?;
+
+        let updated_at_ms = now_ms();
+        conn.execute(
+            "INSERT INTO events (project_id, ts_ms, level, message, data_json) VALUES (?1, ?2, 'info', 'pool_item_selected', ?3)",
+            params![
+                &project_id,
+                updated_at_ms,
+                serde_json::json!({ "item_id": &item_id, "selected": selected }).to_string()
+            ],
+        )?;
+
+        let mut stmt = conn.prepare(
+            "SELECT id, project_id, kind, title, source_url, license, dedup_key, data_json, selected, created_at_ms\n             FROM pool_items WHERE project_id = ?1 AND id = ?2 LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![&project_id, &item_id])?;
+        if let Some(row) = rows.next()? {
+            return Ok(Some(PoolItemResponse {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                kind: row.get(2)?,
+                title: row.get(3)?,
+                source_url: row.get(4)?,
+                license: row.get(5)?,
+                dedup_key: row.get(6)?,
+                data_json: row.get(7)?,
+                selected: row.get::<_, i64>(8)? != 0,
+                created_at_ms: row.get(9)?,
+            }));
+        }
+
+        Ok(None)
+    })
+    .await
+    .context("set_pool_item_selected task failed")??;
+
+    match item {
+        Some(v) => Ok(Json(v)),
+        None => Err(AppError::NotFound("pool item not found".to_string())),
     }
 }
 

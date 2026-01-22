@@ -9,6 +9,18 @@ type Consent = { project_id: string; consented: boolean; auto_confirm: boolean; 
 type ProjectSettings = { project_id: string; think_enabled: boolean; updated_at_ms: number };
 type Artifact = { id: string; project_id: string; kind: string; path: string; created_at_ms: number };
 type ImportLocalResponse = { artifact: Artifact; bytes: number; file_name: string };
+type PoolItem = {
+  id: string;
+  project_id: string;
+  kind: string;
+  title: string | null;
+  source_url: string | null;
+  license: string | null;
+  dedup_key: string;
+  data_json: string | null;
+  selected: boolean;
+  created_at_ms: number;
+};
 
 async function fetchJson<T>(input: string, init?: RequestInit): Promise<T> {
   const res = await fetch(input, init);
@@ -69,6 +81,7 @@ export default function App() {
   const [consent, setConsent] = React.useState<Consent | null>(null);
   const [settings, setSettings] = React.useState<ProjectSettings | null>(null);
   const [artifacts, setArtifacts] = React.useState<Artifact[]>([]);
+  const [poolItems, setPoolItems] = React.useState<PoolItem[]>([]);
   const [projectError, setProjectError] = React.useState<string | null>(null);
   const [projectLoading, setProjectLoading] = React.useState(false);
 
@@ -139,16 +152,18 @@ export default function App() {
     setProjectLoading(true);
     setProjectError(null);
     try {
-      const [p, c, s, a] = await Promise.all([
+      const [p, c, s, a, pool] = await Promise.all([
         fetchJson<Project>(`/tool/projects/${projectId}`),
         fetchJson<Consent>(`/tool/projects/${projectId}/consent`),
         fetchJson<ProjectSettings>(`/tool/projects/${projectId}/settings`),
         fetchJson<Artifact[]>(`/tool/projects/${projectId}/artifacts`),
+        fetchJson<PoolItem[]>(`/tool/projects/${projectId}/pool/items`),
       ]);
       setProject(p);
       setConsent(c);
       setSettings(s);
       setArtifacts(a);
+      setPoolItems(pool);
     } catch (e) {
       setProjectError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -205,6 +220,7 @@ export default function App() {
     setConsent(null);
     setSettings(null);
     setArtifacts([]);
+    setPoolItems([]);
     setProjectError(null);
     setLocalFile(null);
     setImportError(null);
@@ -400,6 +416,31 @@ export default function App() {
     }
   };
 
+  const onAddToPool = async (url: string, title?: string) => {
+    if (view.kind !== "project") return;
+    try {
+      await postJson<PoolItem>(`/tool/projects/${view.projectId}/pool/items`, {
+        kind: "link",
+        title: title || undefined,
+        source_url: url,
+        data: { url, title },
+      });
+      await refreshProject(view.projectId);
+    } catch (e) {
+      setProjectError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const onTogglePoolSelected = async (itemId: string, selected: boolean) => {
+    if (view.kind !== "project") return;
+    try {
+      await postJson<PoolItem>(`/tool/projects/${view.projectId}/pool/items/${itemId}/selected`, { selected });
+      await refreshProject(view.projectId);
+    } catch (e) {
+      setProjectError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
   const onConfirmConsentAndSaveUrl = async () => {
     if (view.kind !== "project") return;
     if (!consentModalUrl) return;
@@ -428,6 +469,7 @@ export default function App() {
   const inputUrls = artifacts.filter((a) => a.kind === "input_url");
   const exaSearchCount = artifacts.filter((a) => a.kind === "exa_search").length;
   const webFetchCount = artifacts.filter((a) => a.kind === "web_fetch").length;
+  const poolSelectedCount = poolItems.filter((i) => i.selected).length;
 
   React.useEffect(() => {
     if (view.kind !== "project") return;
@@ -746,13 +788,22 @@ export default function App() {
                   <div className="mono">{r.title || "(untitled)"}</div>
                   <div className="mono">{r.url || ""}</div>
                   <div className="right">
-                    <button
-                      className="btn btn-secondary"
-                      onClick={() => (r.url ? void onWebFetch(r.url) : undefined)}
-                      disabled={!r.url || fetchBusy || exaBusy}
-                    >
-                      {fetchBusy && fetchUrl === r.url ? "Fetching…" : "Fetch"}
-                    </button>
+                    <div className="row row-gap">
+                      <button
+                        className="btn btn-secondary"
+                        onClick={() => (r.url ? void onWebFetch(r.url) : undefined)}
+                        disabled={!r.url || fetchBusy || exaBusy}
+                      >
+                        {fetchBusy && fetchUrl === r.url ? "Fetching…" : "Fetch"}
+                      </button>
+                      <button
+                        className="btn btn-secondary"
+                        onClick={() => (r.url ? void onAddToPool(r.url, r.title) : undefined)}
+                        disabled={!r.url}
+                      >
+                        Add
+                      </button>
+                    </div>
                   </div>
                 </div>
               ))}
@@ -766,6 +817,43 @@ export default function App() {
               {fetchRaw ? <pre className="code">{JSON.stringify(fetchRaw, null, 2)}</pre> : <p className="muted">no content yet.</p>}
             </>
           ) : null}
+
+          <div className="divider" />
+
+          <h3>Asset pool (meme-first)</h3>
+          <p className="muted">
+            selected {poolSelectedCount}/{poolItems.length}
+          </p>
+          {poolItems.length === 0 ? (
+            <p className="muted">empty — use “Add” from search results.</p>
+          ) : (
+            <div className="table">
+              <div className="table-row table-head">
+                <div>Item</div>
+                <div>Provenance</div>
+                <div />
+              </div>
+              {poolItems.map((it) => (
+                <div key={it.id} className="table-row">
+                  <div>
+                    <div className="mono">{it.title || it.kind}</div>
+                    <div className="muted mono">{it.kind}</div>
+                  </div>
+                  <div className="mono">{it.source_url || ""}</div>
+                  <div className="right">
+                    <label className="toggle">
+                      <input
+                        type="checkbox"
+                        checked={it.selected}
+                        onChange={(e) => void onTogglePoolSelected(it.id, e.target.checked)}
+                      />
+                      <span>Selected</span>
+                    </label>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
         </section>
       )}
 
