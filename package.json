@@ -1,0 +1,18 @@
+{
+  "name": "vidunpack",
+  "private": true,
+  "workspaces": [
+    "apps/*"
+  ],
+  "scripts": {
+    "dev": "concurrently -n web,orchestrator,toolserver -c green,blue,magenta \"npm -w @vidunpack/web run dev\" \"npm -w @vidunpack/orchestrator run dev\" \"cargo run -p vidunpack-toolserver\"",
+    "dev:web": "npm -w @vidunpack/web run dev",
+    "dev:orchestrator": "npm -w @vidunpack/orchestrator run dev",
+    "dev:toolserver": "cargo run -p vidunpack-toolserver",
+    "build": "npm -w @vidunpack/web run build && npm -w @vidunpack/orchestrator run build && cargo build -p vidunpack-toolserver"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}
+

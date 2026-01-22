@@ -1,24 +1,21 @@
-# ai_video_source_get
+# VidUnpack（视频拆解箱）
 
-一个用于“AI 视频源获取”的项目骨架（当前为最小可运行 CLI + GitHub Actions 跨平台打包流水线）。
+本地优先的 Web 应用：用对话驱动把参考视频“拆解”成可复用素材与可下载打包。
 
 ## 本地运行
 
 ```powershell
-python -m pip install -e .
-ai-video-source-get --help
-
-# 或者（无需安装）：
-python .\\pyinstaller_entry.py --help
+copy .env.example .env
+npm install
+npm run dev
 ```
 
-## 打包产物
+打开 `http://127.0.0.1:6785`。
 
-本仓库已配置 GitHub Actions，在 `push` / `pull_request` 时会在：
+## 依赖
 
-- Windows：生成 `dist/ai-video-source-get.exe`
-- macOS：生成 `dist/ai-video-source-get`
+- Node.js (npm workspaces)
+- Rust（后端工具服务）
+- ffmpeg（后续媒体处理会用到）
 
-并作为 Actions Artifacts 上传（后续也可改为打 tag 自动发 Release）。
-
-> 目前已支持：推送 `v*` tag 时自动创建 GitHub Release 并附带打包产物。
+> CI 打包与跨平台发布在后续 issue 中完善。

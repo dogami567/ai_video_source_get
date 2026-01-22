@@ -1,19 +1,34 @@
-# Python
+# Node
+node_modules/
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Vite/React build
+dist/
+*.tsbuildinfo
+
+# Rust
+target/
+
+# App data & secrets
+data/
+.env
+.env.*
+
+# Temp
+*.tmp
+
+# Python (legacy)
 __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
-.Python
-.venv/
-venv/
-ENV/
-
-# Build / dist
-build/
-dist/
-*.spec
 *.egg-info/
 .eggs/
+.venv/
+venv/
 
 # OS / Editor
 .DS_Store
