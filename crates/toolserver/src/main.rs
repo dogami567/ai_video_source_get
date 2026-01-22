@@ -61,6 +61,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/projects/{id}", get(get_project))
         .route("/projects/{id}/consent", get(get_consent).post(upsert_consent))
         .route("/projects/{id}/artifacts", get(list_artifacts))
+        .route("/projects/{id}/artifacts/text", post(create_text_artifact))
         .route("/projects/{id}/inputs/url", post(add_input_url))
         .route("/projects/{id}/media/local", post(import_local_video))
         .route("/projects/{id}/pipeline/ffmpeg", post(ffmpeg_pipeline))
@@ -492,6 +493,96 @@ async fn list_artifacts(State(state): State<AppState>, Path(project_id): Path<St
     .context("list_artifacts task failed")??;
 
     match artifacts {
+        Some(a) => Ok(Json(a)),
+        None => Err(AppError::NotFound("project not found".to_string())),
+    }
+}
+
+#[derive(Deserialize)]
+struct CreateTextArtifactRequest {
+    kind: String,
+    out_path: String,
+    content: String,
+}
+
+fn sanitize_out_path(out_path: &str) -> Option<String> {
+    let normalized = out_path.replace('\\', "/");
+    let parts = normalized
+        .split('/')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter(|s| *s != "." && *s != "..")
+        .map(sanitize_file_name)
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>();
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("/"))
+    }
+}
+
+async fn create_text_artifact(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    Json(req): Json<CreateTextArtifactRequest>,
+) -> AppResult<Json<ArtifactResponse>> {
+    if project_id.trim().is_empty() {
+        return Err(AppError::BadRequest("missing project id".to_string()));
+    }
+
+    let kind = req.kind.trim().to_string();
+    if kind.is_empty() {
+        return Err(AppError::BadRequest("missing kind".to_string()));
+    }
+
+    let out_path = req.out_path.trim().to_string();
+    let Some(safe_out_path) = sanitize_out_path(&out_path) else {
+        return Err(AppError::BadRequest("invalid out_path".to_string()));
+    };
+
+    let content = req.content;
+
+    let data_dir = state.data_dir.clone();
+    let db_path = state.db_path.clone();
+
+    let artifact = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<ArtifactResponse>> {
+        let conn = Connection::open(&db_path)?;
+
+        let exists: bool = conn
+            .query_row("SELECT 1 FROM projects WHERE id = ?1", [&project_id], |_row| Ok(()))
+            .optional()?
+            .is_some();
+        if !exists {
+            return Ok(None);
+        }
+
+        let rel_path = format!("projects/{}/out/{}", project_id, safe_out_path);
+        let abs_path = data_dir.join(&rel_path);
+        if let Some(parent) = abs_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&abs_path, content.as_bytes())?;
+
+        let created_at_ms = now_ms();
+        let artifact = ensure_artifact(&conn, &project_id, &kind, &rel_path, created_at_ms)?;
+
+        conn.execute(
+            "INSERT INTO events (project_id, ts_ms, level, message, data_json) VALUES (?1, ?2, 'info', 'text_artifact', ?3)",
+            params![
+                &project_id,
+                created_at_ms,
+                serde_json::json!({ "kind": &kind, "path": &rel_path }).to_string()
+            ],
+        )?;
+
+        Ok(Some(artifact))
+    })
+    .await
+    .context("create_text_artifact task failed")??;
+
+    match artifact {
         Some(a) => Ok(Json(a)),
         None => Err(AppError::NotFound("project not found".to_string())),
     }

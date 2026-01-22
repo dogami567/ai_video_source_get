@@ -2,6 +2,7 @@ import React from "react";
 
 type OrchestratorHealth = { ok: boolean; service?: string };
 type ToolserverHealth = { ok: boolean; service: string; ffmpeg: boolean; data_dir: string; db_path: string };
+type OrchestratorConfig = { ok: boolean; default_model: string; base_url: string };
 
 type Project = { id: string; title: string; created_at_ms: number };
 type Consent = { project_id: string; consented: boolean; auto_confirm: boolean; updated_at_ms: number };
@@ -77,6 +78,14 @@ export default function App() {
   const [saveUrlBusy, setSaveUrlBusy] = React.useState(false);
   const [saveUrlError, setSaveUrlError] = React.useState<string | null>(null);
 
+  const [analysisModel, setAnalysisModel] = React.useState("gemini-3-pro-preview");
+  const [analysisVideoArtifactId, setAnalysisVideoArtifactId] = React.useState<string>("");
+  const [analysisBusy, setAnalysisBusy] = React.useState(false);
+  const [analysisError, setAnalysisError] = React.useState<string | null>(null);
+  const [analysisText, setAnalysisText] = React.useState<string | null>(null);
+  const [analysisParsed, setAnalysisParsed] = React.useState<unknown | null>(null);
+  const [analysisArtifact, setAnalysisArtifact] = React.useState<Artifact | null>(null);
+
   const [consentModalOpen, setConsentModalOpen] = React.useState(false);
   const [consentModalAutoConfirm, setConsentModalAutoConfirm] = React.useState(true);
   const [consentModalUrl, setConsentModalUrl] = React.useState<string | null>(null);
@@ -133,6 +142,21 @@ export default function App() {
     void refreshHealth();
     void refreshProjects();
   }, [refreshHealth, refreshProjects]);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const cfg = await fetchJson<OrchestratorConfig>("/api/config");
+        if (!cancelled && cfg?.default_model) setAnalysisModel(cfg.default_model);
+      } catch {
+        // ignore config errors; fallback to default model string
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   React.useEffect(() => {
     if (view.kind !== "project") return;
@@ -240,6 +264,47 @@ export default function App() {
     }
   };
 
+  const onRunAnalysis = async () => {
+    if (view.kind !== "project") return;
+    setAnalysisError(null);
+    setAnalysisText(null);
+    setAnalysisParsed(null);
+    setAnalysisArtifact(null);
+
+    const model = analysisModel.trim();
+    if (!model) {
+      setAnalysisError("请输入 model");
+      return;
+    }
+    if (!analysisVideoArtifactId) {
+      setAnalysisError("请选择一个本地视频（input_video）");
+      return;
+    }
+
+    setAnalysisBusy(true);
+    try {
+      const resp = await postJson<{
+        ok: boolean;
+        model: string;
+        artifact: Artifact;
+        text: string;
+        parsed: unknown | null;
+      }>(`/api/projects/${view.projectId}/gemini/analyze`, {
+        model,
+        input_video_artifact_id: analysisVideoArtifactId,
+      });
+
+      setAnalysisText(resp.text || "");
+      setAnalysisParsed(resp.parsed ?? null);
+      setAnalysisArtifact(resp.artifact);
+      await refreshProject(view.projectId);
+    } catch (e) {
+      setAnalysisError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setAnalysisBusy(false);
+    }
+  };
+
   const onConfirmConsentAndSaveUrl = async () => {
     if (view.kind !== "project") return;
     if (!consentModalUrl) return;
@@ -266,6 +331,17 @@ export default function App() {
 
   const inputVideos = artifacts.filter((a) => a.kind === "input_video");
   const inputUrls = artifacts.filter((a) => a.kind === "input_url");
+
+  React.useEffect(() => {
+    if (view.kind !== "project") return;
+    if (inputVideos.length === 0) {
+      setAnalysisVideoArtifactId("");
+      return;
+    }
+    if (!analysisVideoArtifactId || !inputVideos.some((v) => v.id === analysisVideoArtifactId)) {
+      setAnalysisVideoArtifactId(inputVideos[0].id);
+    }
+  }, [analysisVideoArtifactId, inputVideos, view.kind]);
 
   return (
     <div className="app">
@@ -465,6 +541,51 @@ export default function App() {
               )}
             </div>
           </div>
+
+          <div className="divider" />
+
+          <h3>Gemini analysis</h3>
+          <div className="row row-gap row-center">
+            <input
+              className="input"
+              placeholder="model"
+              value={analysisModel}
+              onChange={(e) => setAnalysisModel(e.target.value)}
+              disabled={analysisBusy}
+            />
+            <select
+              className="input"
+              value={analysisVideoArtifactId}
+              onChange={(e) => setAnalysisVideoArtifactId(e.target.value)}
+              disabled={analysisBusy || inputVideos.length === 0}
+            >
+              {inputVideos.length === 0 ? (
+                <option value="">(no input_video)</option>
+              ) : (
+                inputVideos.map((v) => (
+                  <option key={v.id} value={v.id}>
+                    {v.path}
+                  </option>
+                ))
+              )}
+            </select>
+            <button className="btn" onClick={() => void onRunAnalysis()} disabled={analysisBusy}>
+              {analysisBusy ? "Running…" : "Analyze"}
+            </button>
+          </div>
+          {analysisError ? <p className="error">{analysisError}</p> : null}
+          {analysisArtifact ? (
+            <p className="muted">
+              stored: <span className="mono">{analysisArtifact.path}</span>
+            </p>
+          ) : null}
+          {analysisParsed ? (
+            <pre className="code">{JSON.stringify(analysisParsed, null, 2)}</pre>
+          ) : analysisText ? (
+            <pre className="code">{analysisText}</pre>
+          ) : (
+            <p className="muted">no result yet.</p>
+          )}
         </section>
       )}
 
