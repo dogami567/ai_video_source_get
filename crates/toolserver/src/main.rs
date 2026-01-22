@@ -9,6 +9,7 @@ use axum::{
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::{
     net::SocketAddr,
     path::{Path as FsPath, PathBuf},
@@ -61,6 +62,8 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/profile", get(get_profile))
+        .route("/profile/reset", post(reset_profile))
         .route("/projects", post(create_project).get(list_projects))
         .route("/projects/{id}", get(get_project))
         .route("/projects/{id}/consent", get(get_consent).post(upsert_consent))
@@ -126,6 +129,246 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProfileMemoryCount {
+    key: String,
+    count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProfileMemory {
+    version: i64,
+    updated_at_ms: i64,
+    exports_seen: i64,
+    kind_counts: Vec<ProfileMemoryCount>,
+    source_domain_counts: Vec<ProfileMemoryCount>,
+    prompt: String,
+    last_session_summary: String,
+}
+
+impl Default for ProfileMemory {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            updated_at_ms: 0,
+            exports_seen: 0,
+            kind_counts: Vec::new(),
+            source_domain_counts: Vec::new(),
+            prompt: String::new(),
+            last_session_summary: String::new(),
+        }
+    }
+}
+
+fn profile_file_name() -> &'static str {
+    "profile.json"
+}
+
+fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let mut out: String = s.chars().take(max_chars).collect();
+    if s.chars().count() > max_chars {
+        out.push('…');
+    }
+    out
+}
+
+fn url_domain(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let without_scheme = trimmed.split("://").nth(1).unwrap_or(trimmed);
+    let host_port = without_scheme.split('/').next().unwrap_or(without_scheme);
+    let host_port = host_port.split('@').last().unwrap_or(host_port);
+    let host = host_port.split(':').next().unwrap_or(host_port);
+    let host = host.trim();
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_lowercase())
+    }
+}
+
+fn merge_top_counts(existing: &mut Vec<ProfileMemoryCount>, adds: impl IntoIterator<Item = ProfileMemoryCount>, limit: usize) {
+    let mut map: BTreeMap<String, i64> = existing.iter().map(|e| (e.key.clone(), e.count)).collect();
+    for a in adds {
+        if a.key.trim().is_empty() {
+            continue;
+        }
+        *map.entry(a.key).or_insert(0) += a.count;
+    }
+    let mut out: Vec<ProfileMemoryCount> = map
+        .into_iter()
+        .map(|(key, count)| ProfileMemoryCount { key, count })
+        .collect();
+    out.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.key.cmp(&b.key)));
+    out.truncate(limit);
+    *existing = out;
+}
+
+fn build_profile_prompt(p: &ProfileMemory) -> String {
+    let mut lines: Vec<String> = Vec::new();
+
+    if !p.kind_counts.is_empty() {
+        let kinds = p
+            .kind_counts
+            .iter()
+            .map(|e| format!("{}({})", e.key, e.count))
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(format!("Common selected asset kinds: {}", kinds));
+    }
+
+    if !p.source_domain_counts.is_empty() {
+        let sources = p
+            .source_domain_counts
+            .iter()
+            .map(|e| format!("{}({})", e.key, e.count))
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(format!("Common input source domains: {}", sources));
+    }
+
+    if !p.last_session_summary.trim().is_empty() {
+        lines.push(format!("Last export summary: {}", p.last_session_summary.trim()));
+    }
+
+    truncate_with_ellipsis(&lines.join("\n"), 800)
+}
+
+fn load_profile(conn: &Connection) -> anyhow::Result<ProfileMemory> {
+    let row: Option<String> = conn
+        .query_row("SELECT summary FROM profile WHERE id = 1", [], |r| r.get(0))
+        .optional()?;
+
+    let Some(summary) = row else {
+        return Ok(ProfileMemory::default());
+    };
+
+    if let Ok(mut parsed) = serde_json::from_str::<ProfileMemory>(&summary) {
+        if parsed.version <= 0 {
+            parsed.version = 1;
+        }
+        return Ok(parsed);
+    }
+
+    // Backward/unknown format: treat as plain text prompt/summary.
+    Ok(ProfileMemory {
+        version: 1,
+        updated_at_ms: 0,
+        exports_seen: 0,
+        kind_counts: Vec::new(),
+        source_domain_counts: Vec::new(),
+        prompt: truncate_with_ellipsis(&summary, 800),
+        last_session_summary: truncate_with_ellipsis(&summary, 400),
+    })
+}
+
+fn save_profile(conn: &Connection, data_dir: &FsPath, profile: &ProfileMemory) -> anyhow::Result<()> {
+    let updated_at_ms = profile.updated_at_ms;
+    let json = serde_json::to_string_pretty(profile)?;
+
+    conn.execute(
+        "INSERT INTO profile (id, summary, updated_at_ms) VALUES (1, ?1, ?2)\n         ON CONFLICT(id) DO UPDATE SET summary = excluded.summary, updated_at_ms = excluded.updated_at_ms",
+        params![&json, updated_at_ms],
+    )?;
+
+    let file_abs = data_dir.join(profile_file_name());
+    std::fs::write(&file_abs, json.as_bytes()).with_context(|| format!("failed to write {}", file_abs.display()))?;
+    Ok(())
+}
+
+fn update_profile_after_export(
+    conn: &Connection,
+    data_dir: &FsPath,
+    project_id: &str,
+    ts: i64,
+    include_original_video: bool,
+    include_report: bool,
+    include_manifest: bool,
+) -> anyhow::Result<()> {
+    let kind_counts: Vec<ProfileMemoryCount> = {
+        let mut stmt = conn.prepare(
+            "SELECT kind, COUNT(*) FROM pool_items WHERE project_id = ?1 AND selected = 1 GROUP BY kind ORDER BY kind ASC",
+        )?;
+        let rows = stmt.query_map([project_id], |row| Ok(ProfileMemoryCount { key: row.get(0)?, count: row.get(1)? }))?;
+        rows.filter_map(Result::ok).collect()
+    };
+
+    let input_source_domain: Option<String> = conn
+        .query_row(
+            "SELECT path FROM artifacts WHERE project_id = ?1 AND kind = 'input_url' ORDER BY created_at_ms DESC LIMIT 1",
+            [project_id],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+        .and_then(|u| url_domain(&u));
+
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(domain) = input_source_domain.as_ref() {
+        parts.push(format!("source={domain}"));
+    }
+    if !kind_counts.is_empty() {
+        let selected = kind_counts
+            .iter()
+            .filter(|e| e.count > 0)
+            .map(|e| format!("{}({})", e.key, e.count))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if !selected.is_empty() {
+            parts.push(format!("selected={selected}"));
+        }
+    }
+    parts.push(format!("include_original_video={include_original_video}"));
+    parts.push(format!("include_report={include_report}"));
+    parts.push(format!("include_manifest={include_manifest}"));
+
+    let session_summary = truncate_with_ellipsis(&format!("Exported; {}", parts.join("; ")), 400);
+
+    // Persist per-project summary artifact.
+    {
+        let rel = format!("projects/{}/analysis/session_summary-{}.txt", project_id, ts);
+        let abs = data_dir.join(&rel);
+        if let Some(parent) = abs.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&abs, format!("{session_summary}\n"))?;
+        let art = ensure_artifact(conn, project_id, "session_summary", &rel, ts)?;
+        conn.execute(
+            "INSERT INTO events (project_id, ts_ms, level, message, data_json) VALUES (?1, ?2, 'info', 'session_summary_generated', ?3)",
+            params![project_id, ts, serde_json::json!({ "artifact_id": art.id, "path": rel }).to_string()],
+        )?;
+    }
+
+    let mut profile = load_profile(conn)?;
+    profile.exports_seen = profile.exports_seen.saturating_add(1);
+    profile.updated_at_ms = ts;
+    profile.last_session_summary = session_summary;
+
+    merge_top_counts(&mut profile.kind_counts, kind_counts, 5);
+    if let Some(domain) = input_source_domain {
+        merge_top_counts(
+            &mut profile.source_domain_counts,
+            [ProfileMemoryCount { key: domain, count: 1 }],
+            5,
+        );
+    }
+
+    profile.prompt = build_profile_prompt(&profile);
+    save_profile(conn, data_dir, &profile)?;
+
+    conn.execute(
+        "INSERT INTO events (project_id, ts_ms, level, message, data_json) VALUES (?1, ?2, 'info', 'profile_updated', ?3)",
+        params![project_id, ts, serde_json::json!({ "file": profile_file_name() }).to_string()],
+    )?;
+
+    Ok(())
 }
 
 fn init_db(db_path: &FsPath) -> anyhow::Result<()> {
@@ -1195,6 +1438,60 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     })
 }
 
+#[derive(Serialize)]
+struct ProfileResponse {
+    profile: ProfileMemory,
+    profile_rel_path: String,
+    profile_abs_path: String,
+}
+
+async fn get_profile(State(state): State<AppState>) -> AppResult<Json<ProfileResponse>> {
+    let db_path = state.db_path.clone();
+    let data_dir = state.data_dir.clone();
+
+    let resp = tokio::task::spawn_blocking(move || -> anyhow::Result<ProfileResponse> {
+        let conn = Connection::open(&db_path)?;
+        let mut profile = load_profile(&conn)?;
+        if profile.prompt.trim().is_empty() {
+            profile.prompt = build_profile_prompt(&profile);
+        }
+        Ok(ProfileResponse {
+            profile,
+            profile_rel_path: profile_file_name().to_string(),
+            profile_abs_path: data_dir.join(profile_file_name()).display().to_string(),
+        })
+    })
+    .await
+    .context("get_profile task failed")??;
+
+    Ok(Json(resp))
+}
+
+async fn reset_profile(State(state): State<AppState>) -> AppResult<Json<ProfileResponse>> {
+    let db_path = state.db_path.clone();
+    let data_dir = state.data_dir.clone();
+
+    let resp = tokio::task::spawn_blocking(move || -> anyhow::Result<ProfileResponse> {
+        let conn = Connection::open(&db_path)?;
+        conn.execute("DELETE FROM profile WHERE id = 1", [])?;
+
+        let file_abs = data_dir.join(profile_file_name());
+        if file_abs.exists() {
+            let _ = std::fs::remove_file(&file_abs);
+        }
+
+        Ok(ProfileResponse {
+            profile: ProfileMemory::default(),
+            profile_rel_path: profile_file_name().to_string(),
+            profile_abs_path: file_abs.display().to_string(),
+        })
+    })
+    .await
+    .context("reset_profile task failed")??;
+
+    Ok(Json(resp))
+}
+
 #[derive(Deserialize)]
 struct FfmpegPipelineRequest {
     input_video_artifact_id: String,
@@ -2090,6 +2387,15 @@ async fn export_zip(
                 serde_json::json!({ "zip": &zip_rel, "bytes": total_bytes }).to_string()
             ],
         )?;
+
+        if let Err(err) = update_profile_after_export(&conn, &data_dir, &project_id, ts, include_original_video, include_report, include_manifest)
+        {
+            tracing::warn!("failed to update profile after export: {err:#}");
+            let _ = conn.execute(
+                "INSERT INTO events (project_id, ts_ms, level, message, data_json) VALUES (?1, ?2, 'warn', 'profile_update_failed', ?3)",
+                params![&project_id, ts, serde_json::json!({ "error": err.to_string() }).to_string()],
+            );
+        }
 
         let download_url = format!("/projects/{}/exports/download/{}", project_id, zip_name);
         Ok(Some(ExportZipResponse {

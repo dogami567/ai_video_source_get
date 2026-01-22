@@ -19,6 +19,7 @@ type ToolserverFfmpegPipeline = {
   fingerprint: string;
   clips: ToolserverArtifact[];
 };
+type ToolserverProfile = { profile?: { prompt?: string } };
 
 const repoRoot = path.resolve(process.cwd(), "../..");
 const dataDir = path.resolve(repoRoot, process.env.DATA_DIR || "data");
@@ -69,6 +70,15 @@ async function getThinkEnabled(projectId: string): Promise<boolean> {
     return !!s.think_enabled;
   } catch {
     return true;
+  }
+}
+
+async function getProfilePrompt(): Promise<string> {
+  try {
+    const p = await toolserverJson<ToolserverProfile>(`/profile`);
+    return String(p?.profile?.prompt || "").trim();
+  } catch {
+    return "";
   }
 }
 
@@ -178,6 +188,7 @@ app.post("/api/projects/:projectId/gemini/analyze", async (req, res) => {
     const clips = pipeline.clips.slice(0, 3);
     if (clips.length === 0) return res.status(500).json({ ok: false, error: "ffmpeg pipeline returned no clips" });
 
+    const profilePrompt = await getProfilePrompt();
     const parts: any[] = [
       {
         text: [
@@ -190,6 +201,7 @@ app.post("/api/projects/:projectId/gemini/analyze", async (req, res) => {
           "- editing_steps (short steps)",
           "- search_queries (array, for finding assets)",
           "- extra_clips_needed (array of {start_s,duration_s,reason})",
+          ...(profilePrompt ? ["", "User profile (cross-project preferences):", profilePrompt] : []),
         ].join("\n"),
       },
     ];
