@@ -1,7 +1,8 @@
 use anyhow::Context;
 use axum::{
+    body::Body,
     extract::{DefaultBodyLimit, Multipart, Path, State},
-    http::StatusCode,
+    http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -15,7 +16,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::io::AsyncWriteExt;
+use tokio_util::io::ReaderStream;
 use uuid::Uuid;
+use zip::write::FileOptions;
+use zip::ZipWriter;
 
 #[derive(Serialize)]
 struct HealthResponse {
@@ -69,6 +73,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/projects/{id}/media/local", post(import_local_video))
         .route("/projects/{id}/pipeline/ffmpeg", post(ffmpeg_pipeline))
         .route("/projects/{id}/exports/report", post(generate_report))
+        .route("/projects/{id}/exports/zip/estimate", post(estimate_export_zip))
+        .route("/projects/{id}/exports/zip", post(export_zip))
+        .route("/projects/{id}/exports/download/{file}", get(download_export_file))
         .route("/projects/import/manifest", post(import_manifest))
         .layer(DefaultBodyLimit::disable())
         .with_state(state);
@@ -1764,4 +1771,372 @@ async fn import_manifest(State(state): State<AppState>, Json(manifest): Json<ser
     .context("import_manifest task failed")??;
 
     Ok(Json(project))
+}
+
+#[derive(Deserialize)]
+struct ExportZipRequest {
+    include_original_video: Option<bool>,
+    include_report: Option<bool>,
+    include_manifest: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct ExportZipFileEstimate {
+    name: String,
+    bytes: u64,
+}
+
+#[derive(Serialize)]
+struct ExportZipEstimateResponse {
+    total_bytes: u64,
+    files: Vec<ExportZipFileEstimate>,
+}
+
+async fn estimate_export_zip(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    Json(req): Json<ExportZipRequest>,
+) -> AppResult<Json<ExportZipEstimateResponse>> {
+    if project_id.trim().is_empty() {
+        return Err(AppError::BadRequest("missing project id".to_string()));
+    }
+
+    let include_original_video = req.include_original_video.unwrap_or(true);
+    let include_report = req.include_report.unwrap_or(true);
+    let include_manifest = req.include_manifest.unwrap_or(true);
+
+    let data_dir = state.data_dir.clone();
+    let db_path = state.db_path.clone();
+
+    let estimate = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<ExportZipEstimateResponse>> {
+        let conn = Connection::open(&db_path)?;
+
+        let exists: bool = conn
+            .query_row("SELECT 1 FROM projects WHERE id = ?1", [&project_id], |_row| Ok(()))
+            .optional()?
+            .is_some();
+        if !exists {
+            return Ok(None);
+        }
+
+        let mut files: Vec<ExportZipFileEstimate> = Vec::new();
+
+        if include_report {
+            if let Some((path, _)) = conn
+                .query_row(
+                    "SELECT path, created_at_ms FROM artifacts WHERE project_id = ?1 AND kind = 'report_html' ORDER BY created_at_ms DESC LIMIT 1",
+                    [&project_id],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+                )
+                .optional()?
+            {
+                let abs = data_dir.join(&path);
+                if abs.exists() {
+                    files.push(ExportZipFileEstimate {
+                        name: "report.html".to_string(),
+                        bytes: std::fs::metadata(abs)?.len(),
+                    });
+                }
+            }
+        }
+
+        if include_manifest {
+            if let Some((path, _)) = conn
+                .query_row(
+                    "SELECT path, created_at_ms FROM artifacts WHERE project_id = ?1 AND kind = 'manifest_json' ORDER BY created_at_ms DESC LIMIT 1",
+                    [&project_id],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+                )
+                .optional()?
+            {
+                let abs = data_dir.join(&path);
+                if abs.exists() {
+                    files.push(ExportZipFileEstimate {
+                        name: "manifest.json".to_string(),
+                        bytes: std::fs::metadata(abs)?.len(),
+                    });
+                }
+            }
+        }
+
+        // Always include a selected_pool.json snapshot (selected items only).
+        let selected_items: Vec<PoolItemResponse> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, project_id, kind, title, source_url, license, dedup_key, data_json, selected, created_at_ms\n                 FROM pool_items WHERE project_id = ?1 AND selected = 1 ORDER BY created_at_ms ASC",
+            )?;
+            let rows = stmt.query_map([&project_id], |row| {
+                Ok(PoolItemResponse {
+                    id: row.get(0)?,
+                    project_id: row.get(1)?,
+                    kind: row.get(2)?,
+                    title: row.get(3)?,
+                    source_url: row.get(4)?,
+                    license: row.get(5)?,
+                    dedup_key: row.get(6)?,
+                    data_json: row.get(7)?,
+                    selected: row.get::<_, i64>(8)? != 0,
+                    created_at_ms: row.get(9)?,
+                })
+            })?;
+            rows.filter_map(Result::ok).collect()
+        };
+        let selected_pool_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "project_id": &project_id,
+            "generated_at_ms": now_ms(),
+            "selected_pool_items": selected_items,
+        }))?;
+        files.push(ExportZipFileEstimate {
+            name: "selected_pool.json".to_string(),
+            bytes: selected_pool_bytes.len() as u64,
+        });
+
+        if include_original_video {
+            if let Some((path, _)) = conn
+                .query_row(
+                    "SELECT path, created_at_ms FROM artifacts WHERE project_id = ?1 AND kind = 'input_video' ORDER BY created_at_ms DESC LIMIT 1",
+                    [&project_id],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+                )
+                .optional()?
+            {
+                let abs = data_dir.join(&path);
+                if abs.exists() {
+                    let file_name = FsPath::new(&path)
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("input_video");
+                    files.push(ExportZipFileEstimate {
+                        name: format!("input_video/{}", file_name),
+                        bytes: std::fs::metadata(abs)?.len(),
+                    });
+                }
+            }
+        }
+
+        let total_bytes = files.iter().map(|f| f.bytes).sum();
+        Ok(Some(ExportZipEstimateResponse { total_bytes, files }))
+    })
+    .await
+    .context("estimate_export_zip task failed")??;
+
+    match estimate {
+        Some(e) => Ok(Json(e)),
+        None => Err(AppError::NotFound("project not found".to_string())),
+    }
+}
+
+#[derive(Serialize)]
+struct ExportZipResponse {
+    zip: ArtifactResponse,
+    total_bytes: u64,
+    download_url: String,
+}
+
+async fn export_zip(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    Json(req): Json<ExportZipRequest>,
+) -> AppResult<Json<ExportZipResponse>> {
+    if project_id.trim().is_empty() {
+        return Err(AppError::BadRequest("missing project id".to_string()));
+    }
+
+    let include_original_video = req.include_original_video.unwrap_or(true);
+    let include_report = req.include_report.unwrap_or(true);
+    let include_manifest = req.include_manifest.unwrap_or(true);
+
+    let data_dir = state.data_dir.clone();
+    let db_path = state.db_path.clone();
+
+    let res = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<ExportZipResponse>> {
+        let conn = Connection::open(&db_path)?;
+
+        let exists: bool = conn
+            .query_row("SELECT 1 FROM projects WHERE id = ?1", [&project_id], |_row| Ok(()))
+            .optional()?
+            .is_some();
+        if !exists {
+            return Ok(None);
+        }
+
+        let export_dir_rel = format!("projects/{}/out/export", project_id);
+        let export_dir_abs = data_dir.join(&export_dir_rel);
+        std::fs::create_dir_all(&export_dir_abs)?;
+
+        let report_path = if include_report {
+            conn.query_row(
+                "SELECT path FROM artifacts WHERE project_id = ?1 AND kind = 'report_html' ORDER BY created_at_ms DESC LIMIT 1",
+                [&project_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+        } else {
+            None
+        };
+
+        let manifest_path = if include_manifest {
+            conn.query_row(
+                "SELECT path FROM artifacts WHERE project_id = ?1 AND kind = 'manifest_json' ORDER BY created_at_ms DESC LIMIT 1",
+                [&project_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+        } else {
+            None
+        };
+
+        let input_video_path = if include_original_video {
+            conn.query_row(
+                "SELECT path FROM artifacts WHERE project_id = ?1 AND kind = 'input_video' ORDER BY created_at_ms DESC LIMIT 1",
+                [&project_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+        } else {
+            None
+        };
+
+        // selected_pool.json snapshot
+        let selected_items: Vec<PoolItemResponse> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, project_id, kind, title, source_url, license, dedup_key, data_json, selected, created_at_ms\n                 FROM pool_items WHERE project_id = ?1 AND selected = 1 ORDER BY created_at_ms ASC",
+            )?;
+            let rows = stmt.query_map([&project_id], |row| {
+                Ok(PoolItemResponse {
+                    id: row.get(0)?,
+                    project_id: row.get(1)?,
+                    kind: row.get(2)?,
+                    title: row.get(3)?,
+                    source_url: row.get(4)?,
+                    license: row.get(5)?,
+                    dedup_key: row.get(6)?,
+                    data_json: row.get(7)?,
+                    selected: row.get::<_, i64>(8)? != 0,
+                    created_at_ms: row.get(9)?,
+                })
+            })?;
+            rows.filter_map(Result::ok).collect()
+        };
+        let selected_pool = serde_json::json!({
+            "version": 1,
+            "project_id": &project_id,
+            "generated_at_ms": now_ms(),
+            "selected_pool_items": selected_items,
+        });
+        let selected_pool_rel = format!("{export_dir_rel}/selected_pool.json");
+        std::fs::write(data_dir.join(&selected_pool_rel), serde_json::to_vec_pretty(&selected_pool)?)?;
+
+        let ts = now_ms();
+        let zip_name = format!("vidunpack-export-{project_id}-{ts}.zip");
+        let zip_rel = format!("{export_dir_rel}/{zip_name}");
+        let zip_abs = data_dir.join(&zip_rel);
+
+        let file = std::fs::File::create(&zip_abs)?;
+        let mut zip = ZipWriter::new(file);
+        let options = FileOptions::<()>::default().compression_method(zip::CompressionMethod::Deflated);
+
+        let mut total_bytes: u64 = 0;
+
+        let add_file = |zip: &mut ZipWriter<std::fs::File>, abs: &FsPath, name: &str| -> anyhow::Result<u64> {
+            let size = std::fs::metadata(abs)?.len();
+            zip.start_file(name, options)?;
+            let mut f = std::fs::File::open(abs)?;
+            std::io::copy(&mut f, zip)?;
+            Ok(size)
+        };
+
+        // report / manifest
+        if let Some(p) = report_path {
+            let abs = data_dir.join(&p);
+            if abs.exists() {
+                total_bytes = total_bytes.saturating_add(add_file(&mut zip, &abs, "report.html")?);
+            }
+        }
+        if let Some(p) = manifest_path {
+            let abs = data_dir.join(&p);
+            if abs.exists() {
+                total_bytes = total_bytes.saturating_add(add_file(&mut zip, &abs, "manifest.json")?);
+            }
+        }
+
+        // selected_pool snapshot
+        {
+            let abs = data_dir.join(&selected_pool_rel);
+            total_bytes = total_bytes.saturating_add(add_file(&mut zip, &abs, "selected_pool.json")?);
+        }
+
+        // original video
+        if let Some(p) = input_video_path {
+            let abs = data_dir.join(&p);
+            if abs.exists() {
+                let file_name = FsPath::new(&p)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("input_video");
+                total_bytes = total_bytes.saturating_add(add_file(&mut zip, &abs, &format!("input_video/{file_name}"))?);
+            }
+        }
+
+        zip.finish()?;
+
+        let zip_art = ensure_artifact(&conn, &project_id, "export_zip", &zip_rel, ts)?;
+
+        conn.execute(
+            "INSERT INTO events (project_id, ts_ms, level, message, data_json) VALUES (?1, ?2, 'info', 'export_zip', ?3)",
+            params![
+                &project_id,
+                ts,
+                serde_json::json!({ "zip": &zip_rel, "bytes": total_bytes }).to_string()
+            ],
+        )?;
+
+        let download_url = format!("/projects/{}/exports/download/{}", project_id, zip_name);
+        Ok(Some(ExportZipResponse {
+            zip: zip_art,
+            total_bytes,
+            download_url,
+        }))
+    })
+    .await
+    .context("export_zip task failed")??;
+
+    match res {
+        Some(r) => Ok(Json(r)),
+        None => Err(AppError::NotFound("project not found".to_string())),
+    }
+}
+
+async fn download_export_file(
+    State(state): State<AppState>,
+    Path((project_id, file)): Path<(String, String)>,
+) -> AppResult<Response> {
+    if project_id.trim().is_empty() {
+        return Err(AppError::BadRequest("missing project id".to_string()));
+    }
+
+    let safe_name = sanitize_file_name(&file);
+    if safe_name.is_empty() {
+        return Err(AppError::BadRequest("invalid file".to_string()));
+    }
+
+    let rel = format!("projects/{}/out/export/{}", project_id, safe_name);
+    let abs = state.data_dir.join(&rel);
+    if !abs.exists() {
+        return Err(AppError::NotFound("file not found".to_string()));
+    }
+
+    let file = tokio::fs::File::open(&abs)
+        .await
+        .with_context(|| format!("failed to open {}", abs.display()))?;
+    let stream = ReaderStream::new(file);
+    let body = Body::from_stream(stream);
+
+    let mut res = Response::new(body);
+    res.headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/zip"));
+    let disp = format!("attachment; filename=\"{}\"", safe_name);
+    res.headers_mut()
+        .insert(header::CONTENT_DISPOSITION, HeaderValue::from_str(&disp).unwrap_or_else(|_| HeaderValue::from_static("attachment")));
+    Ok(res)
 }

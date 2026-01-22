@@ -119,6 +119,21 @@ export default function App() {
   const [reportError, setReportError] = React.useState<string | null>(null);
   const [reportOut, setReportOut] = React.useState<{ report_html: Artifact; manifest_json: Artifact } | null>(null);
 
+  const [zipIncludeVideo, setZipIncludeVideo] = React.useState(true);
+  const [zipEstimateBusy, setZipEstimateBusy] = React.useState(false);
+  const [zipEstimateError, setZipEstimateError] = React.useState<string | null>(null);
+  const [zipEstimate, setZipEstimate] = React.useState<
+    | {
+        total_bytes: number;
+        files: Array<{ name: string; bytes: number }>;
+      }
+    | null
+  >(null);
+
+  const [zipExportBusy, setZipExportBusy] = React.useState(false);
+  const [zipExportError, setZipExportError] = React.useState<string | null>(null);
+  const [zipExport, setZipExport] = React.useState<{ zip: Artifact; total_bytes: number; download_url: string } | null>(null);
+
   const [consentModalOpen, setConsentModalOpen] = React.useState(false);
   const [consentModalAutoConfirm, setConsentModalAutoConfirm] = React.useState(true);
   const [consentModalUrl, setConsentModalUrl] = React.useState<string | null>(null);
@@ -460,6 +475,42 @@ export default function App() {
       setReportError(e instanceof Error ? e.message : String(e));
     } finally {
       setReportBusy(false);
+    }
+  };
+
+  const onEstimateZip = async () => {
+    if (view.kind !== "project") return;
+    setZipEstimateError(null);
+    setZipEstimate(null);
+    setZipEstimateBusy(true);
+    try {
+      const resp = await postJson<{ total_bytes: number; files: Array<{ name: string; bytes: number }> }>(
+        `/tool/projects/${view.projectId}/exports/zip/estimate`,
+        { include_original_video: zipIncludeVideo, include_report: true, include_manifest: true },
+      );
+      setZipEstimate(resp);
+    } catch (e) {
+      setZipEstimateError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setZipEstimateBusy(false);
+    }
+  };
+
+  const onExportZip = async () => {
+    if (view.kind !== "project") return;
+    setZipExportError(null);
+    setZipExport(null);
+    setZipExportBusy(true);
+    try {
+      const resp = await postJson<{ zip: Artifact; total_bytes: number; download_url: string }>(
+        `/tool/projects/${view.projectId}/exports/zip`,
+        { include_original_video: zipIncludeVideo, include_report: true, include_manifest: true },
+      );
+      setZipExport(resp);
+    } catch (e) {
+      setZipExportError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setZipExportBusy(false);
     }
   };
 
@@ -894,6 +945,47 @@ export default function App() {
           ) : (
             <p className="muted">Not generated yet.</p>
           )}
+
+          <div className="divider" />
+
+          <h3>Zip export</h3>
+          <label className="toggle">
+            <input type="checkbox" checked={zipIncludeVideo} onChange={(e) => setZipIncludeVideo(e.target.checked)} />
+            <span>Include original video</span>
+          </label>
+          <div className="row row-gap">
+            <button className="btn btn-secondary" onClick={() => void onEstimateZip()} disabled={zipEstimateBusy || zipExportBusy}>
+              {zipEstimateBusy ? "Estimating…" : "Estimate size"}
+            </button>
+            <button className="btn" onClick={() => void onExportZip()} disabled={zipExportBusy}>
+              {zipExportBusy ? "Exporting…" : "Export zip"}
+            </button>
+          </div>
+          {zipEstimateError ? <p className="error">{zipEstimateError}</p> : null}
+          {zipEstimate ? (
+            <div className="pill">
+              <div className="pill-title">Estimate</div>
+              <div className="mono">{bytesToSize(zipEstimate.total_bytes)}</div>
+              <ul className="list">
+                {zipEstimate.files.map((f) => (
+                  <li key={f.name} className="mono">
+                    {f.name} — {bytesToSize(f.bytes)}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+          {zipExportError ? <p className="error">{zipExportError}</p> : null}
+          {zipExport ? (
+            <div className="pill">
+              <div className="pill-title">Zip</div>
+              <div className="mono">{zipExport.zip.path}</div>
+              <div className="mono">total: {bytesToSize(zipExport.total_bytes)}</div>
+              <a className="mono" href={`/tool${zipExport.download_url}`}>
+                Download
+              </a>
+            </div>
+          ) : null}
         </section>
       )}
 
