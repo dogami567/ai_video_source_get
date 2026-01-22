@@ -68,6 +68,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/projects/{id}/inputs/url", post(add_input_url))
         .route("/projects/{id}/media/local", post(import_local_video))
         .route("/projects/{id}/pipeline/ffmpeg", post(ffmpeg_pipeline))
+        .route("/projects/{id}/exports/report", post(generate_report))
+        .route("/projects/import/manifest", post(import_manifest))
         .layer(DefaultBodyLimit::disable())
         .with_state(state);
 
@@ -586,7 +588,7 @@ async fn update_project_settings(
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct PoolItemResponse {
     id: String,
     project_id: String,
@@ -848,7 +850,7 @@ async fn set_pool_item_selected(
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct ArtifactResponse {
     id: String,
     project_id: String,
@@ -1435,4 +1437,331 @@ async fn ffmpeg_pipeline(
         Some(r) => Ok(Json(r)),
         None => Err(AppError::NotFound("project not found".to_string())),
     }
+}
+
+#[derive(Serialize)]
+struct GenerateReportResponse {
+    report_html: ArtifactResponse,
+    manifest_json: ArtifactResponse,
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+async fn generate_report(State(state): State<AppState>, Path(project_id): Path<String>) -> AppResult<Json<GenerateReportResponse>> {
+    if project_id.trim().is_empty() {
+        return Err(AppError::BadRequest("missing project id".to_string()));
+    }
+
+    let data_dir = state.data_dir.clone();
+    let db_path = state.db_path.clone();
+
+    let res = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<GenerateReportResponse>> {
+        let conn = Connection::open(&db_path)?;
+
+        let mut stmt = conn.prepare("SELECT id, title, created_at_ms FROM projects WHERE id = ?1")?;
+        let mut rows = stmt.query([&project_id])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        let project_title: String = row.get(1)?;
+        let project_created_at_ms: i64 = row.get(2)?;
+
+        let consent = conn
+            .query_row(
+                "SELECT consented, auto_confirm, updated_at_ms FROM consents WHERE project_id = ?1",
+                [&project_id],
+                |r| Ok((r.get::<_, i64>(0)? != 0, r.get::<_, i64>(1)? != 0, r.get::<_, i64>(2)?)),
+            )
+            .optional()?
+            .map(|(consented, auto_confirm, updated_at_ms)| {
+                serde_json::json!({ "consented": consented, "auto_confirm": auto_confirm, "updated_at_ms": updated_at_ms })
+            })
+            .unwrap_or_else(|| serde_json::json!({ "consented": false, "auto_confirm": false, "updated_at_ms": 0 }));
+
+        let settings = conn
+            .query_row(
+                "SELECT think_enabled, updated_at_ms FROM project_settings WHERE project_id = ?1",
+                [&project_id],
+                |r| Ok((r.get::<_, i64>(0)? != 0, r.get::<_, i64>(1)?)),
+            )
+            .optional()?
+            .map(|(think_enabled, updated_at_ms)| serde_json::json!({ "think_enabled": think_enabled, "updated_at_ms": updated_at_ms }))
+            .unwrap_or_else(|| serde_json::json!({ "think_enabled": true, "updated_at_ms": 0 }));
+
+        let artifacts: Vec<ArtifactResponse> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, project_id, kind, path, created_at_ms FROM artifacts WHERE project_id = ?1 ORDER BY created_at_ms ASC",
+            )?;
+            let rows = stmt.query_map([&project_id], |r| {
+                Ok(ArtifactResponse {
+                    id: r.get(0)?,
+                    project_id: r.get(1)?,
+                    kind: r.get(2)?,
+                    path: r.get(3)?,
+                    created_at_ms: r.get(4)?,
+                })
+            })?;
+            rows.filter_map(Result::ok).collect()
+        };
+
+        let pool_items: Vec<PoolItemResponse> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, project_id, kind, title, source_url, license, dedup_key, data_json, selected, created_at_ms\n                 FROM pool_items WHERE project_id = ?1 ORDER BY created_at_ms ASC",
+            )?;
+            let rows = stmt.query_map([&project_id], |row| {
+                Ok(PoolItemResponse {
+                    id: row.get(0)?,
+                    project_id: row.get(1)?,
+                    kind: row.get(2)?,
+                    title: row.get(3)?,
+                    source_url: row.get(4)?,
+                    license: row.get(5)?,
+                    dedup_key: row.get(6)?,
+                    data_json: row.get(7)?,
+                    selected: row.get::<_, i64>(8)? != 0,
+                    created_at_ms: row.get(9)?,
+                })
+            })?;
+            rows.filter_map(Result::ok).collect()
+        };
+
+        let generated_at_ms = now_ms();
+        let manifest = serde_json::json!({
+            "version": 1,
+            "generated_at_ms": generated_at_ms,
+            "project": { "id": &project_id, "title": &project_title, "created_at_ms": project_created_at_ms },
+            "consent": consent,
+            "settings": settings,
+            "artifacts": artifacts.clone(),
+            "pool_items": pool_items.clone(),
+        });
+
+        let export_dir_rel = format!("projects/{}/out/export", project_id);
+        let export_dir_abs = data_dir.join(&export_dir_rel);
+        std::fs::create_dir_all(&export_dir_abs)?;
+
+        let manifest_rel = format!("{export_dir_rel}/manifest.json");
+        let report_rel = format!("{export_dir_rel}/report.html");
+        std::fs::write(data_dir.join(&manifest_rel), serde_json::to_vec_pretty(&manifest)?)?;
+
+        let citations_html = {
+            let mut out = String::new();
+            let exa_searches = artifacts.iter().filter(|a| a.kind == "exa_search").collect::<Vec<_>>();
+            if exa_searches.is_empty() {
+                out.push_str("<p class=\"muted\">No Exa search artifacts.</p>");
+            } else {
+                for a in exa_searches {
+                    let abs = data_dir.join(&a.path);
+                    if let Ok(bytes) = std::fs::read(&abs) {
+                        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                            let query = v.get("query").and_then(|x| x.as_str()).unwrap_or("");
+                            out.push_str(&format!("<h4>Search: {}</h4>", html_escape(query)));
+                            out.push_str("<ul>");
+                            if let Some(results) = v.get("results").and_then(|x| x.as_array()) {
+                                for r in results {
+                                    let title = r.get("title").and_then(|x| x.as_str()).unwrap_or("");
+                                    let url = r.get("url").and_then(|x| x.as_str()).unwrap_or("");
+                                    out.push_str(&format!(
+                                        "<li><a href=\"{}\">{}</a></li>",
+                                        html_escape(url),
+                                        html_escape(if title.is_empty() { url } else { title })
+                                    ));
+                                }
+                            }
+                            out.push_str("</ul>");
+                        }
+                    }
+                }
+            }
+            out
+        };
+
+        let pool_html = {
+            let mut out = String::new();
+            if pool_items.is_empty() {
+                out.push_str("<p class=\"muted\">Pool is empty.</p>");
+            } else {
+                out.push_str("<table><thead><tr><th>Selected</th><th>Kind</th><th>Title</th><th>Source</th><th>License</th></tr></thead><tbody>");
+                for it in &pool_items {
+                    out.push_str(&format!(
+                        "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                        if it.selected { "yes" } else { "no" },
+                        html_escape(&it.kind),
+                        html_escape(it.title.as_deref().unwrap_or("")),
+                        html_escape(it.source_url.as_deref().unwrap_or("")),
+                        html_escape(it.license.as_deref().unwrap_or("")),
+                    ));
+                }
+                out.push_str("</tbody></table>");
+            }
+            out
+        };
+
+        let report_html = format!(
+            r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VidUnpack Report</title>
+  <style>
+    :root {{ color-scheme: light; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }}
+    body {{ margin: 0; padding: 24px; background: #0b0f14; color: #e7eef8; }}
+    a {{ color: #93c5fd; }}
+    .muted {{ color: #9bb0c9; }}
+    .card {{ margin: 16px 0; padding: 16px; border-radius: 12px; border: 1px solid rgba(255,255,255,.08); background: rgba(255,255,255,.04); }}
+    table {{ width: 100%; border-collapse: collapse; }}
+    th, td {{ border-bottom: 1px solid rgba(255,255,255,.08); padding: 8px; text-align: left; vertical-align: top; }}
+    code, pre {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, \"Liberation Mono\", \"Courier New\", monospace; }}
+  </style>
+</head>
+<body>
+  <h1>VidUnpack Report</h1>
+  <p class="muted">Generated at {generated_at_ms}</p>
+
+  <div class="card">
+    <h2>Project</h2>
+    <p><strong>Title:</strong> {title}</p>
+    <p><strong>ID:</strong> {pid}</p>
+    <p><strong>Created:</strong> {created}</p>
+  </div>
+
+  <div class="card">
+    <h2>Asset Pool</h2>
+    {pool_html}
+  </div>
+
+  <div class="card">
+    <h2>Citations</h2>
+    {citations_html}
+  </div>
+
+  <div class="card">
+    <h2>Manifest</h2>
+    <p class="muted">This report ships with a manifest.json for reproducibility.</p>
+  </div>
+</body>
+</html>"#,
+            generated_at_ms = generated_at_ms,
+            title = html_escape(&project_title),
+            pid = html_escape(&project_id),
+            created = project_created_at_ms,
+            pool_html = pool_html,
+            citations_html = citations_html,
+        );
+
+        std::fs::write(data_dir.join(&report_rel), report_html.as_bytes())?;
+
+        let report_art = ensure_artifact(&conn, &project_id, "report_html", &report_rel, generated_at_ms)?;
+        let manifest_art = ensure_artifact(&conn, &project_id, "manifest_json", &manifest_rel, generated_at_ms)?;
+
+        conn.execute(
+            "INSERT INTO events (project_id, ts_ms, level, message, data_json) VALUES (?1, ?2, 'info', 'report_generated', ?3)",
+            params![
+                &project_id,
+                generated_at_ms,
+                serde_json::json!({ "report": &report_rel, "manifest": &manifest_rel, "version": 1 }).to_string()
+            ],
+        )?;
+
+        Ok(Some(GenerateReportResponse {
+            report_html: report_art,
+            manifest_json: manifest_art,
+        }))
+    })
+    .await
+    .context("generate_report task failed")??;
+
+    match res {
+        Some(r) => Ok(Json(r)),
+        None => Err(AppError::NotFound("project not found".to_string())),
+    }
+}
+
+async fn import_manifest(State(state): State<AppState>, Json(manifest): Json<serde_json::Value>) -> AppResult<Json<ProjectResponse>> {
+    let data_dir = state.data_dir.clone();
+    let db_path = state.db_path.clone();
+
+    let project = tokio::task::spawn_blocking(move || -> anyhow::Result<ProjectResponse> {
+        let conn = Connection::open(&db_path)?;
+
+        let title = manifest
+            .get("project")
+            .and_then(|p| p.get("title"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("imported");
+        let title = format!("imported: {}", title);
+
+        let project_id = Uuid::new_v4().to_string();
+        let created_at_ms = now_ms();
+
+        conn.execute(
+            "INSERT INTO projects (id, title, created_at_ms) VALUES (?1, ?2, ?3)",
+            params![&project_id, &title, created_at_ms],
+        )?;
+
+        let project_dir = data_dir.join("projects").join(&project_id);
+        std::fs::create_dir_all(project_dir.join("media"))?;
+        std::fs::create_dir_all(project_dir.join("assets"))?;
+        std::fs::create_dir_all(project_dir.join("out"))?;
+        std::fs::create_dir_all(project_dir.join("tmp"))?;
+
+        // Restore pool items (best-effort).
+        if let Some(items) = manifest.get("pool_items").and_then(|x| x.as_array()) {
+            for it in items {
+                let kind = it.get("kind").and_then(|x| x.as_str()).unwrap_or("link");
+                let title = it.get("title").and_then(|x| x.as_str());
+                let source_url = it.get("source_url").and_then(|x| x.as_str());
+                let license = it.get("license").and_then(|x| x.as_str());
+                let dedup_key = it
+                    .get("dedup_key")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or_else(|| source_url.unwrap_or("random"));
+                let data_json = it.get("data_json").and_then(|x| x.as_str());
+                let selected = it.get("selected").and_then(|x| x.as_bool()).unwrap_or(true);
+
+                let id = Uuid::new_v4().to_string();
+                conn.execute(
+                    "INSERT INTO pool_items (id, project_id, kind, title, source_url, license, dedup_key, data_json, selected, created_at_ms)\n                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)\n                     ON CONFLICT(project_id, dedup_key) DO UPDATE SET kind = excluded.kind, title = excluded.title, source_url = excluded.source_url, license = excluded.license, data_json = excluded.data_json, selected = excluded.selected",
+                    params![
+                        &id,
+                        &project_id,
+                        kind,
+                        title,
+                        source_url,
+                        license,
+                        dedup_key,
+                        data_json,
+                        if selected { 1 } else { 0 },
+                        created_at_ms
+                    ],
+                )?;
+            }
+        }
+
+        conn.execute(
+            "INSERT INTO events (project_id, ts_ms, level, message, data_json) VALUES (?1, ?2, 'info', 'project_imported_manifest', ?3)",
+            params![
+                &project_id,
+                created_at_ms,
+                serde_json::json!({ "version": manifest.get("version") }).to_string()
+            ],
+        )?;
+
+        Ok(ProjectResponse {
+            id: project_id,
+            title,
+            created_at_ms,
+        })
+    })
+    .await
+    .context("import_manifest task failed")??;
+
+    Ok(Json(project))
 }

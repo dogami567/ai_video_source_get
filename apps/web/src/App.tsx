@@ -115,6 +115,10 @@ export default function App() {
   const [fetchUrl, setFetchUrl] = React.useState<string | null>(null);
   const [fetchRaw, setFetchRaw] = React.useState<unknown | null>(null);
 
+  const [reportBusy, setReportBusy] = React.useState(false);
+  const [reportError, setReportError] = React.useState<string | null>(null);
+  const [reportOut, setReportOut] = React.useState<{ report_html: Artifact; manifest_json: Artifact } | null>(null);
+
   const [consentModalOpen, setConsentModalOpen] = React.useState(false);
   const [consentModalAutoConfirm, setConsentModalAutoConfirm] = React.useState(true);
   const [consentModalUrl, setConsentModalUrl] = React.useState<string | null>(null);
@@ -438,6 +442,24 @@ export default function App() {
       await refreshProject(view.projectId);
     } catch (e) {
       setProjectError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const onGenerateReport = async () => {
+    if (view.kind !== "project") return;
+    setReportError(null);
+    setReportOut(null);
+    setReportBusy(true);
+    try {
+      const resp = await fetchJson<{ report_html: Artifact; manifest_json: Artifact }>(`/tool/projects/${view.projectId}/exports/report`, {
+        method: "POST",
+      });
+      setReportOut(resp);
+      await refreshProject(view.projectId);
+    } catch (e) {
+      setReportError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setReportBusy(false);
     }
   };
 
@@ -853,6 +875,24 @@ export default function App() {
                 </div>
               ))}
             </div>
+          )}
+
+          <div className="divider" />
+
+          <h3>Static report + manifest</h3>
+          <button className="btn" onClick={() => void onGenerateReport()} disabled={reportBusy}>
+            {reportBusy ? "Generating…" : "Generate report.html + manifest.json"}
+          </button>
+          {reportError ? <p className="error">{reportError}</p> : null}
+          {reportOut ? (
+            <div className="pill">
+              <div className="pill-title">Outputs</div>
+              <div className="mono">{reportOut.report_html.path}</div>
+              <div className="mono">{reportOut.manifest_json.path}</div>
+              <p className="muted">These files are standalone on disk under your project `data/` folder.</p>
+            </div>
+          ) : (
+            <p className="muted">Not generated yet.</p>
           )}
         </section>
       )}
