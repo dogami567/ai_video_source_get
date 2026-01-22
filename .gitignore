@@ -9,6 +9,9 @@ yarn-error.log*
 dist/
 *.tsbuildinfo
 
+# Gemini-skill outputs
+out/
+
 # Rust
 target/
 

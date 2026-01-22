@@ -202,7 +202,7 @@ export default function App() {
         const cfg = await fetchJson<OrchestratorConfig>("/api/config");
         if (!cancelled && cfg?.default_model) setAnalysisModel(cfg.default_model);
       } catch {
-        // ignore config errors; fallback to default model string
+        // ignore config errors
       }
     })();
     return () => {
@@ -556,460 +556,412 @@ export default function App() {
   }, [analysisVideoArtifactId, inputVideos, view.kind]);
 
   return (
-    <div className="app">
-      <header className="header">
-        <h1>VidUnpack</h1>
-        <p className="subtitle">视频拆解箱（MVP）</p>
+    <div className="app fade-in">
+      <header className="header row row-between row-center">
+        <div>
+          <h1 className="logo-text">VidUnpack</h1>
+          <p className="subtitle">Video Decomposition Workspace</p>
+        </div>
+        <div className="status-cluster">
+           {healthError ? (
+            <span className="badge badge-error">System Error</span>
+           ) : (
+             <div className="row row-gap">
+               <div className={`status-dot ${orchHealth?.ok ? 'ok' : 'err'}`} title="Orchestrator" />
+               <div className={`status-dot ${toolHealth?.ok ? 'ok' : 'err'}`} title="Toolserver" />
+             </div>
+           )}
+        </div>
       </header>
 
-      <section className="card">
-        <div className="row row-between row-center">
-          <h2>Services</h2>
-          <button className="btn btn-secondary" onClick={refreshHealth}>
-            Refresh
-          </button>
-        </div>
-        {healthError ? (
-          <p className="error">{healthError}</p>
-        ) : (
-          <div className="grid grid-2">
-            <div className="pill">
-              <div className="pill-title">orchestrator</div>
-              <div className={orchHealth?.ok ? "ok" : "muted"}>{orchHealth?.ok ? "ok" : "…"}</div>
+      <main className="main-content">
+        {view.kind === "list" ? (
+          <section className="panel animate-slide-up">
+            <div className="panel-header row row-between row-center">
+              <h2>Projects</h2>
+              <button className="btn btn-ghost" onClick={refreshProjects} disabled={projectsLoading}>
+                Refresh
+              </button>
             </div>
-            <div className="pill">
-              <div className="pill-title">toolserver</div>
-              <div className={toolHealth?.ok ? "ok" : "muted"}>
-                {toolHealth?.ok ? `ok (ffmpeg=${toolHealth.ffmpeg ? "true" : "false"})` : "…"}
-              </div>
+
+            <div className="control-group row row-gap">
+              <input
+                className="input"
+                placeholder="New project title"
+                value={createTitle}
+                onChange={(e) => setCreateTitle(e.target.value)}
+                disabled={createBusy}
+              />
+              <button className="btn btn-primary" onClick={onCreateProject} disabled={createBusy}>
+                {createBusy ? "Creating…" : "Create Project"}
+              </button>
             </div>
-          </div>
-        )}
-      </section>
 
-      {view.kind === "list" ? (
-        <section className="card">
-          <div className="row row-between row-center">
-            <h2>Projects</h2>
-            <button className="btn btn-secondary" onClick={refreshProjects} disabled={projectsLoading}>
-              Refresh
-            </button>
-          </div>
-
-          <div className="row row-gap">
-            <input
-              className="input"
-              placeholder="New project title (optional)"
-              value={createTitle}
-              onChange={(e) => setCreateTitle(e.target.value)}
-              disabled={createBusy}
-            />
-            <button className="btn" onClick={onCreateProject} disabled={createBusy}>
-              {createBusy ? "Creating…" : "Create"}
-            </button>
-          </div>
-
-          {projectsError ? <p className="error">{projectsError}</p> : null}
-          {projectsLoading ? (
-            <p className="muted">loading…</p>
-          ) : projects.length === 0 ? (
-            <p className="muted">No projects yet.</p>
-          ) : (
-            <div className="table">
-              <div className="table-row table-head">
-                <div>Title</div>
-                <div>Created</div>
-                <div />
-              </div>
-              {projects.map((p) => (
-                <div key={p.id} className="table-row">
-                  <div className="mono">{p.title || "(untitled)"}</div>
-                  <div className="muted">{formatTs(p.created_at_ms)}</div>
-                  <div className="right">
-                    <button className="btn btn-secondary" onClick={() => onOpenProject(p.id)}>
-                      Open
-                    </button>
+            {projectsError && <div className="alert alert-error">{projectsError}</div>}
+            
+            <div className="project-list">
+              {projectsLoading ? (
+                <div className="skeleton-loader">Loading projects…</div>
+              ) : projects.length === 0 ? (
+                <div className="empty-state">No projects found. Create one to get started.</div>
+              ) : (
+                <div className="table">
+                  <div className="table-head">
+                    <div className="col">Title</div>
+                    <div className="col">Created</div>
+                    <div className="col right">Action</div>
                   </div>
+                  {projects.map((p) => (
+                    <div key={p.id} className="table-row">
+                      <div className="col mono title-cell">{p.title || "Untitled"}</div>
+                      <div className="col muted mono text-sm">{formatTs(p.created_at_ms)}</div>
+                      <div className="col right">
+                        <button className="btn btn-sm btn-secondary" onClick={() => onOpenProject(p.id)}>
+                          Open
+                        </button>
+                      </div>
+                    </div>
+                  ))}
                 </div>
-              ))}
-            </div>
-          )}
-        </section>
-      ) : (
-        <section className="card">
-          <div className="row row-between row-center">
-            <div>
-              <h2>Project</h2>
-              <div className="muted mono">{view.projectId}</div>
-            </div>
-            <button className="btn btn-secondary" onClick={onBackToList}>
-              Back
-            </button>
-          </div>
-
-          {projectLoading ? (
-            <p className="muted">loading…</p>
-          ) : projectError ? (
-            <p className="error">{projectError}</p>
-          ) : project ? (
-            <div className="grid grid-2">
-              <div className="pill">
-                <div className="pill-title">Title</div>
-                <div className="mono">{project.title || "(untitled)"}</div>
-              </div>
-              <div className="pill">
-                <div className="pill-title">Created</div>
-                <div className="mono">{formatTs(project.created_at_ms)}</div>
-              </div>
-            </div>
-          ) : null}
-
-          <div className="divider" />
-
-          <h3>Consent (project-scoped)</h3>
-          <p className="muted">
-            对外部链接的视频下载/解析可能涉及版权、平台条款或其他合规风险。我们会在每个项目里让你确认一次。
-          </p>
-          <div className="row row-between row-center">
-            <div className="mono">
-              consented: <span className={consent?.consented ? "ok" : "warn"}>{consent?.consented ? "true" : "false"}</span>
-            </div>
-            <label className="toggle">
-              <input
-                type="checkbox"
-                checked={!!consent?.auto_confirm}
-                onChange={(e) => void onToggleAutoConfirm(e.target.checked)}
-                disabled={!consent?.consented}
-              />
-              <span>以后自动确认（本项目）</span>
-            </label>
-          </div>
-
-          <div className="divider" />
-
-          <h3>Think plan</h3>
-          <div className="row row-between row-center">
-            <label className="toggle">
-              <input
-                type="checkbox"
-                checked={settings?.think_enabled ?? true}
-                onChange={(e) => void onToggleThink(e.target.checked)}
-              />
-              <span>启用 think() 面板（本项目）</span>
-            </label>
-            {lastPlanArtifact ? (
-              <span className="muted">
-                stored: <span className="mono">{lastPlanArtifact.path}</span>
-              </span>
-            ) : null}
-          </div>
-          {(settings?.think_enabled ?? true) ? (
-            lastPlan ? (
-              <pre className="code">{JSON.stringify(lastPlan, null, 2)}</pre>
-            ) : (
-              <p className="muted">no plan yet.</p>
-            )
-          ) : (
-            <p className="muted">disabled.</p>
-          )}
-
-          <div className="divider" />
-
-          <h3>Import local video</h3>
-          <div className="row row-gap">
-            <input
-              className="input"
-              type="file"
-              accept="video/*"
-              onChange={(e) => setLocalFile(e.target.files?.item(0) || null)}
-              disabled={importBusy}
-            />
-            <button className="btn" onClick={onImportLocal} disabled={importBusy || !localFile}>
-              {importBusy ? "Importing…" : "Import"}
-            </button>
-          </div>
-          {localFile ? <p className="muted">Selected: {localFile.name}</p> : null}
-          {importError ? <p className="error">{importError}</p> : null}
-
-          <div className="divider" />
-
-          <h3>Paste video URL</h3>
-          <div className="row row-gap">
-            <input
-              className="input"
-              placeholder="https://..."
-              value={inputUrl}
-              onChange={(e) => setInputUrl(e.target.value)}
-              disabled={saveUrlBusy}
-            />
-            <button className="btn" onClick={onSaveUrl} disabled={saveUrlBusy}>
-              {saveUrlBusy ? "Saving…" : "Save"}
-            </button>
-          </div>
-          {saveUrlError ? <p className="error">{saveUrlError}</p> : null}
-
-          <div className="divider" />
-
-          <h3>Inputs</h3>
-          <div className="grid grid-2">
-            <div className="pill">
-              <div className="pill-title">Local videos</div>
-              {inputVideos.length === 0 ? (
-                <div className="muted">none</div>
-              ) : (
-                <ul className="list">
-                  {inputVideos.map((a) => (
-                    <li key={a.id} className="mono">
-                      {a.path}
-                    </li>
-                  ))}
-                </ul>
               )}
             </div>
-            <div className="pill">
-              <div className="pill-title">URLs</div>
-              {inputUrls.length === 0 ? (
-                <div className="muted">none</div>
-              ) : (
-                <ul className="list">
-                  {inputUrls.map((a) => (
-                    <li key={a.id} className="mono">
-                      {a.path}
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </div>
-          </div>
-
-          <div className="divider" />
-
-          <h3>Gemini analysis</h3>
-          <div className="row row-gap row-center">
-            <input
-              className="input"
-              placeholder="model"
-              value={analysisModel}
-              onChange={(e) => setAnalysisModel(e.target.value)}
-              disabled={analysisBusy}
-            />
-            <select
-              className="input"
-              value={analysisVideoArtifactId}
-              onChange={(e) => setAnalysisVideoArtifactId(e.target.value)}
-              disabled={analysisBusy || inputVideos.length === 0}
-            >
-              {inputVideos.length === 0 ? (
-                <option value="">(no input_video)</option>
-              ) : (
-                inputVideos.map((v) => (
-                  <option key={v.id} value={v.id}>
-                    {v.path}
-                  </option>
-                ))
-              )}
-            </select>
-            <button className="btn" onClick={() => void onRunAnalysis()} disabled={analysisBusy}>
-              {analysisBusy ? "Running…" : "Analyze"}
-            </button>
-          </div>
-          {analysisError ? <p className="error">{analysisError}</p> : null}
-          {analysisArtifact ? (
-            <p className="muted">
-              stored: <span className="mono">{analysisArtifact.path}</span>
-            </p>
-          ) : null}
-          {analysisParsed ? (
-            <pre className="code">{JSON.stringify(analysisParsed, null, 2)}</pre>
-          ) : analysisText ? (
-            <pre className="code">{analysisText}</pre>
-          ) : (
-            <p className="muted">no result yet.</p>
-          )}
-
-          <div className="divider" />
-
-          <h3>Web search (Exa)</h3>
-          <p className="muted">
-            budgets: search {exaSearchCount}/3, web_fetch {webFetchCount}/3 (per project)
-          </p>
-          <div className="row row-gap row-center">
-            <input
-              className="input"
-              placeholder="Search query"
-              value={exaQuery}
-              onChange={(e) => setExaQuery(e.target.value)}
-              disabled={exaBusy || fetchBusy}
-            />
-            <button className="btn" onClick={() => void onExaSearch()} disabled={exaBusy || fetchBusy}>
-              {exaBusy ? "Searching…" : "Search"}
-            </button>
-          </div>
-          {exaError ? <p className="error">{exaError}</p> : null}
-          {exaRound ? <p className="muted">latest round: {exaRound}</p> : null}
-          {exaResults.length === 0 ? (
-            <p className="muted">no results.</p>
-          ) : (
-            <div className="table">
-              <div className="table-row table-head">
-                <div>Title</div>
-                <div>URL</div>
-                <div />
+          </section>
+        ) : (
+          <div className="project-view animate-slide-up">
+            <div className="navbar row row-between row-center">
+              <div className="breadcrumb">
+                <button className="btn btn-text" onClick={onBackToList}>&larr; Projects</button>
+                <span className="sep">/</span>
+                <span className="current">{project?.title || "Untitled"}</span>
               </div>
-              {exaResults.map((r, idx) => (
-                <div key={`${r.url || "no-url"}-${idx}`} className="table-row">
-                  <div className="mono">{r.title || "(untitled)"}</div>
-                  <div className="mono">{r.url || ""}</div>
-                  <div className="right">
-                    <div className="row row-gap">
-                      <button
-                        className="btn btn-secondary"
-                        onClick={() => (r.url ? void onWebFetch(r.url) : undefined)}
-                        disabled={!r.url || fetchBusy || exaBusy}
+              <div className="meta mono text-xs muted">ID: {view.projectId}</div>
+            </div>
+
+            {projectError && <div className="alert alert-error">{projectError}</div>}
+            {projectLoading && <div className="skeleton-loader">Loading project data…</div>}
+
+            {project && (
+              <div className="dashboard-grid">
+                {/* Left Column: Configuration & Inputs */}
+                <div className="column-config">
+                  <section className="panel">
+                    <h3 className="panel-title">Settings</h3>
+                    <div className="setting-item">
+                      <label className="toggle">
+                        <input
+                          type="checkbox"
+                          checked={!!consent?.auto_confirm}
+                          onChange={(e) => void onToggleAutoConfirm(e.target.checked)}
+                          disabled={!consent?.consented}
+                        />
+                        <span className="label-text">Auto-confirm downloads</span>
+                      </label>
+                      <div className="status-indicator">
+                        Consent: <span className={consent?.consented ? "text-ok" : "text-warn"}>{consent?.consented ? "Granted" : "Pending"}</span>
+                      </div>
+                    </div>
+                    
+                    <div className="setting-item">
+                      <label className="toggle">
+                        <input
+                          type="checkbox"
+                          checked={settings?.think_enabled ?? true}
+                          onChange={(e) => void onToggleThink(e.target.checked)}
+                        />
+                        <span className="label-text">Enable Reasoning</span>
+                      </label>
+                    </div>
+                    
+                    {(settings?.think_enabled ?? true) && lastPlan != null && (
+                      <div className="mini-terminal">
+                        <div className="terminal-header">Latest Plan</div>
+                        <pre className="code-block">{JSON.stringify(lastPlan, null, 2)}</pre>
+                      </div>
+                    )}
+                  </section>
+
+                  <section className="panel">
+                    <h3 className="panel-title">Inputs</h3>
+                    <div className="input-group">
+                      <label>Local Video</label>
+                      <div className="row row-gap">
+                        <input
+                          className="file-input"
+                          type="file"
+                          accept="video/*"
+                          onChange={(e) => setLocalFile(e.target.files?.item(0) || null)}
+                          disabled={importBusy}
+                        />
+                        <button className="btn btn-secondary" onClick={onImportLocal} disabled={importBusy || !localFile}>
+                          {importBusy ? "…" : "Import"}
+                        </button>
+                      </div>
+                      {localFile && <div className="file-name mono">{localFile.name}</div>}
+                      {importError && <div className="text-error text-xs">{importError}</div>}
+                    </div>
+
+                    <div className="input-group">
+                      <label>Video URL</label>
+                      <div className="row row-gap">
+                        <input
+                          className="input"
+                          placeholder="https://..."
+                          value={inputUrl}
+                          onChange={(e) => setInputUrl(e.target.value)}
+                          disabled={saveUrlBusy}
+                        />
+                        <button className="btn btn-secondary" onClick={onSaveUrl} disabled={saveUrlBusy}>
+                          Save
+                        </button>
+                      </div>
+                      {saveUrlError && <div className="text-error text-xs">{saveUrlError}</div>}
+                    </div>
+
+                    <div className="inventory">
+                      <div className="inventory-section">
+                        <h4>Videos ({inputVideos.length})</h4>
+                        <ul className="list-mono">
+                          {inputVideos.map(a => <li key={a.id} title={a.path}>{a.path}</li>)}
+                        </ul>
+                      </div>
+                      <div className="inventory-section">
+                        <h4>URLs ({inputUrls.length})</h4>
+                         <ul className="list-mono">
+                          {inputUrls.map(a => <li key={a.id} title={a.path}>{a.path}</li>)}
+                        </ul>
+                      </div>
+                    </div>
+                  </section>
+                </div>
+
+                {/* Right Column: Actions & Results */}
+                <div className="column-actions">
+                  <section className="panel">
+                    <h3 className="panel-title">Analysis</h3>
+                    <div className="control-bar">
+                      <input
+                        className="input"
+                        placeholder="Model ID"
+                        value={analysisModel}
+                        onChange={(e) => setAnalysisModel(e.target.value)}
+                        disabled={analysisBusy}
+                      />
+                      <select
+                        className="select"
+                        value={analysisVideoArtifactId}
+                        onChange={(e) => setAnalysisVideoArtifactId(e.target.value)}
+                        disabled={analysisBusy || inputVideos.length === 0}
                       >
-                        {fetchBusy && fetchUrl === r.url ? "Fetching…" : "Fetch"}
-                      </button>
-                      <button
-                        className="btn btn-secondary"
-                        onClick={() => (r.url ? void onAddToPool(r.url, r.title) : undefined)}
-                        disabled={!r.url}
-                      >
-                        Add
+                        {inputVideos.length === 0 ? (
+                          <option value="">No video available</option>
+                        ) : (
+                          inputVideos.map((v) => (
+                            <option key={v.id} value={v.id}>
+                              {v.path}
+                            </option>
+                          ))
+                        )}
+                      </select>
+                      <button className="btn btn-primary" onClick={() => void onRunAnalysis()} disabled={analysisBusy}>
+                        {analysisBusy ? "Analyzing…" : "Run Analysis"}
                       </button>
                     </div>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
+                    {analysisError && <div className="alert alert-error">{analysisError}</div>}
+                    
+                    <div className="analysis-output">
+                      {analysisParsed ? (
+                         <pre className="code-block">{JSON.stringify(analysisParsed, null, 2)}</pre>
+                      ) : analysisText ? (
+                         <pre className="code-block">{analysisText}</pre>
+                      ) : (
+                        <div className="placeholder-text">Analysis results will appear here.</div>
+                      )}
+                    </div>
+                  </section>
 
-          {fetchUrl ? (
-            <>
-              <h4 className="mono">web_fetch: {fetchUrl}</h4>
-              {fetchError ? <p className="error">{fetchError}</p> : null}
-              {fetchRaw ? <pre className="code">{JSON.stringify(fetchRaw, null, 2)}</pre> : <p className="muted">no content yet.</p>}
-            </>
-          ) : null}
-
-          <div className="divider" />
-
-          <h3>Asset pool (meme-first)</h3>
-          <p className="muted">
-            selected {poolSelectedCount}/{poolItems.length}
-          </p>
-          {poolItems.length === 0 ? (
-            <p className="muted">empty — use “Add” from search results.</p>
-          ) : (
-            <div className="table">
-              <div className="table-row table-head">
-                <div>Item</div>
-                <div>Provenance</div>
-                <div />
-              </div>
-              {poolItems.map((it) => (
-                <div key={it.id} className="table-row">
-                  <div>
-                    <div className="mono">{it.title || it.kind}</div>
-                    <div className="muted mono">{it.kind}</div>
-                  </div>
-                  <div className="mono">{it.source_url || ""}</div>
-                  <div className="right">
-                    <label className="toggle">
+                  <section className="panel">
+                    <div className="panel-header row row-between">
+                       <h3 className="panel-title">Context Search</h3>
+                       <div className="usage-stats mono text-xs">
+                         Exa: {exaSearchCount}/3 • Fetch: {webFetchCount}/3
+                       </div>
+                    </div>
+                    
+                    <div className="control-bar">
                       <input
-                        type="checkbox"
-                        checked={it.selected}
-                        onChange={(e) => void onTogglePoolSelected(it.id, e.target.checked)}
+                        className="input"
+                        placeholder="Search query..."
+                        value={exaQuery}
+                        onChange={(e) => setExaQuery(e.target.value)}
+                        disabled={exaBusy || fetchBusy}
                       />
-                      <span>Selected</span>
-                    </label>
-                  </div>
+                      <button className="btn btn-secondary" onClick={() => void onExaSearch()} disabled={exaBusy || fetchBusy}>
+                        {exaBusy ? "Searching…" : "Search"}
+                      </button>
+                    </div>
+                    {exaError && <div className="alert alert-error">{exaError}</div>}
+                    
+                    {exaResults.length > 0 && (
+                      <div className="results-list">
+                         {exaResults.map((r, idx) => (
+                           <div key={`${idx}`} className="result-item">
+                             <div className="result-main">
+                               <div className="result-title">{r.title || "Untitled"}</div>
+                               <a href={r.url} target="_blank" rel="noopener noreferrer" className="result-url mono">{r.url}</a>
+                             </div>
+                             <div className="result-actions">
+                                <button
+                                  className="btn btn-xs btn-secondary"
+                                  onClick={() => (r.url ? void onWebFetch(r.url) : undefined)}
+                                  disabled={!r.url || fetchBusy || exaBusy}
+                                >
+                                  Fetch
+                                </button>
+                                <button
+                                  className="btn btn-xs btn-secondary"
+                                  onClick={() => (r.url ? void onAddToPool(r.url, r.title) : undefined)}
+                                  disabled={!r.url}
+                                >
+                                  Add
+                                </button>
+                             </div>
+                           </div>
+                         ))}
+                      </div>
+                    )}
+                    
+                    {fetchUrl && (
+                      <div className="fetch-preview">
+                        <div className="preview-label">Fetched: {fetchUrl}</div>
+                        {fetchError ? (
+                           <div className="text-error">{fetchError}</div>
+                        ) : fetchRaw ? (
+                           <pre className="code-block xs">{JSON.stringify(fetchRaw, null, 2)}</pre>
+                        ) : null}
+                      </div>
+                    )}
+                  </section>
+
+                  <section className="panel">
+                    <div className="panel-header row row-between">
+                      <h3 className="panel-title">Asset Pool</h3>
+                      <div className="text-xs muted mono">Selected: {poolSelectedCount}</div>
+                    </div>
+                    
+                    <div className="pool-list">
+                      {poolItems.length === 0 ? (
+                        <div className="placeholder-text">No items in pool.</div>
+                      ) : (
+                        <div className="table">
+                          <div className="table-head">
+                             <div className="col">Asset</div>
+                             <div className="col">Source</div>
+                             <div className="col right">Select</div>
+                          </div>
+                          {poolItems.map(it => (
+                            <div key={it.id} className="table-row">
+                               <div className="col">
+                                 <div className="font-medium">{it.title || "Untitled"}</div>
+                                 <div className="badge badge-subtle">{it.kind}</div>
+                               </div>
+                               <div className="col mono text-xs text-truncate" title={it.source_url || ""}>
+                                 {it.source_url || "-"}
+                               </div>
+                               <div className="col right">
+                                 <label className="checkbox-wrapper">
+                                    <input
+                                      type="checkbox"
+                                      checked={it.selected}
+                                      onChange={(e) => void onTogglePoolSelected(it.id, e.target.checked)}
+                                    />
+                                    <span className="checkbox-custom"></span>
+                                 </label>
+                               </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </section>
+                  
+                  <section className="panel">
+                    <h3 className="panel-title">Export</h3>
+                    <div className="export-controls">
+                      <div className="row row-between row-center mb-4">
+                        <label className="toggle">
+                          <input type="checkbox" checked={zipIncludeVideo} onChange={(e) => setZipIncludeVideo(e.target.checked)} />
+                          <span className="label-text">Include original video in Zip</span>
+                        </label>
+                      </div>
+                      
+                      <div className="button-group">
+                         <button className="btn btn-secondary" onClick={() => void onGenerateReport()} disabled={reportBusy}>
+                           {reportBusy ? "Generating Report…" : "Gen Report"}
+                         </button>
+                         <button className="btn btn-secondary" onClick={() => void onEstimateZip()} disabled={zipEstimateBusy || zipExportBusy}>
+                           {zipEstimateBusy ? "Estimating…" : "Estimate Size"}
+                         </button>
+                         <button className="btn btn-primary" onClick={() => void onExportZip()} disabled={zipExportBusy}>
+                           {zipExportBusy ? "Exporting…" : "Export Zip"}
+                         </button>
+                      </div>
+                      
+                      {(reportError || zipEstimateError || zipExportError) && (
+                         <div className="alert alert-error mt-4">
+                            {reportError} {zipEstimateError} {zipExportError}
+                         </div>
+                      )}
+
+                      {(reportOut || zipEstimate || zipExport) && (
+                        <div className="export-status mt-4">
+                           {reportOut && <div className="status-line text-ok">✓ Report & Manifest generated</div>}
+                           {zipEstimate && (
+                             <div className="status-line">
+                               Estimate: <span className="mono">{bytesToSize(zipEstimate.total_bytes)}</span>
+                             </div>
+                           )}
+                           {zipExport && (
+                             <div className="status-line">
+                               <span className="text-ok">✓ Zip Ready:</span> <span className="mono">{bytesToSize(zipExport.total_bytes)}</span>
+                               <a className="download-link ml-2" href={`/tool${zipExport.download_url}`}>Download</a>
+                             </div>
+                           )}
+                        </div>
+                      )}
+                    </div>
+                  </section>
                 </div>
-              ))}
-            </div>
-          )}
-
-          <div className="divider" />
-
-          <h3>Static report + manifest</h3>
-          <button className="btn" onClick={() => void onGenerateReport()} disabled={reportBusy}>
-            {reportBusy ? "Generating…" : "Generate report.html + manifest.json"}
-          </button>
-          {reportError ? <p className="error">{reportError}</p> : null}
-          {reportOut ? (
-            <div className="pill">
-              <div className="pill-title">Outputs</div>
-              <div className="mono">{reportOut.report_html.path}</div>
-              <div className="mono">{reportOut.manifest_json.path}</div>
-              <p className="muted">These files are standalone on disk under your project `data/` folder.</p>
-            </div>
-          ) : (
-            <p className="muted">Not generated yet.</p>
-          )}
-
-          <div className="divider" />
-
-          <h3>Zip export</h3>
-          <label className="toggle">
-            <input type="checkbox" checked={zipIncludeVideo} onChange={(e) => setZipIncludeVideo(e.target.checked)} />
-            <span>Include original video</span>
-          </label>
-          <div className="row row-gap">
-            <button className="btn btn-secondary" onClick={() => void onEstimateZip()} disabled={zipEstimateBusy || zipExportBusy}>
-              {zipEstimateBusy ? "Estimating…" : "Estimate size"}
-            </button>
-            <button className="btn" onClick={() => void onExportZip()} disabled={zipExportBusy}>
-              {zipExportBusy ? "Exporting…" : "Export zip"}
-            </button>
+              </div>
+            )}
           </div>
-          {zipEstimateError ? <p className="error">{zipEstimateError}</p> : null}
-          {zipEstimate ? (
-            <div className="pill">
-              <div className="pill-title">Estimate</div>
-              <div className="mono">{bytesToSize(zipEstimate.total_bytes)}</div>
-              <ul className="list">
-                {zipEstimate.files.map((f) => (
-                  <li key={f.name} className="mono">
-                    {f.name} — {bytesToSize(f.bytes)}
-                  </li>
-                ))}
-              </ul>
-            </div>
-          ) : null}
-          {zipExportError ? <p className="error">{zipExportError}</p> : null}
-          {zipExport ? (
-            <div className="pill">
-              <div className="pill-title">Zip</div>
-              <div className="mono">{zipExport.zip.path}</div>
-              <div className="mono">total: {bytesToSize(zipExport.total_bytes)}</div>
-              <a className="mono" href={`/tool${zipExport.download_url}`}>
-                Download
-              </a>
-            </div>
-          ) : null}
-        </section>
-      )}
+        )}
+      </main>
 
-      {consentModalOpen ? (
-        <div className="modal-backdrop" role="dialog" aria-modal="true">
-          <div className="modal">
-            <h3>确认一次（本项目）</h3>
-            <p className="muted">
-              你即将保存一个外部链接，后续工作流可能会触发下载/解析。请确认你有权使用该内容，并愿意承担相应风险。
+      {consentModalOpen && (
+        <div className="modal-backdrop fade-in" role="dialog" aria-modal="true">
+          <div className="modal animate-pop">
+            <h3 className="modal-title">External Content Warning</h3>
+            <p className="modal-text">
+              You are about to save an external URL. This may trigger automated downloads or analysis. 
+              Please confirm you have the right to access and process this content.
             </p>
-            <div className="pill mono">{consentModalUrl}</div>
-            <label className="toggle">
+            <div className="modal-code">{consentModalUrl}</div>
+            
+            <label className="toggle mt-4">
               <input
                 type="checkbox"
                 checked={consentModalAutoConfirm}
                 onChange={(e) => setConsentModalAutoConfirm(e.target.checked)}
                 disabled={consentModalBusy}
               />
-              <span>以后自动确认（本项目）</span>
+              <span className="label-text">Auto-confirm for this project</span>
             </label>
-            {consentModalError ? <p className="error">{consentModalError}</p> : null}
-            <div className="row row-right row-gap">
+            
+            {consentModalError && <div className="alert alert-error mt-4">{consentModalError}</div>}
+            
+            <div className="modal-actions row row-right row-gap mt-6">
               <button
-                className="btn btn-secondary"
+                className="btn btn-ghost"
                 onClick={() => {
                   setConsentModalOpen(false);
                   setConsentModalUrl(null);
@@ -1019,13 +971,13 @@ export default function App() {
               >
                 Cancel
               </button>
-              <button className="btn" onClick={() => void onConfirmConsentAndSaveUrl()} disabled={consentModalBusy}>
-                {consentModalBusy ? "Confirming…" : "I confirm"}
+              <button className="btn btn-primary" onClick={() => void onConfirmConsentAndSaveUrl()} disabled={consentModalBusy}>
+                {consentModalBusy ? "Confirming…" : "I Confirm"}
               </button>
             </div>
           </div>
         </div>
-      ) : null}
+      )}
     </div>
   );
 }
