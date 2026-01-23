@@ -915,9 +915,9 @@ export default function App() {
                           {exaError && <div className="alert mb-2">{exaError}</div>}
 
                           {exaResults.length > 0 && (
-                            <div className="flex flex-col gap-0 border border-base rounded-md overflow-hidden">
+                            <div className="flex flex-col gap-0 border border-base rounded-md overflow-hidden bg-white/50">
                               {exaResults.map((r, i) => (
-                                <div key={i} className="p-3 border-b border-base last:border-0 hover:bg-white/5 flex gap-2 justify-between items-center">
+                                <div key={i} className="p-3 border-b border-base last:border-0 hover:bg-black/5 flex gap-2 justify-between items-center transition-colors">
                                   <div className="flex-1 overflow-hidden">
                                     <div className="text-sm font-medium truncate" title={r.title}>{r.title || tr("untitled")}</div>
                                     <a href={r.url} target="_blank" rel="noopener" className="text-xs mono text-success truncate block mt-1 opacity-80">{r.url}</a>
@@ -1010,7 +1010,7 @@ export default function App() {
                              {reportOut && <div className="text-success mb-2 font-medium">{tr("reportManifestGenerated")}</div>}
                              {zipEstimate && <div className="mono mb-2">{tr("estimateLabel")} {bytesToSize(zipEstimate.total_bytes)}</div>}
                              {zipExport && (
-                               <div className="flex flex-col gap-1 mt-2 p-3 bg-white/5 border border-base rounded-md">
+                               <div className="flex flex-col gap-1 mt-2 p-3 bg-input border border-base rounded-md">
                                   <div className="flex justify-between items-center">
                                     <span className="text-success font-bold">{tr("zipReady")}</span>
                                     <span className="mono text-muted">{bytesToSize(zipExport.total_bytes)}</span>
@@ -1035,13 +1035,13 @@ export default function App() {
        {consentModalOpen && (
         <div className="modal-backdrop" data-testid="consent-modal">
            <div className="modal-content">
-              <h3 className="text-lg font-bold mb-3 text-white">{tr("externalContentWarningTitle")}</h3>
+              <h3 className="text-lg font-bold mb-3">{tr("externalContentWarningTitle")}</h3>
               <p className="text-sm text-muted mb-4 leading-relaxed">{tr("externalContentWarningText")}</p>
-              <div className="bg-black p-3 rounded-md text-xs mono text-primary mb-6 break-all border border-base">
+              <div className="code-block text-xs text-primary mb-6 break-all">
                  {consentModalUrl}
               </div>
 
-              <label className="flex items-center gap-2 mb-6 cursor-pointer select-none">
+              <label className="flex items-center gap-2 mb-6 cursor-pointer select-none justify-center">
                   <input
                     type="checkbox"
                     checked={consentModalAutoConfirm}
