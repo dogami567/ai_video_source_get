@@ -6,6 +6,13 @@ type OrchestratorHealth = { ok: boolean; service?: string };
 type ToolserverHealth = { ok: boolean; service: string; ffmpeg: boolean; data_dir: string; db_path: string };
 type OrchestratorConfig = { ok: boolean; default_model: string; base_url: string };
 
+type ClientConfig = {
+  base_url?: string;
+  gemini_api_key?: string;
+  exa_api_key?: string;
+  default_model?: string;
+};
+
 type Project = { id: string; title: string; created_at_ms: number };
 type Consent = { project_id: string; consented: boolean; auto_confirm: boolean; updated_at_ms: number };
 type ProjectSettings = { project_id: string; think_enabled: boolean; updated_at_ms: number };
@@ -23,6 +30,49 @@ type PoolItem = {
   selected: boolean;
   created_at_ms: number;
 };
+
+const CLIENT_CONFIG_KEY = "vidunpack_client_config_v1";
+
+function normalizeClientConfig(cfg: ClientConfig): ClientConfig {
+  const out: ClientConfig = {};
+  const baseUrl = cfg.base_url?.trim();
+  const geminiKey = cfg.gemini_api_key?.trim();
+  const exaKey = cfg.exa_api_key?.trim();
+  const defaultModel = cfg.default_model?.trim();
+
+  if (baseUrl) out.base_url = baseUrl;
+  if (geminiKey) out.gemini_api_key = geminiKey;
+  if (exaKey) out.exa_api_key = exaKey;
+  if (defaultModel) out.default_model = defaultModel;
+
+  return out;
+}
+
+function loadClientConfig(): ClientConfig {
+  try {
+    const raw = localStorage.getItem(CLIENT_CONFIG_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object") return {};
+    const obj = parsed as Record<string, unknown>;
+    return normalizeClientConfig({
+      base_url: typeof obj.base_url === "string" ? obj.base_url : undefined,
+      gemini_api_key: typeof obj.gemini_api_key === "string" ? obj.gemini_api_key : undefined,
+      exa_api_key: typeof obj.exa_api_key === "string" ? obj.exa_api_key : undefined,
+      default_model: typeof obj.default_model === "string" ? obj.default_model : undefined,
+    });
+  } catch {
+    return {};
+  }
+}
+
+function saveClientConfig(cfg: ClientConfig) {
+  try {
+    localStorage.setItem(CLIENT_CONFIG_KEY, JSON.stringify(normalizeClientConfig(cfg)));
+  } catch {
+    // ignore
+  }
+}
 
 // --- API Helpers ---
 async function fetchJson<T>(input: string, init?: RequestInit): Promise<T> {
@@ -71,6 +121,7 @@ function bytesToSize(bytes: number) {
 const Header = ({
   locale,
   toggleLocale,
+  onOpenSettings,
   orchHealth,
   toolHealth,
   healthError,
@@ -78,6 +129,7 @@ const Header = ({
 }: {
   locale: Locale;
   toggleLocale: () => void;
+  onOpenSettings: () => void;
   orchHealth: OrchestratorHealth | null;
   toolHealth: ToolserverHealth | null;
   healthError: string | null;
@@ -100,6 +152,9 @@ const Header = ({
             </>
           )}
         </div>
+        <button className="btn btn-ghost btn-sm" onClick={onOpenSettings} type="button">
+          {tr("settings")}
+        </button>
         <button className="btn btn-ghost btn-sm" onClick={toggleLocale} data-testid="lang-toggle">
           {locale === "en" ? tr("langZH") : tr("langEN")}
         </button>
@@ -118,6 +173,7 @@ const ProjectList = ({
   onCreate,
   onOpen,
   onRefresh,
+  onOpenSettings,
   tr,
 }: {
   projects: Project[];
@@ -129,6 +185,7 @@ const ProjectList = ({
   onCreate: () => void;
   onOpen: (id: string) => void;
   onRefresh: () => void;
+  onOpenSettings: () => void;
   tr: (k: MessageKey) => string;
 }) => (
   <div className="panel animate-enter">
@@ -159,7 +216,23 @@ const ProjectList = ({
     {loading && projects.length === 0 ? (
       <div className="text-center text-muted py-8">{tr("loadingProjects")}</div>
     ) : projects.length === 0 ? (
-      <div className="text-center text-muted py-8">{tr("emptyProjects")}</div>
+      <div className="text-center text-muted py-8">
+        <div className="mb-4">{tr("emptyProjects")}</div>
+        <div className="onboarding">
+          <div className="text-sm font-bold text-main mb-2">{tr("quickStartTitle")}</div>
+          <ol className="onboarding-list text-sm text-muted">
+            <li>{tr("quickStartStep1")}</li>
+            <li>{tr("quickStartStep2")}</li>
+            <li>{tr("quickStartStep3")}</li>
+            <li>{tr("quickStartStep4")}</li>
+          </ol>
+          <div className="mt-4 flex justify-center">
+            <button className="btn btn-secondary btn-sm" type="button" onClick={onOpenSettings}>
+              {tr("openSettings")}
+            </button>
+          </div>
+        </div>
+      </div>
     ) : (
       <div className="table-container">
         <table className="data-table">
@@ -195,6 +268,11 @@ const ProjectList = ({
 
 // --- Main App ---
 
+type View =
+  | { kind: "list" }
+  | { kind: "settings" }
+  | { kind: "project"; projectId: string };
+
 export default function App() {
   const [locale, setLocale] = React.useState<Locale>(() => getInitialLocale());
   const tr = React.useCallback((key: MessageKey, vars?: I18nVars) => t(locale, key, vars), [locale]);
@@ -219,9 +297,22 @@ export default function App() {
   const [createTitle, setCreateTitle] = React.useState("");
   const [createBusy, setCreateBusy] = React.useState(false);
 
-  const [view, setView] = React.useState<{ kind: "list" } | { kind: "project"; projectId: string }>({
-    kind: "list",
+  const [view, setView] = React.useState<View>({ kind: "list" });
+  const returnFromSettings = React.useRef<View>({ kind: "list" });
+
+  const [clientConfig, setClientConfig] = React.useState<ClientConfig>(() => loadClientConfig());
+  const [orchConfig, setOrchConfig] = React.useState<OrchestratorConfig | null>(null);
+
+  const [settingsDraft, setSettingsDraft] = React.useState(() => {
+    const cfg = loadClientConfig();
+    return {
+      base_url: cfg.base_url ?? "",
+      gemini_api_key: cfg.gemini_api_key ?? "",
+      exa_api_key: cfg.exa_api_key ?? "",
+      default_model: cfg.default_model ?? "",
+    };
   });
+  const [settingsSavedAt, setSettingsSavedAt] = React.useState<number | null>(null);
 
   const [project, setProject] = React.useState<Project | null>(null);
   const [consent, setConsent] = React.useState<Consent | null>(null);
@@ -239,7 +330,7 @@ export default function App() {
   const [saveUrlBusy, setSaveUrlBusy] = React.useState(false);
   const [saveUrlError, setSaveUrlError] = React.useState<string | null>(null);
 
-  const [analysisModel, setAnalysisModel] = React.useState("gemini-2.0-flash-exp");
+  const [analysisModel, setAnalysisModel] = React.useState(() => clientConfig.default_model ?? "gemini-3-preview");
   const [analysisVideoArtifactId, setAnalysisVideoArtifactId] = React.useState<string>("");
   const [analysisBusy, setAnalysisBusy] = React.useState(false);
   const [analysisError, setAnalysisError] = React.useState<string | null>(null);
@@ -346,7 +437,9 @@ export default function App() {
     (async () => {
       try {
         const cfg = await fetchJson<OrchestratorConfig>("/api/config");
-        if (!cancelled && cfg?.default_model) setAnalysisModel(cfg.default_model);
+        if (cancelled) return;
+        setOrchConfig(cfg);
+        if (!clientConfig.default_model && cfg?.default_model) setAnalysisModel(cfg.default_model);
       } catch {
         // ignore config errors
       }
@@ -354,7 +447,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [clientConfig.default_model]);
 
   React.useEffect(() => {
     if (view.kind !== "project") return;
@@ -378,6 +471,44 @@ export default function App() {
 
   const onOpenProject = (projectId: string) => {
     setView({ kind: "project", projectId });
+  };
+
+  const onOpenSettings = () => {
+    returnFromSettings.current = view.kind === "settings" ? { kind: "list" } : view;
+    setSettingsDraft({
+      base_url: clientConfig.base_url ?? "",
+      gemini_api_key: clientConfig.gemini_api_key ?? "",
+      exa_api_key: clientConfig.exa_api_key ?? "",
+      default_model: clientConfig.default_model ?? "",
+    });
+    setSettingsSavedAt(null);
+    setView({ kind: "settings" });
+  };
+
+  const onCloseSettings = () => {
+    const next = returnFromSettings.current;
+    setView(next.kind === "settings" ? { kind: "list" } : next);
+  };
+
+  const onSaveSettings = () => {
+    const next = normalizeClientConfig({
+      base_url: settingsDraft.base_url,
+      gemini_api_key: settingsDraft.gemini_api_key,
+      exa_api_key: settingsDraft.exa_api_key,
+      default_model: settingsDraft.default_model,
+    });
+    saveClientConfig(next);
+    setClientConfig(next);
+    if (next.default_model) setAnalysisModel(next.default_model);
+    setSettingsSavedAt(Date.now());
+  };
+
+  const onClearSettings = () => {
+    saveClientConfig({});
+    setClientConfig({});
+    setSettingsDraft({ base_url: "", gemini_api_key: "", exa_api_key: "", default_model: "" });
+    setSettingsSavedAt(Date.now());
+    setAnalysisModel(orchConfig?.default_model ?? "gemini-3-preview");
   };
 
   const onBackToList = () => {
@@ -508,6 +639,8 @@ export default function App() {
       }>(`/api/projects/${view.projectId}/gemini/analyze`, {
         model,
         input_video_artifact_id: analysisVideoArtifactId,
+        base_url: clientConfig.base_url,
+        gemini_api_key: clientConfig.gemini_api_key,
       });
 
       setAnalysisText(resp.text || "");
@@ -545,7 +678,7 @@ export default function App() {
         round: number;
         query: string;
         results: Array<{ title?: string; url?: string }>;
-      }>(`/api/projects/${view.projectId}/exa/search`, { query });
+      }>(`/api/projects/${view.projectId}/exa/search`, { query, exa_api_key: clientConfig.exa_api_key });
       setExaRound(resp.round);
       setExaResults(resp.results || []);
       setLastPlan(resp.plan ?? null);
@@ -568,7 +701,7 @@ export default function App() {
     try {
       const resp = await postJson<{ ok: boolean; plan: unknown | null; plan_artifact?: Artifact | null; url: string; raw: unknown }>(
         `/api/projects/${view.projectId}/exa/fetch`,
-        { url },
+        { url, exa_api_key: clientConfig.exa_api_key },
       );
       setFetchRaw(resp.raw);
       setLastPlan(resp.plan ?? null);
@@ -706,6 +839,7 @@ export default function App() {
       <Header
         locale={locale}
         toggleLocale={toggleLocale}
+        onOpenSettings={onOpenSettings}
         orchHealth={orchHealth}
         toolHealth={toolHealth}
         healthError={healthError}
@@ -714,6 +848,14 @@ export default function App() {
 
       <main className="main-content">
         <div className="width-constraint">
+          {(healthError || !orchHealth?.ok || !toolHealth?.ok) && (
+            <div className="alert mb-6">
+              <div className="font-medium">{tr("backendOfflineTitle")}</div>
+              <div className="text-sm text-muted mt-1">{tr("backendOfflineDesc")}</div>
+              <div className="mono text-sm mt-2">{tr("backendOfflineCommand")} npm run dev</div>
+            </div>
+          )}
+
           {view.kind === "list" ? (
             <ProjectList
               projects={projects}
@@ -725,8 +867,104 @@ export default function App() {
               onCreate={onCreateProject}
               onOpen={onOpenProject}
               onRefresh={refreshProjects}
+              onOpenSettings={onOpenSettings}
               tr={tr}
             />
+          ) : view.kind === "settings" ? (
+            <div className="animate-enter">
+              <div className="flex items-center gap-2 mb-6">
+                <button className="btn btn-ghost btn-sm" type="button" onClick={onCloseSettings}>
+                  &larr; {tr("backToProjects")}
+                </button>
+                <span className="text-dim">/</span>
+                <span className="font-bold text-lg text-main">{tr("globalSettingsTitle")}</span>
+              </div>
+
+              <div className="panel">
+                <div className="panel-header">
+                  <div className="panel-title">{tr("globalSettingsTitle")}</div>
+                </div>
+
+                <div className="text-sm text-muted mb-6">{tr("globalSettingsHint")}</div>
+
+                <div className="settings-grid">
+                  <div className="panel">
+                    <div className="panel-header">
+                      <div className="panel-title">{tr("settingsGemini")}</div>
+                    </div>
+
+                    <div className="input-group">
+                      <label className="input-label">{tr("settingsBaseUrl")}</label>
+                      <input
+                        className="input-field"
+                        type="text"
+                        placeholder={orchConfig?.base_url ? orchConfig.base_url : "https://generativelanguage.googleapis.com"}
+                        value={settingsDraft.base_url}
+                        onChange={(e) => setSettingsDraft((p) => ({ ...p, base_url: e.target.value }))}
+                      />
+                      <div className="text-xs text-dim mt-1">{tr("settingsEmptyUsesEnv")}</div>
+                    </div>
+
+                    <div className="input-group">
+                      <label className="input-label">{tr("settingsGeminiKey")}</label>
+                      <input
+                        className="input-field"
+                        type="password"
+                        placeholder={tr("settingsKeyPlaceholder")}
+                        value={settingsDraft.gemini_api_key}
+                        onChange={(e) => setSettingsDraft((p) => ({ ...p, gemini_api_key: e.target.value }))}
+                      />
+                      <div className="text-xs text-dim mt-1">{tr("settingsEmptyUsesEnv")}</div>
+                    </div>
+
+                    <div className="input-group">
+                      <label className="input-label">{tr("settingsDefaultModel")}</label>
+                      <input
+                        className="input-field"
+                        type="text"
+                        placeholder={orchConfig?.default_model ?? "gemini-3-preview"}
+                        value={settingsDraft.default_model}
+                        onChange={(e) => setSettingsDraft((p) => ({ ...p, default_model: e.target.value }))}
+                      />
+                      <div className="text-xs text-dim mt-1">{tr("settingsEmptyUsesEnv")}</div>
+                    </div>
+                  </div>
+
+                  <div className="panel">
+                    <div className="panel-header">
+                      <div className="panel-title">{tr("settingsExa")}</div>
+                    </div>
+
+                    <div className="input-group">
+                      <label className="input-label">{tr("settingsExaKey")}</label>
+                      <input
+                        className="input-field"
+                        type="password"
+                        placeholder={tr("settingsKeyPlaceholder")}
+                        value={settingsDraft.exa_api_key}
+                        onChange={(e) => setSettingsDraft((p) => ({ ...p, exa_api_key: e.target.value }))}
+                      />
+                      <div className="text-xs text-dim mt-1">{tr("settingsEmptyUsesEnv")}</div>
+                    </div>
+
+                    <div className="text-sm text-muted">{tr("settingsExaHint")}</div>
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-between mt-6">
+                  <button className="btn btn-ghost btn-sm" type="button" onClick={onClearSettings}>
+                    {tr("clear")}
+                  </button>
+
+                  <div className="flex items-center gap-2">
+                    {settingsSavedAt && <span className="text-sm text-muted">{tr("saved")}</span>}
+                    <button className="btn btn-primary" type="button" onClick={onSaveSettings}>
+                      {tr("save")}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
           ) : (
             <div className="animate-enter">
               <div className="flex items-center gap-2 mb-6">

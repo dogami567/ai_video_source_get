@@ -12,6 +12,15 @@ npm run dev
 
 打开 `http://127.0.0.1:6785`。
 
+（Windows 一键测试启动）也可以直接双击运行 `run_test.bat`。
+
+## 设置（可选）
+
+应用右上角 **Settings/设置** 支持在浏览器本地保存 `BASE_URL`、Gemini/Exa 的 API Key 与默认模型：
+
+- 留空：使用 `.env`（环境变量）
+- 填写并保存：优先使用浏览器本地设置（localStorage）
+
 ## 依赖
 
 - Node.js (npm workspaces)

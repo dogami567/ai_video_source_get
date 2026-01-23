@@ -138,10 +138,14 @@ app.get("/api/health", (_req, res) => {
 app.get("/api/config", (_req, res) => {
   res.json({
     ok: true,
-    default_model: process.env.DEFAULT_MODEL || "gemini-3-pro-preview",
+    default_model: process.env.DEFAULT_MODEL || "gemini-3-preview",
     base_url: process.env.BASE_URL || "",
   });
 });
+
+function str(v: unknown): string {
+  return String(v ?? "").trim();
+}
 
 app.post("/api/projects/:projectId/gemini/analyze", async (req, res) => {
   try {
@@ -150,16 +154,19 @@ app.post("/api/projects/:projectId/gemini/analyze", async (req, res) => {
 
     const thinkEnabled = await getThinkEnabled(projectId);
 
-    const apiKey = String(process.env.GEMINI_API_KEY || "").trim();
+    const apiKey = str(req.body?.gemini_api_key) || str(req.body?.api_key) || str(process.env.GEMINI_API_KEY);
     if (!apiKey) {
       return res.status(400).json({
         ok: false,
-        error: "GEMINI_API_KEY is not set; set GEMINI_API_KEY (and optionally BASE_URL) in .env and restart",
+        error: "GEMINI_API_KEY is not set; set it in .env or in the UI Settings and retry",
       });
     }
 
-    const baseUrl = String(process.env.BASE_URL || "").trim() || "https://generativelanguage.googleapis.com";
-    const model = String(req.body?.model || process.env.DEFAULT_MODEL || "gemini-3-pro-preview").trim();
+    const baseUrl =
+      str(req.body?.base_url) ||
+      str(process.env.BASE_URL) ||
+      "https://generativelanguage.googleapis.com";
+    const model = str(req.body?.model) || str(process.env.DEFAULT_MODEL) || "gemini-3-preview";
 
     let inputVideoArtifactId = String(req.body?.input_video_artifact_id || "").trim();
     if (!inputVideoArtifactId) {
@@ -280,11 +287,11 @@ app.post("/api/projects/:projectId/exa/search", async (req, res) => {
 
     const thinkEnabled = await getThinkEnabled(projectId);
 
-    const apiKey = String(process.env.EXA_API_KEY || "").trim();
+    const apiKey = str(req.body?.exa_api_key) || str(req.body?.api_key) || str(process.env.EXA_API_KEY);
     if (!apiKey) {
       return res.status(400).json({
         ok: false,
-        error: "EXA_API_KEY is not set; set EXA_API_KEY in .env and restart",
+        error: "EXA_API_KEY is not set; set it in .env or in the UI Settings and retry",
       });
     }
 
@@ -338,11 +345,11 @@ app.post("/api/projects/:projectId/exa/fetch", async (req, res) => {
 
     const thinkEnabled = await getThinkEnabled(projectId);
 
-    const apiKey = String(process.env.EXA_API_KEY || "").trim();
+    const apiKey = str(req.body?.exa_api_key) || str(req.body?.api_key) || str(process.env.EXA_API_KEY);
     if (!apiKey) {
       return res.status(400).json({
         ok: false,
-        error: "EXA_API_KEY is not set; set EXA_API_KEY in .env and restart",
+        error: "EXA_API_KEY is not set; set it in .env or in the UI Settings and retry",
       });
     }
 
