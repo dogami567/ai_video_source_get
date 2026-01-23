@@ -1,5 +1,7 @@
 import React from "react";
 
+import { getInitialLocale, persistLocale, t, type I18nVars, type Locale, type MessageKey } from "./i18n";
+
 type OrchestratorHealth = { ok: boolean; service?: string };
 type ToolserverHealth = { ok: boolean; service: string; ffmpeg: boolean; data_dir: string; db_path: string };
 type OrchestratorConfig = { ok: boolean; default_model: string; base_url: string };
@@ -62,6 +64,18 @@ function bytesToSize(bytes: number) {
 }
 
 export default function App() {
+  const [locale, setLocale] = React.useState<Locale>(() => getInitialLocale());
+  const tr = React.useCallback((key: MessageKey, vars?: I18nVars) => t(locale, key, vars), [locale]);
+
+  React.useEffect(() => {
+    persistLocale(locale);
+    document.documentElement.lang = locale;
+  }, [locale]);
+
+  const toggleLocale = React.useCallback(() => {
+    setLocale((prev) => (prev === "en" ? "zh-CN" : "en"));
+  }, []);
+
   const [orchHealth, setOrchHealth] = React.useState<OrchestratorHealth | null>(null);
   const [toolHealth, setToolHealth] = React.useState<ToolserverHealth | null>(null);
   const [healthError, setHealthError] = React.useState<string | null>(null);
@@ -308,7 +322,7 @@ export default function App() {
     setSaveUrlError(null);
     const url = inputUrl.trim();
     if (!url) {
-      setSaveUrlError("请输入 URL");
+      setSaveUrlError(tr("errEnterUrl"));
       return;
     }
 
@@ -341,11 +355,11 @@ export default function App() {
 
     const model = analysisModel.trim();
     if (!model) {
-      setAnalysisError("请输入 model");
+      setAnalysisError(tr("errEnterModel"));
       return;
     }
     if (!analysisVideoArtifactId) {
-      setAnalysisError("请选择一个本地视频（input_video）");
+      setAnalysisError(tr("errPickLocalVideo"));
       return;
     }
 
@@ -386,7 +400,7 @@ export default function App() {
 
     const query = exaQuery.trim();
     if (!query) {
-      setExaError("请输入 search query");
+      setExaError(tr("errEnterSearchQuery"));
       return;
     }
 
@@ -559,18 +573,23 @@ export default function App() {
     <div className="app fade-in">
       <header className="header row row-between row-center">
         <div>
-          <h1 className="logo-text">VidUnpack</h1>
-          <p className="subtitle">Video Decomposition Workspace</p>
+          <h1 className="logo-text">{tr("appTitle")}</h1>
+          <p className="subtitle">{tr("appSubtitle")}</p>
         </div>
         <div className="status-cluster">
-           {healthError ? (
-            <span className="badge badge-error">System Error</span>
-           ) : (
-             <div className="row row-gap">
-               <div className={`status-dot ${orchHealth?.ok ? 'ok' : 'err'}`} title="Orchestrator" />
-               <div className={`status-dot ${toolHealth?.ok ? 'ok' : 'err'}`} title="Toolserver" />
-             </div>
-           )}
+          <div className="row row-gap row-center">
+            <button className="btn btn-ghost btn-xs" onClick={toggleLocale} title={tr("langToggleTitle")}>
+              {locale === "en" ? tr("langZH") : tr("langEN")}
+            </button>
+            {healthError ? (
+              <span className="badge badge-error">{tr("systemError")}</span>
+            ) : (
+              <div className="row row-gap">
+                <div className={`status-dot ${orchHealth?.ok ? "ok" : "err"}`} title={tr("orchestrator")} />
+                <div className={`status-dot ${toolHealth?.ok ? "ok" : "err"}`} title={tr("toolserver")} />
+              </div>
+            )}
+          </div>
         </div>
       </header>
 
@@ -578,22 +597,22 @@ export default function App() {
         {view.kind === "list" ? (
           <section className="panel animate-slide-up">
             <div className="panel-header row row-between row-center">
-              <h2>Projects</h2>
+              <h2>{tr("projects")}</h2>
               <button className="btn btn-ghost" onClick={refreshProjects} disabled={projectsLoading}>
-                Refresh
+                {tr("refresh")}
               </button>
             </div>
 
             <div className="control-group row row-gap">
               <input
                 className="input"
-                placeholder="New project title"
+                placeholder={tr("newProjectTitlePlaceholder")}
                 value={createTitle}
                 onChange={(e) => setCreateTitle(e.target.value)}
                 disabled={createBusy}
               />
               <button className="btn btn-primary" onClick={onCreateProject} disabled={createBusy}>
-                {createBusy ? "Creating…" : "Create Project"}
+                {createBusy ? tr("creating") : tr("createProject")}
               </button>
             </div>
 
@@ -601,23 +620,23 @@ export default function App() {
             
             <div className="project-list">
               {projectsLoading ? (
-                <div className="skeleton-loader">Loading projects…</div>
+                <div className="skeleton-loader">{tr("loadingProjects")}</div>
               ) : projects.length === 0 ? (
-                <div className="empty-state">No projects found. Create one to get started.</div>
+                <div className="empty-state">{tr("emptyProjects")}</div>
               ) : (
                 <div className="table">
                   <div className="table-head">
-                    <div className="col">Title</div>
-                    <div className="col">Created</div>
-                    <div className="col right">Action</div>
+                    <div className="col">{tr("title")}</div>
+                    <div className="col">{tr("created")}</div>
+                    <div className="col right">{tr("action")}</div>
                   </div>
                   {projects.map((p) => (
                     <div key={p.id} className="table-row">
-                      <div className="col mono title-cell">{p.title || "Untitled"}</div>
+                      <div className="col mono title-cell">{p.title || tr("untitled")}</div>
                       <div className="col muted mono text-sm">{formatTs(p.created_at_ms)}</div>
                       <div className="col right">
                         <button className="btn btn-sm btn-secondary" onClick={() => onOpenProject(p.id)}>
-                          Open
+                          {tr("open")}
                         </button>
                       </div>
                     </div>
@@ -630,22 +649,22 @@ export default function App() {
           <div className="project-view animate-slide-up">
             <div className="navbar row row-between row-center">
               <div className="breadcrumb">
-                <button className="btn btn-text" onClick={onBackToList}>&larr; Projects</button>
+                <button className="btn btn-text" onClick={onBackToList}>&larr; {tr("backToProjects")}</button>
                 <span className="sep">/</span>
-                <span className="current">{project?.title || "Untitled"}</span>
+                <span className="current">{project?.title || tr("untitled")}</span>
               </div>
-              <div className="meta mono text-xs muted">ID: {view.projectId}</div>
+              <div className="meta mono text-xs muted">{tr("idLabel")}: {view.projectId}</div>
             </div>
 
             {projectError && <div className="alert alert-error">{projectError}</div>}
-            {projectLoading && <div className="skeleton-loader">Loading project data…</div>}
+            {projectLoading && <div className="skeleton-loader">{tr("loadingProjectData")}</div>}
 
             {project && (
               <div className="dashboard-grid">
                 {/* Left Column: Configuration & Inputs */}
                 <div className="column-config">
                   <section className="panel">
-                    <h3 className="panel-title">Settings</h3>
+                    <h3 className="panel-title">{tr("settings")}</h3>
                     <div className="setting-item">
                       <label className="toggle">
                         <input
@@ -654,10 +673,10 @@ export default function App() {
                           onChange={(e) => void onToggleAutoConfirm(e.target.checked)}
                           disabled={!consent?.consented}
                         />
-                        <span className="label-text">Auto-confirm downloads</span>
+                        <span className="label-text">{tr("autoConfirmDownloads")}</span>
                       </label>
                       <div className="status-indicator">
-                        Consent: <span className={consent?.consented ? "text-ok" : "text-warn"}>{consent?.consented ? "Granted" : "Pending"}</span>
+                        {tr("consent")}: <span className={consent?.consented ? "text-ok" : "text-warn"}>{consent?.consented ? tr("granted") : tr("pending")}</span>
                       </div>
                     </div>
                     
@@ -668,22 +687,22 @@ export default function App() {
                           checked={settings?.think_enabled ?? true}
                           onChange={(e) => void onToggleThink(e.target.checked)}
                         />
-                        <span className="label-text">Enable Reasoning</span>
+                        <span className="label-text">{tr("enableReasoning")}</span>
                       </label>
                     </div>
                     
                     {(settings?.think_enabled ?? true) && lastPlan != null && (
                       <div className="mini-terminal">
-                        <div className="terminal-header">Latest Plan</div>
+                        <div className="terminal-header">{tr("latestPlan")}</div>
                         <pre className="code-block">{JSON.stringify(lastPlan, null, 2)}</pre>
                       </div>
                     )}
                   </section>
 
                   <section className="panel">
-                    <h3 className="panel-title">Inputs</h3>
+                    <h3 className="panel-title">{tr("inputs")}</h3>
                     <div className="input-group">
-                      <label>Local Video</label>
+                      <label>{tr("localVideo")}</label>
                       <div className="row row-gap">
                         <input
                           className="file-input"
@@ -693,7 +712,7 @@ export default function App() {
                           disabled={importBusy}
                         />
                         <button className="btn btn-secondary" onClick={onImportLocal} disabled={importBusy || !localFile}>
-                          {importBusy ? "…" : "Import"}
+                          {importBusy ? "…" : tr("import")}
                         </button>
                       </div>
                       {localFile && <div className="file-name mono">{localFile.name}</div>}
@@ -701,7 +720,7 @@ export default function App() {
                     </div>
 
                     <div className="input-group">
-                      <label>Video URL</label>
+                      <label>{tr("videoUrl")}</label>
                       <div className="row row-gap">
                         <input
                           className="input"
@@ -711,7 +730,7 @@ export default function App() {
                           disabled={saveUrlBusy}
                         />
                         <button className="btn btn-secondary" onClick={onSaveUrl} disabled={saveUrlBusy}>
-                          Save
+                          {tr("save")}
                         </button>
                       </div>
                       {saveUrlError && <div className="text-error text-xs">{saveUrlError}</div>}
@@ -719,13 +738,13 @@ export default function App() {
 
                     <div className="inventory">
                       <div className="inventory-section">
-                        <h4>Videos ({inputVideos.length})</h4>
+                        <h4>{tr("videosCount", { count: inputVideos.length })}</h4>
                         <ul className="list-mono">
                           {inputVideos.map(a => <li key={a.id} title={a.path}>{a.path}</li>)}
                         </ul>
                       </div>
                       <div className="inventory-section">
-                        <h4>URLs ({inputUrls.length})</h4>
+                        <h4>{tr("urlsCount", { count: inputUrls.length })}</h4>
                          <ul className="list-mono">
                           {inputUrls.map(a => <li key={a.id} title={a.path}>{a.path}</li>)}
                         </ul>
@@ -737,11 +756,11 @@ export default function App() {
                 {/* Right Column: Actions & Results */}
                 <div className="column-actions">
                   <section className="panel">
-                    <h3 className="panel-title">Analysis</h3>
+                    <h3 className="panel-title">{tr("analysis")}</h3>
                     <div className="control-bar">
                       <input
                         className="input"
-                        placeholder="Model ID"
+                        placeholder={tr("modelIdPlaceholder")}
                         value={analysisModel}
                         onChange={(e) => setAnalysisModel(e.target.value)}
                         disabled={analysisBusy}
@@ -753,7 +772,7 @@ export default function App() {
                         disabled={analysisBusy || inputVideos.length === 0}
                       >
                         {inputVideos.length === 0 ? (
-                          <option value="">No video available</option>
+                          <option value="">{tr("noVideoAvailable")}</option>
                         ) : (
                           inputVideos.map((v) => (
                             <option key={v.id} value={v.id}>
@@ -763,7 +782,7 @@ export default function App() {
                         )}
                       </select>
                       <button className="btn btn-primary" onClick={() => void onRunAnalysis()} disabled={analysisBusy}>
-                        {analysisBusy ? "Analyzing…" : "Run Analysis"}
+                        {analysisBusy ? tr("analyzing") : tr("runAnalysis")}
                       </button>
                     </div>
                     {analysisError && <div className="alert alert-error">{analysisError}</div>}
@@ -774,29 +793,29 @@ export default function App() {
                       ) : analysisText ? (
                          <pre className="code-block">{analysisText}</pre>
                       ) : (
-                        <div className="placeholder-text">Analysis results will appear here.</div>
+                        <div className="placeholder-text">{tr("analysisPlaceholder")}</div>
                       )}
                     </div>
                   </section>
 
                   <section className="panel">
                     <div className="panel-header row row-between">
-                       <h3 className="panel-title">Context Search</h3>
+                       <h3 className="panel-title">{tr("contextSearch")}</h3>
                        <div className="usage-stats mono text-xs">
-                         Exa: {exaSearchCount}/3 • Fetch: {webFetchCount}/3
+                         {tr("usageStats", { exa: exaSearchCount, fetch: webFetchCount })}
                        </div>
                     </div>
                     
                     <div className="control-bar">
                       <input
                         className="input"
-                        placeholder="Search query..."
+                        placeholder={tr("searchQueryPlaceholder")}
                         value={exaQuery}
                         onChange={(e) => setExaQuery(e.target.value)}
                         disabled={exaBusy || fetchBusy}
                       />
                       <button className="btn btn-secondary" onClick={() => void onExaSearch()} disabled={exaBusy || fetchBusy}>
-                        {exaBusy ? "Searching…" : "Search"}
+                        {exaBusy ? tr("searching") : tr("search")}
                       </button>
                     </div>
                     {exaError && <div className="alert alert-error">{exaError}</div>}
@@ -806,7 +825,7 @@ export default function App() {
                          {exaResults.map((r, idx) => (
                            <div key={`${idx}`} className="result-item">
                              <div className="result-main">
-                               <div className="result-title">{r.title || "Untitled"}</div>
+                               <div className="result-title">{r.title || tr("untitled")}</div>
                                <a href={r.url} target="_blank" rel="noopener noreferrer" className="result-url mono">{r.url}</a>
                              </div>
                              <div className="result-actions">
@@ -815,14 +834,14 @@ export default function App() {
                                   onClick={() => (r.url ? void onWebFetch(r.url) : undefined)}
                                   disabled={!r.url || fetchBusy || exaBusy}
                                 >
-                                  Fetch
+                                  {tr("fetch")}
                                 </button>
                                 <button
                                   className="btn btn-xs btn-secondary"
                                   onClick={() => (r.url ? void onAddToPool(r.url, r.title) : undefined)}
                                   disabled={!r.url}
                                 >
-                                  Add
+                                  {tr("add")}
                                 </button>
                              </div>
                            </div>
@@ -832,7 +851,7 @@ export default function App() {
                     
                     {fetchUrl && (
                       <div className="fetch-preview">
-                        <div className="preview-label">Fetched: {fetchUrl}</div>
+                        <div className="preview-label">{tr("fetched", { url: fetchUrl })}</div>
                         {fetchError ? (
                            <div className="text-error">{fetchError}</div>
                         ) : fetchRaw ? (
@@ -844,24 +863,24 @@ export default function App() {
 
                   <section className="panel">
                     <div className="panel-header row row-between">
-                      <h3 className="panel-title">Asset Pool</h3>
-                      <div className="text-xs muted mono">Selected: {poolSelectedCount}</div>
+                      <h3 className="panel-title">{tr("assetPool")}</h3>
+                      <div className="text-xs muted mono">{tr("selected", { count: poolSelectedCount })}</div>
                     </div>
                     
                     <div className="pool-list">
                       {poolItems.length === 0 ? (
-                        <div className="placeholder-text">No items in pool.</div>
+                        <div className="placeholder-text">{tr("noItemsInPool")}</div>
                       ) : (
                         <div className="table">
                           <div className="table-head">
-                             <div className="col">Asset</div>
-                             <div className="col">Source</div>
-                             <div className="col right">Select</div>
+                             <div className="col">{tr("asset")}</div>
+                             <div className="col">{tr("source")}</div>
+                             <div className="col right">{tr("select")}</div>
                           </div>
                           {poolItems.map(it => (
                             <div key={it.id} className="table-row">
                                <div className="col">
-                                 <div className="font-medium">{it.title || "Untitled"}</div>
+                                 <div className="font-medium">{it.title || tr("untitled")}</div>
                                  <div className="badge badge-subtle">{it.kind}</div>
                                </div>
                                <div className="col mono text-xs text-truncate" title={it.source_url || ""}>
@@ -885,24 +904,24 @@ export default function App() {
                   </section>
                   
                   <section className="panel">
-                    <h3 className="panel-title">Export</h3>
+                    <h3 className="panel-title">{tr("export")}</h3>
                     <div className="export-controls">
                       <div className="row row-between row-center mb-4">
                         <label className="toggle">
                           <input type="checkbox" checked={zipIncludeVideo} onChange={(e) => setZipIncludeVideo(e.target.checked)} />
-                          <span className="label-text">Include original video in Zip</span>
+                          <span className="label-text">{tr("includeOriginalVideo")}</span>
                         </label>
                       </div>
                       
                       <div className="button-group">
                          <button className="btn btn-secondary" onClick={() => void onGenerateReport()} disabled={reportBusy}>
-                           {reportBusy ? "Generating Report…" : "Gen Report"}
+                           {reportBusy ? tr("generatingReport") : tr("genReport")}
                          </button>
                          <button className="btn btn-secondary" onClick={() => void onEstimateZip()} disabled={zipEstimateBusy || zipExportBusy}>
-                           {zipEstimateBusy ? "Estimating…" : "Estimate Size"}
+                           {zipEstimateBusy ? tr("estimating") : tr("estimateSize")}
                          </button>
                          <button className="btn btn-primary" onClick={() => void onExportZip()} disabled={zipExportBusy}>
-                           {zipExportBusy ? "Exporting…" : "Export Zip"}
+                           {zipExportBusy ? tr("exporting") : tr("exportZip")}
                          </button>
                       </div>
                       
@@ -914,16 +933,16 @@ export default function App() {
 
                       {(reportOut || zipEstimate || zipExport) && (
                         <div className="export-status mt-4">
-                           {reportOut && <div className="status-line text-ok">✓ Report & Manifest generated</div>}
+                           {reportOut && <div className="status-line text-ok">{tr("reportManifestGenerated")}</div>}
                            {zipEstimate && (
                              <div className="status-line">
-                               Estimate: <span className="mono">{bytesToSize(zipEstimate.total_bytes)}</span>
+                               {tr("estimateLabel")} <span className="mono">{bytesToSize(zipEstimate.total_bytes)}</span>
                              </div>
                            )}
                            {zipExport && (
                              <div className="status-line">
-                               <span className="text-ok">✓ Zip Ready:</span> <span className="mono">{bytesToSize(zipExport.total_bytes)}</span>
-                               <a className="download-link ml-2" href={`/tool${zipExport.download_url}`}>Download</a>
+                               <span className="text-ok">{tr("zipReady")}</span> <span className="mono">{bytesToSize(zipExport.total_bytes)}</span>
+                               <a className="download-link ml-2" href={`/tool${zipExport.download_url}`}>{tr("download")}</a>
                              </div>
                            )}
                         </div>
@@ -940,10 +959,9 @@ export default function App() {
       {consentModalOpen && (
         <div className="modal-backdrop fade-in" role="dialog" aria-modal="true">
           <div className="modal animate-pop">
-            <h3 className="modal-title">External Content Warning</h3>
+            <h3 className="modal-title">{tr("externalContentWarningTitle")}</h3>
             <p className="modal-text">
-              You are about to save an external URL. This may trigger automated downloads or analysis. 
-              Please confirm you have the right to access and process this content.
+              {tr("externalContentWarningText")}
             </p>
             <div className="modal-code">{consentModalUrl}</div>
             
@@ -954,7 +972,7 @@ export default function App() {
                 onChange={(e) => setConsentModalAutoConfirm(e.target.checked)}
                 disabled={consentModalBusy}
               />
-              <span className="label-text">Auto-confirm for this project</span>
+              <span className="label-text">{tr("autoConfirmForThisProject")}</span>
             </label>
             
             {consentModalError && <div className="alert alert-error mt-4">{consentModalError}</div>}
@@ -969,10 +987,10 @@ export default function App() {
                 }}
                 disabled={consentModalBusy}
               >
-                Cancel
+                {tr("cancel")}
               </button>
               <button className="btn btn-primary" onClick={() => void onConfirmConsentAndSaveUrl()} disabled={consentModalBusy}>
-                {consentModalBusy ? "Confirming…" : "I Confirm"}
+                {consentModalBusy ? tr("confirming") : tr("iConfirm")}
               </button>
             </div>
           </div>
