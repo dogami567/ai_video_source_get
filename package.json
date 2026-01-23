@@ -5,7 +5,7 @@
     "apps/*"
   ],
   "scripts": {
-    "dev": "node scripts/predev.mjs --all && concurrently -n web,orchestrator,toolserver -c green,blue,magenta \"npm -w @vidunpack/web run dev\" \"npm -w @vidunpack/orchestrator run dev\" \"node scripts/run-toolserver.mjs\"",
+    "dev": "node scripts/predev.mjs --all && concurrently --kill-others-on-fail -n web,orchestrator,toolserver -c green,blue,magenta \"npm -w @vidunpack/web run dev\" \"npm -w @vidunpack/orchestrator run dev\" \"node scripts/run-toolserver.mjs\"",
     "dev:web": "npm -w @vidunpack/web run dev",
     "dev:orchestrator": "npm -w @vidunpack/orchestrator run dev",
     "dev:toolserver": "node scripts/run-toolserver.mjs",

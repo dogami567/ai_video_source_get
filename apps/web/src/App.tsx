@@ -152,7 +152,7 @@ const Header = ({
             </>
           )}
         </div>
-        <button className="btn btn-ghost btn-sm" onClick={onOpenSettings} type="button">
+        <button className="btn btn-ghost btn-sm" onClick={onOpenSettings} type="button" data-testid="open-settings">
           {tr("settings")}
         </button>
         <button className="btn btn-ghost btn-sm" onClick={toggleLocale} data-testid="lang-toggle">
@@ -863,7 +863,7 @@ export default function App() {
       <main className="main-content">
         <div className="width-constraint">
           {(healthError || !orchHealth?.ok || !toolHealth?.ok) && (
-            <div className="alert mb-6">
+            <div className="alert mb-6" data-testid="backend-offline">
               <div className="font-medium">{tr("backendOfflineTitle")}</div>
               <div className="text-sm text-muted mt-1">{tr("backendOfflineDesc")}</div>
               <div className="mono text-sm mt-2">{tr("backendOfflineCommand")} npm run dev</div>
@@ -887,7 +887,7 @@ export default function App() {
           ) : view.kind === "settings" ? (
             <div className="animate-enter">
               <div className="flex items-center gap-2 mb-6">
-                <button className="btn btn-ghost btn-sm" type="button" onClick={onCloseSettings}>
+                <button className="btn btn-ghost btn-sm" type="button" onClick={onCloseSettings} data-testid="settings-back">
                   &larr; {tr("backToProjects")}
                 </button>
                 <span className="text-dim">/</span>
@@ -912,6 +912,7 @@ export default function App() {
                       <input
                         className="input-field"
                         type="text"
+                        data-testid="settings-base-url"
                         placeholder={orchConfig?.base_url ? orchConfig.base_url : "https://generativelanguage.googleapis.com"}
                         value={settingsDraft.base_url}
                         onChange={(e) => setSettingsDraft((p) => ({ ...p, base_url: e.target.value }))}
@@ -924,6 +925,7 @@ export default function App() {
                       <input
                         className="input-field"
                         type="password"
+                        data-testid="settings-gemini-key"
                         placeholder={tr("settingsKeyPlaceholder")}
                         value={settingsDraft.gemini_api_key}
                         onChange={(e) => setSettingsDraft((p) => ({ ...p, gemini_api_key: e.target.value }))}
@@ -936,6 +938,7 @@ export default function App() {
                       <input
                         className="input-field"
                         type="text"
+                        data-testid="settings-default-model"
                         placeholder={orchConfig?.default_model ?? "gemini-3-preview"}
                         value={settingsDraft.default_model}
                         onChange={(e) => setSettingsDraft((p) => ({ ...p, default_model: e.target.value }))}
@@ -954,6 +957,7 @@ export default function App() {
                       <input
                         className="input-field"
                         type="password"
+                        data-testid="settings-exa-key"
                         placeholder={tr("settingsKeyPlaceholder")}
                         value={settingsDraft.exa_api_key}
                         onChange={(e) => setSettingsDraft((p) => ({ ...p, exa_api_key: e.target.value }))}
@@ -966,13 +970,17 @@ export default function App() {
                 </div>
 
                 <div className="flex items-center justify-between mt-6">
-                  <button className="btn btn-ghost btn-sm" type="button" onClick={onClearSettings}>
+                  <button className="btn btn-ghost btn-sm" type="button" onClick={onClearSettings} data-testid="settings-clear">
                     {tr("clear")}
                   </button>
 
                   <div className="flex items-center gap-2">
-                    {settingsSavedAt && <span className="text-sm text-muted">{tr("saved")}</span>}
-                    <button className="btn btn-primary" type="button" onClick={onSaveSettings}>
+                    {settingsSavedAt && (
+                      <span className="text-sm text-muted" data-testid="settings-saved">
+                        {tr("saved")}
+                      </span>
+                    )}
+                    <button className="btn btn-primary" type="button" onClick={onSaveSettings} data-testid="settings-save">
                       {tr("save")}
                     </button>
                   </div>
@@ -1011,10 +1019,11 @@ export default function App() {
                                 className="flex-1 input-field"
                                 type="file"
                                 accept="video/*"
+                                data-testid="local-file-input"
                                 onChange={(e) => setLocalFile(e.target.files?.item(0) || null)}
                                 disabled={importBusy}
                              />
-                             <button className="btn btn-secondary" onClick={onImportLocal} disabled={importBusy || !localFile}>
+                             <button className="btn btn-secondary" onClick={onImportLocal} disabled={importBusy || !localFile} data-testid="import-local">
                                {importBusy ? "…" : tr("import")}
                              </button>
                            </div>
@@ -1060,13 +1069,14 @@ export default function App() {
                         </div>
                         <div className="flex justify-between items-center mb-4">
                            <span className="text-sm text-secondary">{tr("autoConfirmDownloads")}</span>
-                           <label className="toggle-switch">
+                           <label className="toggle-switch" data-testid="toggle-auto-confirm-ui">
                               <input
                                 type="checkbox"
                                 hidden
                                 checked={!!consent?.auto_confirm}
                                 onChange={(e) => void onToggleAutoConfirm(e.target.checked)}
                                 disabled={!consent?.consented}
+                                data-testid="toggle-auto-confirm"
                               />
                               <div className="toggle-track"><div className="toggle-knob"/></div>
                            </label>
@@ -1074,7 +1084,7 @@ export default function App() {
                         
                         <div className="flex justify-between items-center">
                            <span className="text-sm text-secondary">{tr("enableReasoning")}</span>
-                           <label className="toggle-switch">
+                           <label className="toggle-switch" data-testid="toggle-think-ui">
                               <input
                                 type="checkbox"
                                 hidden
@@ -1094,15 +1104,15 @@ export default function App() {
                         </div>
                         
                         <label className="flex items-center gap-2 mb-4 cursor-pointer select-none">
-                           <input type="checkbox" checked={zipIncludeVideo} onChange={e => setZipIncludeVideo(e.target.checked)} />
+                           <input type="checkbox" checked={zipIncludeVideo} onChange={e => setZipIncludeVideo(e.target.checked)} data-testid="include-original-video" />
                            <span className="text-sm">{tr("includeOriginalVideo")}</span>
                         </label>
 
                         <div className="flex flex-col gap-2">
-                           <button className="btn btn-secondary w-full" onClick={() => void onGenerateReport()} disabled={reportBusy}>
+                           <button className="btn btn-secondary w-full" onClick={() => void onGenerateReport()} disabled={reportBusy} data-testid="gen-report">
                              {reportBusy ? tr("generatingReport") : tr("genReport")}
                            </button>
-                           <button className="btn btn-secondary w-full" onClick={() => void onEstimateZip()} disabled={zipEstimateBusy}>
+                           <button className="btn btn-secondary w-full" onClick={() => void onEstimateZip()} disabled={zipEstimateBusy} data-testid="estimate-zip">
                              {zipEstimateBusy ? tr("estimating") : tr("estimateSize")}
                            </button>
                            <button className="btn btn-primary w-full" onClick={() => void onExportZip()} disabled={zipExportBusy} data-testid="export-zip">

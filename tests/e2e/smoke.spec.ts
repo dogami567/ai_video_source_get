@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 
-test("smoke: create project, save url with consent, export zip", async ({ page, request }) => {
+test("smoke: non-API flows (settings, project, import, export)", async ({ page, request }) => {
   await page.goto("/");
 
   // Wait for backend services (orchestrator + toolserver) to be ready.
@@ -31,6 +31,29 @@ test("smoke: create project, save url with consent, export zip", async ({ page, 
   await waitForOk("/api/health");
   await waitForOk("/tool/health");
 
+  // Backend banner should not be shown once health endpoints are ok.
+  await expect(page.getByTestId("backend-offline")).toHaveCount(0);
+
+  // Global Settings (local-only, no API calls).
+  await page.getByTestId("open-settings").click();
+  await expect(page.getByTestId("settings-save")).toBeVisible();
+
+  await page.getByTestId("settings-base-url").fill("https://example.invalid");
+  await page.getByTestId("settings-gemini-key").fill("test-key");
+  await page.getByTestId("settings-default-model").fill("gemini-3-preview");
+  await page.getByTestId("settings-exa-key").fill("test-key");
+
+  await page.getByTestId("settings-save").click();
+  await expect(page.getByTestId("settings-saved")).toBeVisible();
+
+  await page.getByTestId("settings-clear").click();
+  await expect(page.getByTestId("settings-base-url")).toHaveValue("");
+  await expect(page.getByTestId("settings-gemini-key")).toHaveValue("");
+  await expect(page.getByTestId("settings-default-model")).toHaveValue("");
+  await expect(page.getByTestId("settings-exa-key")).toHaveValue("");
+
+  await page.getByTestId("settings-back").click();
+
   const createInput = page.getByTestId("create-project-input");
   await expect(createInput).toBeVisible();
 
@@ -42,6 +65,11 @@ test("smoke: create project, save url with consent, export zip", async ({ page, 
   await createInput.fill(`e2e-${Date.now()}`);
   await page.getByTestId("create-project-btn").click();
   await expect(page.getByTestId("back-to-list")).toBeVisible();
+
+  // Import local "video" (no ffmpeg pipeline; just verifies upload path works).
+  await page.getByTestId("local-file-input").setInputFiles("tests/fixtures/sample.mp4");
+  await page.getByTestId("import-local").click();
+  await expect(page.locator('div[title*=".mp4"]')).toBeVisible();
 
   const url = "https://example.com/video";
   await page.getByTestId("input-url").fill(url);
@@ -58,6 +86,28 @@ test("smoke: create project, save url with consent, export zip", async ({ page, 
 
   await expect(page.locator(`div[title="${url}"]`)).toBeVisible();
 
+  // Project toggles (non-API).
+  await expect(page.getByTestId("toggle-auto-confirm")).toBeEnabled();
+  await page.getByTestId("toggle-auto-confirm-ui").click();
+  await page.getByTestId("toggle-auto-confirm-ui").click();
+
+  await page.getByTestId("toggle-think-ui").click();
+  await page.getByTestId("toggle-think-ui").click();
+
+  // Export helpers (non-API).
+  await page.getByTestId("include-original-video").click();
+  await page.getByTestId("include-original-video").click();
+
+  await page.getByTestId("gen-report").click();
+  await expect(page.getByText(/Report & Manifest generated|已生成报告与清单/i)).toBeVisible({ timeout: 60_000 });
+
+  await page.getByTestId("estimate-zip").click();
+  await expect(page.getByText(/Estimate:|预计：/i)).toBeVisible({ timeout: 60_000 });
+
   await page.getByTestId("export-zip").click();
   await expect(page.getByRole("link", { name: /download|下载/i })).toBeVisible({ timeout: 60_000 });
+
+  // Back to project list should still work.
+  await page.getByTestId("back-to-list").click();
+  await expect(page.getByTestId("create-project-input")).toBeVisible();
 });

@@ -54,4 +54,4 @@ echo [vidunpack] Starting backend (orchestrator=%ORCHESTRATOR_PORT% toolserver=%
 start "" "http://127.0.0.1:%ORCHESTRATOR_PORT%/api/health"
 
 REM Run orchestrator + toolserver together
-npx concurrently -n orchestrator,toolserver -c blue,magenta "npm -w @vidunpack/orchestrator run dev" "node scripts/run-toolserver.mjs"
+npx concurrently --kill-others-on-fail -n orchestrator,toolserver -c blue,magenta "npm -w @vidunpack/orchestrator run dev" "node scripts/run-toolserver.mjs"

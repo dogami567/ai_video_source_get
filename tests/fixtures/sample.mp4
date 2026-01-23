@@ -1,0 +1,2 @@
+This is a tiny placeholder file used by Playwright E2E tests.
+It is NOT a real video; the backend should accept arbitrary bytes for local import.
