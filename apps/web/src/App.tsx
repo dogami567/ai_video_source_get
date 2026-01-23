@@ -979,55 +979,17 @@ export default function App() {
               {projectLoading && <div className="text-center text-muted mb-4">{tr("loadingProjectData")}</div>}
 
               {project && (
-                <div className="dashboard-grid">
-                  {/* Column 1: Config */}
-                  <div className="flex flex-col gap-4">
-                    <div className="panel">
-                      <div className="panel-header">
-                        <div className="panel-title">{tr("colConfig")}</div>
-                      </div>
-
-                      {/* Settings */}
-                      <div className="mb-6">
-                        <div className="text-xs font-bold text-muted uppercase mb-3">{tr("settings")}</div>
-                        <div className="flex justify-between items-center mb-3">
-                           <span className="text-sm">{tr("autoConfirmDownloads")}</span>
-                           <label className="toggle-switch">
-                              <input
-                                type="checkbox"
-                                hidden
-                                checked={!!consent?.auto_confirm}
-                                onChange={(e) => void onToggleAutoConfirm(e.target.checked)}
-                                disabled={!consent?.consented}
-                              />
-                              <div className="toggle-track"><div className="toggle-knob"/></div>
-                           </label>
+                <div className="main-layout">
+                  {/* --- Left Sidebar: Context & Controls --- */}
+                  <aside className="layout-sidebar">
+                    <div className="flex flex-col gap-4">
+                      
+                      {/* Inputs Panel */}
+                      <div className="panel">
+                        <div className="panel-header">
+                          <div className="panel-title">{tr("inputs")}</div>
                         </div>
-                        <div className="text-xs text-dim mb-4 flex justify-between">
-                           {tr("consent")}: 
-                           <span className={consent?.consented ? "text-success" : "text-warn"}>
-                              {consent?.consented ? tr("granted") : tr("pending")}
-                           </span>
-                        </div>
-
-                        <div className="flex justify-between items-center">
-                           <span className="text-sm">{tr("enableReasoning")}</span>
-                           <label className="toggle-switch">
-                              <input
-                                type="checkbox"
-                                hidden
-                                checked={settings?.think_enabled ?? true}
-                                onChange={(e) => void onToggleThink(e.target.checked)}
-                                data-testid="toggle-think"
-                              />
-                               <div className="toggle-track"><div className="toggle-knob"/></div>
-                           </label>
-                        </div>
-                      </div>
-
-                      {/* Inputs */}
-                      <div>
-                        <div className="text-xs font-bold text-muted uppercase mb-3">{tr("inputs")}</div>
+                        
                         <div className="input-group">
                            <label className="input-label">{tr("localVideo")}</label>
                            <div className="flex gap-2">
@@ -1069,78 +1031,167 @@ export default function App() {
                             {saveUrlError && <div className="text-error text-xs mt-1">{saveUrlError}</div>}
                          </div>
 
-                        <div className="mt-4 border-t border-base pt-4">
+                        <div className="mt-2 border-t border-base pt-4">
                           <div className="text-xs text-dim mb-2">{tr("videosCount", { count: inputVideos.length })}</div>
                           {inputVideos.map(v => <div key={v.id} className="text-xs mono truncate text-muted mb-1" title={v.path}>• {v.path}</div>)}
                           <div className="text-xs text-dim mt-3 mb-2">{tr("urlsCount", { count: inputUrls.length })}</div>
                           {inputUrls.map(u => <div key={u.id} className="text-xs mono truncate text-muted mb-1" title={u.path}>• {u.path}</div>)}
                         </div>
                       </div>
-                    </div>
-                  </div>
 
-                  {/* Column 2: Workspace */}
-                  <div className="flex flex-col gap-4">
-                    <div className="panel">
-                       <div className="panel-header">
-                         <div className="panel-title">{tr("colWorkspace")}</div>
-                       </div>
-                       
-                       {/* Analysis */}
-                       <div className="mb-8">
-                         <div className="text-xs font-bold text-muted uppercase mb-3">{tr("analysis")}</div>
-                         <div className="flex gap-2 mb-3">
-                            <input
-                               className="flex-1 input-field"
-                               placeholder={tr("modelIdPlaceholder")}
-                               value={analysisModel}
-                               onChange={(e) => setAnalysisModel(e.target.value)}
-                               disabled={analysisBusy}
-                            />
-                            <select
-                               className="flex-1 input-field"
-                               value={analysisVideoArtifactId}
-                               onChange={(e) => setAnalysisVideoArtifactId(e.target.value)}
-                               disabled={analysisBusy || inputVideos.length === 0}
-                            >
-                               {inputVideos.length === 0 ? <option value="">{tr("noVideoAvailable")}</option> : inputVideos.map(v => (
-                                 <option key={v.id} value={v.id}>{v.path}</option>
-                               ))}
-                            </select>
+                      {/* Settings Panel */}
+                      <div className="panel">
+                        <div className="panel-header">
+                          <div className="panel-title">{tr("settings")}</div>
+                        </div>
+                        <div className="flex justify-between items-center mb-4">
+                           <span className="text-sm text-secondary">{tr("autoConfirmDownloads")}</span>
+                           <label className="toggle-switch">
+                              <input
+                                type="checkbox"
+                                hidden
+                                checked={!!consent?.auto_confirm}
+                                onChange={(e) => void onToggleAutoConfirm(e.target.checked)}
+                                disabled={!consent?.consented}
+                              />
+                              <div className="toggle-track"><div className="toggle-knob"/></div>
+                           </label>
+                        </div>
+                        
+                        <div className="flex justify-between items-center">
+                           <span className="text-sm text-secondary">{tr("enableReasoning")}</span>
+                           <label className="toggle-switch">
+                              <input
+                                type="checkbox"
+                                hidden
+                                checked={settings?.think_enabled ?? true}
+                                onChange={(e) => void onToggleThink(e.target.checked)}
+                                data-testid="toggle-think"
+                              />
+                               <div className="toggle-track"><div className="toggle-knob"/></div>
+                           </label>
+                        </div>
+                      </div>
+
+                      {/* Export Panel */}
+                      <div className="panel">
+                        <div className="panel-header">
+                           <div className="panel-title">{tr("export")}</div>
+                        </div>
+                        
+                        <label className="flex items-center gap-2 mb-4 cursor-pointer select-none">
+                           <input type="checkbox" checked={zipIncludeVideo} onChange={e => setZipIncludeVideo(e.target.checked)} />
+                           <span className="text-sm">{tr("includeOriginalVideo")}</span>
+                        </label>
+
+                        <div className="flex flex-col gap-2">
+                           <button className="btn btn-secondary w-full" onClick={() => void onGenerateReport()} disabled={reportBusy}>
+                             {reportBusy ? tr("generatingReport") : tr("genReport")}
+                           </button>
+                           <button className="btn btn-secondary w-full" onClick={() => void onEstimateZip()} disabled={zipEstimateBusy}>
+                             {zipEstimateBusy ? tr("estimating") : tr("estimateSize")}
+                           </button>
+                           <button className="btn btn-primary w-full" onClick={() => void onExportZip()} disabled={zipExportBusy} data-testid="export-zip">
+                             {zipExportBusy ? tr("exporting") : tr("exportZip")}
+                           </button>
+                        </div>
+
+                        {(reportError || zipEstimateError || zipExportError) && (
+                          <div className="alert mt-4">{reportError || zipEstimateError || zipExportError}</div>
+                        )}
+
+                        <div className="mt-4 text-xs">
+                           {reportOut && <div className="text-success mb-2 font-medium">{tr("reportManifestGenerated")}</div>}
+                           {zipEstimate && <div className="mono mb-2">{tr("estimateLabel")} {bytesToSize(zipEstimate.total_bytes)}</div>}
+                           {zipExport && (
+                             <div className="flex flex-col gap-1 mt-2 p-3 bg-input border border-base rounded-md">
+                                <div className="flex justify-between items-center">
+                                  <span className="text-success font-bold">{tr("zipReady")}</span>
+                                  <span className="mono text-muted">{bytesToSize(zipExport.total_bytes)}</span>
+                                </div>
+                                <a href={`/tool${zipExport.download_url}`} className="text-primary hover:underline mt-1 block font-medium">
+                                  {tr("download")}
+                                </a>
+                             </div>
+                           )}
+                        </div>
+                      </div>
+
+                    </div>
+                  </aside>
+
+                  {/* --- Main Content: Workspace & Results --- */}
+                  <main className="layout-content">
+                    <div className="flex flex-col gap-6">
+                      
+                      {/* Analysis Section */}
+                      <div className="panel">
+                         <div className="panel-header">
+                           <div className="panel-title">{tr("analysis")}</div>
                          </div>
-                         <button className="btn btn-primary w-full" onClick={() => void onRunAnalysis()} disabled={analysisBusy} data-testid="run-analysis">
-                            {analysisBusy ? tr("analyzing") : tr("runAnalysis")}
-                         </button>
-                         {analysisError && <div className="alert mt-2">{analysisError}</div>}
+                         
+                         <div className="flex gap-4 mb-4">
+                            <div className="flex-1">
+                              <label className="input-label">{tr("modelIdPlaceholder")}</label>
+                              <input
+                                 className="input-field"
+                                 placeholder="gemini-2.0-flash-exp"
+                                 value={analysisModel}
+                                 onChange={(e) => setAnalysisModel(e.target.value)}
+                                 disabled={analysisBusy}
+                              />
+                            </div>
+                            <div className="flex-1">
+                              <label className="input-label">{tr("localVideo")}</label>
+                              <select
+                                 className="input-field"
+                                 value={analysisVideoArtifactId}
+                                 onChange={(e) => setAnalysisVideoArtifactId(e.target.value)}
+                                 disabled={analysisBusy || inputVideos.length === 0}
+                              >
+                                 {inputVideos.length === 0 ? <option value="">{tr("noVideoAvailable")}</option> : inputVideos.map(v => (
+                                   <option key={v.id} value={v.id}>{v.path}</option>
+                                 ))}
+                              </select>
+                            </div>
+                            <div className="flex-none self-end">
+                              <button className="btn btn-primary" onClick={() => void onRunAnalysis()} disabled={analysisBusy} data-testid="run-analysis">
+                                {analysisBusy ? tr("analyzing") : tr("runAnalysis")}
+                              </button>
+                            </div>
+                         </div>
+                         
+                         {analysisError && <div className="alert mb-4">{analysisError}</div>}
                          
                          {(analysisText || analysisParsed) ? (
-                           <div className="mt-4 code-block">
+                           <div className="code-block">
                               {analysisParsed ? JSON.stringify(analysisParsed, null, 2) : analysisText}
                            </div>
                          ) : (
-                           <div className="mt-4 text-center text-muted text-xs py-8 border border-dashed border-base rounded-md">
+                           <div className="text-center text-muted text-sm py-12 border-2 border-dashed border-base rounded-lg bg-input">
                              {tr("analysisPlaceholder")}
                            </div>
                          )}
 
                           {(settings?.think_enabled ?? true) && lastPlan != null && (
-                            <div className="mt-4">
-                               <div className="text-xs text-muted mb-2">{tr("latestPlan")}</div>
+                            <div className="mt-6">
+                               <div className="text-xs font-bold text-muted uppercase mb-2">{tr("latestPlan")}</div>
                                <div className="code-block text-xs">{JSON.stringify(lastPlan, null, 2)}</div>
                             </div>
                           )}
-                       </div>
+                      </div>
 
-                       {/* Search */}
-                       <div className="border-t border-base pt-6">
-                          <div className="flex justify-between items-center mb-3">
-                             <div className="text-xs font-bold text-muted uppercase">{tr("contextSearch")}</div>
+                      {/* Context Search Section */}
+                      <div className="panel">
+                          <div className="panel-header">
+                             <div className="panel-title">{tr("contextSearch")}</div>
                              <div className="text-xs mono text-dim">{tr("usageStats", { exa: exaSearchCount, fetch: webFetchCount })}</div>
                           </div>
-                          <div className="flex gap-2 mb-4">
+                          
+                          <div className="flex gap-3 mb-6">
                              <input 
                                type="text"
-                               className="flex-1"
+                               className="flex-1 input-field"
                                placeholder={tr("searchQueryPlaceholder")}
                                value={exaQuery}
                                onChange={e => setExaQuery(e.target.value)}
@@ -1150,15 +1201,16 @@ export default function App() {
                                 {exaBusy ? tr("searching") : tr("search")}
                              </button>
                           </div>
-                          {exaError && <div className="alert mb-2">{exaError}</div>}
+                          
+                          {exaError && <div className="alert mb-4">{exaError}</div>}
 
-                          {exaResults.length > 0 && (
-                            <div className="flex flex-col gap-0 border border-base rounded-md overflow-hidden bg-white/50">
+                          {exaResults.length > 0 ? (
+                            <div className="border border-base rounded-lg overflow-hidden">
                               {exaResults.map((r, i) => (
-                                <div key={i} className="p-3 border-b border-base last:border-0 hover:bg-black/5 flex gap-2 justify-between items-center transition-colors">
+                                <div key={i} className="p-4 border-b border-base last:border-0 hover:bg-black/5 flex gap-4 justify-between items-center transition-colors">
                                   <div className="flex-1 overflow-hidden">
-                                    <div className="text-sm font-medium truncate" title={r.title}>{r.title || tr("untitled")}</div>
-                                    <a href={r.url} target="_blank" rel="noopener" className="text-xs mono text-success truncate block mt-1 opacity-80">{r.url}</a>
+                                    <div className="text-base font-medium text-main truncate" title={r.title}>{r.title || tr("untitled")}</div>
+                                    <a href={r.url} target="_blank" rel="noopener" className="text-xs mono text-primary truncate block mt-1 hover:underline">{r.url}</a>
                                   </div>
                                   <div className="flex gap-2 shrink-0">
                                     <button className="btn btn-secondary btn-sm" onClick={() => r.url && void onWebFetch(r.url)} disabled={!r.url || fetchBusy}>
@@ -1171,97 +1223,57 @@ export default function App() {
                                 </div>
                               ))}
                             </div>
+                          ) : (
+                             <div className="text-center text-muted text-sm py-8">{tr("noResults")}</div>
                           )}
 
                           {fetchUrl && (
-                            <div className="mt-4">
-                               <div className="text-xs text-muted mb-1">{tr("fetched", { url: fetchUrl })}</div>
+                            <div className="mt-6">
+                               <div className="text-xs font-bold text-muted uppercase mb-2">{tr("fetched", { url: fetchUrl })}</div>
                                {fetchError ? <div className="text-error text-xs">{fetchError}</div> : 
-                                fetchRaw ? <div className="code-block text-xs h-32">{JSON.stringify(fetchRaw, null, 2)}</div> : null}
+                                fetchRaw ? <div className="code-block text-xs h-64">{JSON.stringify(fetchRaw, null, 2)}</div> : null}
                             </div>
                           )}
                        </div>
-                    </div>
-                  </div>
 
-                  {/* Column 3: Results */}
-                  <div className="flex flex-col gap-4">
-                    <div className="panel">
-                       <div className="panel-header">
-                         <div className="panel-title">{tr("colResults")}</div>
-                       </div>
-
-                       {/* Pool */}
-                       <div className="mb-6">
-                          <div className="flex justify-between items-center mb-3">
-                             <div className="text-xs font-bold text-muted uppercase">{tr("assetPool")}</div>
+                       {/* Asset Pool Section */}
+                       <div className="panel">
+                          <div className="panel-header">
+                             <div className="panel-title">{tr("assetPool")}</div>
                              <div className="text-xs mono text-dim">{tr("selected", { count: poolSelectedCount })}</div>
                           </div>
                           
-                          <div className="pool-list">
-                             {poolItems.length === 0 ? (
-                               <div className="text-center text-xs text-muted py-6">{tr("noItemsInPool")}</div>
-                             ) : poolItems.map(item => (
-                               <div key={item.id} className="pool-item">
-                                  <div className="pt-1">
-                                     <input
-                                        type="checkbox"
-                                        checked={item.selected}
-                                        onChange={(e) => void onTogglePoolSelected(item.id, e.target.checked)}
-                                     />
-                                  </div>
-                                  <div className="flex-1 overflow-hidden">
-                                     <div className="text-sm truncate" title={item.title || ""}>{item.title || tr("untitled")}</div>
-                                     <div className="text-xs mono text-dim truncate" title={item.source_url || ""}>{item.source_url || item.kind}</div>
-                                  </div>
-                               </div>
-                             ))}
-                          </div>
-                       </div>
-
-                       {/* Export */}
-                       <div className="border-t border-base pt-6">
-                          <div className="text-xs font-bold text-muted uppercase mb-4">{tr("export")}</div>
-                          
-                          <label className="flex items-center gap-2 mb-4 cursor-pointer select-none">
-                             <input type="checkbox" checked={zipIncludeVideo} onChange={e => setZipIncludeVideo(e.target.checked)} />
-                             <span className="text-sm">{tr("includeOriginalVideo")}</span>
-                          </label>
-
-                          <div className="flex flex-col gap-2">
-                             <button className="btn btn-secondary w-full" onClick={() => void onGenerateReport()} disabled={reportBusy}>
-                               {reportBusy ? tr("generatingReport") : tr("genReport")}
-                             </button>
-                             <button className="btn btn-secondary w-full" onClick={() => void onEstimateZip()} disabled={zipEstimateBusy}>
-                               {zipEstimateBusy ? tr("estimating") : tr("estimateSize")}
-                             </button>
-                             <button className="btn btn-primary w-full" onClick={() => void onExportZip()} disabled={zipExportBusy} data-testid="export-zip">
-                               {zipExportBusy ? tr("exporting") : tr("exportZip")}
-                             </button>
-                          </div>
-
-                          {(reportError || zipEstimateError || zipExportError) && (
-                            <div className="alert mt-4">{reportError || zipEstimateError || zipExportError}</div>
+                          {poolItems.length === 0 ? (
+                             <div className="text-center text-muted text-sm py-12 bg-input rounded-lg border border-dashed border-base">
+                                {tr("noItemsInPool")}
+                             </div>
+                          ) : (
+                             <div className="grid grid-cols-1 gap-0 border border-base rounded-lg overflow-hidden">
+                               {poolItems.map(item => (
+                                 <div key={item.id} className="p-3 bg-surface border-b border-base last:border-0 hover:bg-black/5 flex gap-3 items-center">
+                                    <div className="pt-1">
+                                       <input
+                                          type="checkbox"
+                                          className="accent-primary"
+                                          checked={item.selected}
+                                          onChange={(e) => void onTogglePoolSelected(item.id, e.target.checked)}
+                                       />
+                                    </div>
+                                    <div className="flex-1 min-w-0">
+                                       <div className="text-sm font-medium text-main truncate" title={item.title || ""}>{item.title || tr("untitled")}</div>
+                                       <div className="text-xs mono text-muted truncate" title={item.source_url || ""}>{item.source_url || item.kind}</div>
+                                    </div>
+                                    <div className="text-xs text-dim whitespace-nowrap">
+                                       {formatTs(item.created_at_ms)}
+                                    </div>
+                                 </div>
+                               ))}
+                             </div>
                           )}
-
-                          <div className="mt-4 text-xs">
-                             {reportOut && <div className="text-success mb-2 font-medium">{tr("reportManifestGenerated")}</div>}
-                             {zipEstimate && <div className="mono mb-2">{tr("estimateLabel")} {bytesToSize(zipEstimate.total_bytes)}</div>}
-                             {zipExport && (
-                               <div className="flex flex-col gap-1 mt-2 p-3 bg-input border border-base rounded-md">
-                                  <div className="flex justify-between items-center">
-                                    <span className="text-success font-bold">{tr("zipReady")}</span>
-                                    <span className="mono text-muted">{bytesToSize(zipExport.total_bytes)}</span>
-                                  </div>
-                                  <a href={`/tool${zipExport.download_url}`} className="text-primary hover:underline mt-1 block font-medium">
-                                    {tr("download")}
-                                  </a>
-                               </div>
-                             )}
-                          </div>
                        </div>
+
                     </div>
-                  </div>
+                  </main>
                 </div>
               )}
             </div>

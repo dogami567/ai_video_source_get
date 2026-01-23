@@ -124,6 +124,7 @@ const en = {
   errEnterModel: "Please enter a model",
   errPickLocalVideo: "Please select a local video (input_video)",
   errEnterSearchQuery: "Please enter a search query",
+  noResults: "No results found.",
 } satisfies Record<string, string>;
 
 const zhCN: typeof en = {
@@ -246,6 +247,7 @@ const zhCN: typeof en = {
   errEnterModel: "请输入 model",
   errPickLocalVideo: "请选择一个本地视频（input_video）",
   errEnterSearchQuery: "请输入 search query",
+  noResults: "未找到结果。",
 };
 
 export const messages = { en, "zh-CN": zhCN } as const;

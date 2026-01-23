@@ -329,18 +329,32 @@ table.data-table {
   background-color: var(--bg-surface-hover);
 }
 
-/* --- Dashboard Grid --- */
-.dashboard-grid {
-  display: grid;
-  grid-template-columns: 280px 1fr 300px;
-  gap: var(--space-6);
+/* --- Layout: Main Two-Column --- */
+.main-layout {
+  display: flex;
+  gap: 32px;
   align-items: start;
 }
 
+.layout-sidebar {
+  width: 340px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+.layout-content {
+  flex: 1;
+  min-width: 0; /* Enable truncation in flex children */
+}
+
 @media (max-width: 1024px) {
-  .dashboard-grid {
-    grid-template-columns: 1fr;
-    gap: var(--space-6);
+  .main-layout {
+    flex-direction: column;
+  }
+  .layout-sidebar {
+    width: 100%;
   }
 }
 
