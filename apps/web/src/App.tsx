@@ -1,7 +1,7 @@
 import React from "react";
-
 import { getInitialLocale, persistLocale, t, type I18nVars, type Locale, type MessageKey } from "./i18n";
 
+// --- Types ---
 type OrchestratorHealth = { ok: boolean; service?: string };
 type ToolserverHealth = { ok: boolean; service: string; ffmpeg: boolean; data_dir: string; db_path: string };
 type OrchestratorConfig = { ok: boolean; default_model: string; base_url: string };
@@ -24,6 +24,7 @@ type PoolItem = {
   created_at_ms: number;
 };
 
+// --- API Helpers ---
 async function fetchJson<T>(input: string, init?: RequestInit): Promise<T> {
   const res = await fetch(input, init);
   const text = await res.text();
@@ -62,6 +63,130 @@ function bytesToSize(bytes: number) {
   }
   return `${n.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
 }
+
+// --- Components ---
+
+const Header = ({
+  locale,
+  toggleLocale,
+  orchHealth,
+  toolHealth,
+  healthError,
+  tr,
+}: {
+  locale: Locale;
+  toggleLocale: () => void;
+  orchHealth: OrchestratorHealth | null;
+  toolHealth: ToolserverHealth | null;
+  healthError: string | null;
+  tr: (k: MessageKey, v?: I18nVars) => string;
+}) => (
+  <header className="app-header">
+    <div className="brand">
+      <div className="brand-title">{tr("appTitle")}</div>
+      <div className="brand-subtitle">{tr("appSubtitle")}</div>
+    </div>
+    <div className="flex items-center gap-4">
+      <button className="btn btn-ghost btn-sm" onClick={toggleLocale} data-testid="lang-toggle">
+        {locale === "en" ? tr("langZH") : tr("langEN")}
+      </button>
+      <div className="flex gap-2 items-center" title="System Health">
+        {healthError ? (
+          <span className="text-error text-xs">{tr("systemError")}</span>
+        ) : (
+          <>
+            <div className={`status-indicator ${orchHealth?.ok ? "ok" : "err"}`} title={tr("orchestrator")} />
+            <div className={`status-indicator ${toolHealth?.ok ? "ok" : "err"}`} title={tr("toolserver")} />
+          </>
+        )}
+      </div>
+    </div>
+  </header>
+);
+
+const ProjectList = ({
+  projects,
+  loading,
+  error,
+  createBusy,
+  createTitle,
+  setCreateTitle,
+  onCreate,
+  onOpen,
+  onRefresh,
+  tr,
+}: {
+  projects: Project[];
+  loading: boolean;
+  error: string | null;
+  createBusy: boolean;
+  createTitle: string;
+  setCreateTitle: (s: string) => void;
+  onCreate: () => void;
+  onOpen: (id: string) => void;
+  onRefresh: () => void;
+  tr: (k: MessageKey) => string;
+}) => (
+  <div className="glass-panel animate-slide width-constraint">
+    <div className="panel-title flex justify-between items-center">
+      <span>{tr("projects")}</span>
+      <button className="btn btn-ghost btn-sm" onClick={onRefresh} disabled={loading} data-testid="refresh-projects">
+        {tr("refresh")}
+      </button>
+    </div>
+
+    <div className="flex gap-2 mb-4">
+      <input
+        type="text"
+        placeholder={tr("newProjectTitlePlaceholder")}
+        value={createTitle}
+        onChange={(e) => setCreateTitle(e.target.value)}
+        disabled={createBusy}
+        data-testid="create-project-input"
+      />
+      <button className="btn btn-primary" onClick={onCreate} disabled={createBusy} data-testid="create-project-btn">
+        {createBusy ? tr("creating") : tr("createProject")}
+      </button>
+    </div>
+
+    {error && <div className="alert mb-4">{error}</div>}
+
+    {loading && projects.length === 0 ? (
+      <div className="text-center muted py-8">{tr("loadingProjects")}</div>
+    ) : projects.length === 0 ? (
+      <div className="text-center muted py-8">{tr("emptyProjects")}</div>
+    ) : (
+      <table className="data-table">
+        <thead>
+          <tr>
+            <th>{tr("title")}</th>
+            <th>{tr("created")}</th>
+            <th className="text-right">{tr("action")}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {projects.map((p) => (
+            <tr key={p.id}>
+              <td className="font-medium text-main">{p.title || tr("untitled")}</td>
+              <td className="mono text-xs muted">{formatTs(p.created_at_ms)}</td>
+              <td className="text-right">
+                <button
+                  className="btn btn-secondary btn-sm"
+                  onClick={() => onOpen(p.id)}
+                  data-testid={`open-project-${p.id}`}
+                >
+                  {tr("open")}
+                </button>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    )}
+  </div>
+);
+
+// --- Main App ---
 
 export default function App() {
   const [locale, setLocale] = React.useState<Locale>(() => getInitialLocale());
@@ -107,7 +232,7 @@ export default function App() {
   const [saveUrlBusy, setSaveUrlBusy] = React.useState(false);
   const [saveUrlError, setSaveUrlError] = React.useState<string | null>(null);
 
-  const [analysisModel, setAnalysisModel] = React.useState("gemini-3-pro-preview");
+  const [analysisModel, setAnalysisModel] = React.useState("gemini-2.0-flash-exp");
   const [analysisVideoArtifactId, setAnalysisVideoArtifactId] = React.useState<string>("");
   const [analysisBusy, setAnalysisBusy] = React.useState(false);
   const [analysisError, setAnalysisError] = React.useState<string | null>(null);
@@ -570,385 +695,317 @@ export default function App() {
   }, [analysisVideoArtifactId, inputVideos, view.kind]);
 
   return (
-    <div className="app fade-in">
-      <header className="header row row-between row-center">
-        <div>
-          <h1 className="logo-text">{tr("appTitle")}</h1>
-          <p className="subtitle">{tr("appSubtitle")}</p>
-        </div>
-        <div className="status-cluster">
-          <div className="row row-gap row-center">
-            <button className="btn btn-ghost btn-xs" onClick={toggleLocale} title={tr("langToggleTitle")}>
-              {locale === "en" ? tr("langZH") : tr("langEN")}
-            </button>
-            {healthError ? (
-              <span className="badge badge-error">{tr("systemError")}</span>
-            ) : (
-              <div className="row row-gap">
-                <div className={`status-dot ${orchHealth?.ok ? "ok" : "err"}`} title={tr("orchestrator")} />
-                <div className={`status-dot ${toolHealth?.ok ? "ok" : "err"}`} title={tr("toolserver")} />
-              </div>
-            )}
-          </div>
-        </div>
-      </header>
+    <div className="app-container">
+      <Header
+        locale={locale}
+        toggleLocale={toggleLocale}
+        orchHealth={orchHealth}
+        toolHealth={toolHealth}
+        healthError={healthError}
+        tr={tr}
+      />
 
-      <main className="main-content">
+      <main className="main-scroll-area">
         {view.kind === "list" ? (
-          <section className="panel animate-slide-up">
-            <div className="panel-header row row-between row-center">
-              <h2>{tr("projects")}</h2>
-              <button className="btn btn-ghost" onClick={refreshProjects} disabled={projectsLoading}>
-                {tr("refresh")}
-              </button>
-            </div>
-
-            <div className="control-group row row-gap">
-              <input
-                className="input"
-                placeholder={tr("newProjectTitlePlaceholder")}
-                value={createTitle}
-                onChange={(e) => setCreateTitle(e.target.value)}
-                disabled={createBusy}
-              />
-              <button className="btn btn-primary" onClick={onCreateProject} disabled={createBusy}>
-                {createBusy ? tr("creating") : tr("createProject")}
-              </button>
-            </div>
-
-            {projectsError && <div className="alert alert-error">{projectsError}</div>}
-            
-            <div className="project-list">
-              {projectsLoading ? (
-                <div className="skeleton-loader">{tr("loadingProjects")}</div>
-              ) : projects.length === 0 ? (
-                <div className="empty-state">{tr("emptyProjects")}</div>
-              ) : (
-                <div className="table">
-                  <div className="table-head">
-                    <div className="col">{tr("title")}</div>
-                    <div className="col">{tr("created")}</div>
-                    <div className="col right">{tr("action")}</div>
-                  </div>
-                  {projects.map((p) => (
-                    <div key={p.id} className="table-row">
-                      <div className="col mono title-cell">{p.title || tr("untitled")}</div>
-                      <div className="col muted mono text-sm">{formatTs(p.created_at_ms)}</div>
-                      <div className="col right">
-                        <button className="btn btn-sm btn-secondary" onClick={() => onOpenProject(p.id)}>
-                          {tr("open")}
-                        </button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          </section>
+          <ProjectList
+            projects={projects}
+            loading={projectsLoading}
+            error={projectsError}
+            createBusy={createBusy}
+            createTitle={createTitle}
+            setCreateTitle={setCreateTitle}
+            onCreate={onCreateProject}
+            onOpen={onOpenProject}
+            onRefresh={refreshProjects}
+            tr={tr}
+          />
         ) : (
-          <div className="project-view animate-slide-up">
-            <div className="navbar row row-between row-center">
-              <div className="breadcrumb">
-                <button className="btn btn-text" onClick={onBackToList}>&larr; {tr("backToProjects")}</button>
-                <span className="sep">/</span>
-                <span className="current">{project?.title || tr("untitled")}</span>
-              </div>
-              <div className="meta mono text-xs muted">{tr("idLabel")}: {view.projectId}</div>
+          <div className="width-constraint animate-slide">
+            <div className="flex items-center gap-2 mb-4">
+              <button className="btn btn-ghost btn-sm" onClick={onBackToList} data-testid="back-to-list">
+                &larr; {tr("backToProjects")}
+              </button>
+              <span className="text-dim">/</span>
+              <span className="font-medium text-main">{project?.title || tr("untitled")}</span>
             </div>
 
-            {projectError && <div className="alert alert-error">{projectError}</div>}
-            {projectLoading && <div className="skeleton-loader">{tr("loadingProjectData")}</div>}
+            {projectError && <div className="alert mb-4">{projectError}</div>}
+            {projectLoading && <div className="text-center muted mb-4">{tr("loadingProjectData")}</div>}
 
             {project && (
               <div className="dashboard-grid">
-                {/* Left Column: Configuration & Inputs */}
-                <div className="column-config">
-                  <section className="panel">
-                    <h3 className="panel-title">{tr("settings")}</h3>
-                    <div className="setting-item">
-                      <label className="toggle">
-                        <input
-                          type="checkbox"
-                          checked={!!consent?.auto_confirm}
-                          onChange={(e) => void onToggleAutoConfirm(e.target.checked)}
-                          disabled={!consent?.consented}
-                        />
-                        <span className="label-text">{tr("autoConfirmDownloads")}</span>
-                      </label>
-                      <div className="status-indicator">
-                        {tr("consent")}: <span className={consent?.consented ? "text-ok" : "text-warn"}>{consent?.consented ? tr("granted") : tr("pending")}</span>
-                      </div>
-                    </div>
-                    
-                    <div className="setting-item">
-                      <label className="toggle">
-                        <input
-                          type="checkbox"
-                          checked={settings?.think_enabled ?? true}
-                          onChange={(e) => void onToggleThink(e.target.checked)}
-                        />
-                        <span className="label-text">{tr("enableReasoning")}</span>
-                      </label>
-                    </div>
-                    
-                    {(settings?.think_enabled ?? true) && lastPlan != null && (
-                      <div className="mini-terminal">
-                        <div className="terminal-header">{tr("latestPlan")}</div>
-                        <pre className="code-block">{JSON.stringify(lastPlan, null, 2)}</pre>
-                      </div>
-                    )}
-                  </section>
+                {/* Column 1: Config */}
+                <div className="column">
+                  <div className="glass-panel">
+                    <div className="panel-title">{tr("colConfig")}</div>
 
-                  <section className="panel">
-                    <h3 className="panel-title">{tr("inputs")}</h3>
-                    <div className="input-group">
-                      <label>{tr("localVideo")}</label>
-                      <div className="row row-gap">
-                        <input
-                          className="file-input"
-                          type="file"
-                          accept="video/*"
-                          onChange={(e) => setLocalFile(e.target.files?.item(0) || null)}
-                          disabled={importBusy}
-                        />
-                        <button className="btn btn-secondary" onClick={onImportLocal} disabled={importBusy || !localFile}>
-                          {importBusy ? "…" : tr("import")}
-                        </button>
+                    {/* Settings */}
+                    <div className="mb-6">
+                      <div className="text-xs muted uppercase mb-2">{tr("settings")}</div>
+                      <div className="flex justify-between items-center mb-2">
+                         <span className="text-sm">{tr("autoConfirmDownloads")}</span>
+                         <label className="toggle-switch">
+                            <input
+                              type="checkbox"
+                              hidden
+                              checked={!!consent?.auto_confirm}
+                              onChange={(e) => void onToggleAutoConfirm(e.target.checked)}
+                              disabled={!consent?.consented}
+                            />
+                            <div className="toggle-track"><div className="toggle-knob"/></div>
+                         </label>
                       </div>
-                      {localFile && <div className="file-name mono">{localFile.name}</div>}
-                      {importError && <div className="text-error text-xs">{importError}</div>}
+                      <div className="text-xs text-dim mb-4 flex justify-between">
+                         {tr("consent")}: 
+                         <span className={consent?.consented ? "text-success" : "text-warn"}>
+                            {consent?.consented ? tr("granted") : tr("pending")}
+                         </span>
+                      </div>
+
+                      <div className="flex justify-between items-center">
+                         <span className="text-sm">{tr("enableReasoning")}</span>
+                         <label className="toggle-switch">
+                            <input
+                              type="checkbox"
+                              hidden
+                              checked={settings?.think_enabled ?? true}
+                              onChange={(e) => void onToggleThink(e.target.checked)}
+                              data-testid="toggle-think"
+                            />
+                             <div className="toggle-track"><div className="toggle-knob"/></div>
+                         </label>
+                      </div>
                     </div>
 
-                    <div className="input-group">
-                      <label>{tr("videoUrl")}</label>
-                      <div className="row row-gap">
-                        <input
-                          className="input"
-                          placeholder="https://..."
-                          value={inputUrl}
-                          onChange={(e) => setInputUrl(e.target.value)}
-                          disabled={saveUrlBusy}
-                        />
-                        <button className="btn btn-secondary" onClick={onSaveUrl} disabled={saveUrlBusy}>
-                          {tr("save")}
-                        </button>
+                    {/* Inputs */}
+                    <div>
+                      <div className="text-xs muted uppercase mb-2">{tr("inputs")}</div>
+                      <div className="input-group">
+                         <label className="input-label">{tr("localVideo")}</label>
+                         <div className="flex gap-2">
+                           <input
+                              className="flex-1"
+                              type="file"
+                              accept="video/*"
+                              onChange={(e) => setLocalFile(e.target.files?.item(0) || null)}
+                              disabled={importBusy}
+                           />
+                           <button className="btn btn-secondary" onClick={onImportLocal} disabled={importBusy || !localFile}>
+                             {importBusy ? "…" : tr("import")}
+                           </button>
+                         </div>
+                         {importError && <div className="text-error text-xs mt-1">{importError}</div>}
                       </div>
-                      {saveUrlError && <div className="text-error text-xs">{saveUrlError}</div>}
-                    </div>
 
-                    <div className="inventory">
-                      <div className="inventory-section">
-                        <h4>{tr("videosCount", { count: inputVideos.length })}</h4>
-                        <ul className="list-mono">
-                          {inputVideos.map(a => <li key={a.id} title={a.path}>{a.path}</li>)}
-                        </ul>
-                      </div>
-                      <div className="inventory-section">
-                        <h4>{tr("urlsCount", { count: inputUrls.length })}</h4>
-                         <ul className="list-mono">
-                          {inputUrls.map(a => <li key={a.id} title={a.path}>{a.path}</li>)}
-                        </ul>
+                      <div className="input-group">
+                         <label className="input-label">{tr("videoUrl")}</label>
+                         <div className="flex gap-2">
+                             <input
+                               type="text"
+                               placeholder="https://..."
+                               value={inputUrl}
+                               onChange={(e) => setInputUrl(e.target.value)}
+                               disabled={saveUrlBusy}
+                               data-testid="input-url"
+                             />
+                             <button
+                               className="btn btn-secondary"
+                               onClick={onSaveUrl}
+                               disabled={saveUrlBusy}
+                               data-testid="save-url"
+                             >
+                                {tr("save")}
+                             </button>
+                          </div>
+                          {saveUrlError && <div className="text-error text-xs mt-1">{saveUrlError}</div>}
+                       </div>
+
+                      <div className="mt-4 border-t border-subtle pt-4">
+                        <div className="text-xs text-dim mb-1">{tr("videosCount", { count: inputVideos.length })}</div>
+                        {inputVideos.map(v => <div key={v.id} className="text-xs mono truncate muted" title={v.path}>{v.path}</div>)}
+                        <div className="text-xs text-dim mt-2 mb-1">{tr("urlsCount", { count: inputUrls.length })}</div>
+                        {inputUrls.map(u => <div key={u.id} className="text-xs mono truncate muted" title={u.path}>{u.path}</div>)}
                       </div>
                     </div>
-                  </section>
+                  </div>
                 </div>
 
-                {/* Right Column: Actions & Results */}
-                <div className="column-actions">
-                  <section className="panel">
-                    <h3 className="panel-title">{tr("analysis")}</h3>
-                    <div className="control-bar">
-                      <input
-                        className="input"
-                        placeholder={tr("modelIdPlaceholder")}
-                        value={analysisModel}
-                        onChange={(e) => setAnalysisModel(e.target.value)}
-                        disabled={analysisBusy}
-                      />
-                      <select
-                        className="select"
-                        value={analysisVideoArtifactId}
-                        onChange={(e) => setAnalysisVideoArtifactId(e.target.value)}
-                        disabled={analysisBusy || inputVideos.length === 0}
-                      >
-                        {inputVideos.length === 0 ? (
-                          <option value="">{tr("noVideoAvailable")}</option>
-                        ) : (
-                          inputVideos.map((v) => (
-                            <option key={v.id} value={v.id}>
-                              {v.path}
-                            </option>
-                          ))
-                        )}
-                      </select>
-                      <button className="btn btn-primary" onClick={() => void onRunAnalysis()} disabled={analysisBusy}>
-                        {analysisBusy ? tr("analyzing") : tr("runAnalysis")}
-                      </button>
-                    </div>
-                    {analysisError && <div className="alert alert-error">{analysisError}</div>}
-                    
-                    <div className="analysis-output">
-                      {analysisParsed ? (
-                         <pre className="code-block">{JSON.stringify(analysisParsed, null, 2)}</pre>
-                      ) : analysisText ? (
-                         <pre className="code-block">{analysisText}</pre>
-                      ) : (
-                        <div className="placeholder-text">{tr("analysisPlaceholder")}</div>
-                      )}
-                    </div>
-                  </section>
-
-                  <section className="panel">
-                    <div className="panel-header row row-between">
-                       <h3 className="panel-title">{tr("contextSearch")}</h3>
-                       <div className="usage-stats mono text-xs">
-                         {tr("usageStats", { exa: exaSearchCount, fetch: webFetchCount })}
+                {/* Column 2: Workspace */}
+                <div className="column">
+                  <div className="glass-panel">
+                     <div className="panel-title">{tr("colWorkspace")}</div>
+                     
+                     {/* Analysis */}
+                     <div className="mb-6">
+                       <div className="text-xs muted uppercase mb-2">{tr("analysis")}</div>
+                       <div className="flex gap-2 mb-2">
+                          <input
+                             className="flex-1"
+                             placeholder={tr("modelIdPlaceholder")}
+                             value={analysisModel}
+                             onChange={(e) => setAnalysisModel(e.target.value)}
+                             disabled={analysisBusy}
+                          />
+                          <select
+                             className="flex-1"
+                             value={analysisVideoArtifactId}
+                             onChange={(e) => setAnalysisVideoArtifactId(e.target.value)}
+                             disabled={analysisBusy || inputVideos.length === 0}
+                          >
+                             {inputVideos.length === 0 ? <option value="">{tr("noVideoAvailable")}</option> : inputVideos.map(v => (
+                               <option key={v.id} value={v.id}>{v.path}</option>
+                             ))}
+                          </select>
                        </div>
-                    </div>
-                    
-                    <div className="control-bar">
-                      <input
-                        className="input"
-                        placeholder={tr("searchQueryPlaceholder")}
-                        value={exaQuery}
-                        onChange={(e) => setExaQuery(e.target.value)}
-                        disabled={exaBusy || fetchBusy}
-                      />
-                      <button className="btn btn-secondary" onClick={() => void onExaSearch()} disabled={exaBusy || fetchBusy}>
-                        {exaBusy ? tr("searching") : tr("search")}
-                      </button>
-                    </div>
-                    {exaError && <div className="alert alert-error">{exaError}</div>}
-                    
-                    {exaResults.length > 0 && (
-                      <div className="results-list">
-                         {exaResults.map((r, idx) => (
-                           <div key={`${idx}`} className="result-item">
-                             <div className="result-main">
-                               <div className="result-title">{r.title || tr("untitled")}</div>
-                               <a href={r.url} target="_blank" rel="noopener noreferrer" className="result-url mono">{r.url}</a>
-                             </div>
-                             <div className="result-actions">
-                                <button
-                                  className="btn btn-xs btn-secondary"
-                                  onClick={() => (r.url ? void onWebFetch(r.url) : undefined)}
-                                  disabled={!r.url || fetchBusy || exaBusy}
-                                >
-                                  {tr("fetch")}
-                                </button>
-                                <button
-                                  className="btn btn-xs btn-secondary"
-                                  onClick={() => (r.url ? void onAddToPool(r.url, r.title) : undefined)}
-                                  disabled={!r.url}
-                                >
-                                  {tr("add")}
-                                </button>
-                             </div>
-                           </div>
-                         ))}
-                      </div>
-                    )}
-                    
-                    {fetchUrl && (
-                      <div className="fetch-preview">
-                        <div className="preview-label">{tr("fetched", { url: fetchUrl })}</div>
-                        {fetchError ? (
-                           <div className="text-error">{fetchError}</div>
-                        ) : fetchRaw ? (
-                           <pre className="code-block xs">{JSON.stringify(fetchRaw, null, 2)}</pre>
-                        ) : null}
-                      </div>
-                    )}
-                  </section>
-
-                  <section className="panel">
-                    <div className="panel-header row row-between">
-                      <h3 className="panel-title">{tr("assetPool")}</h3>
-                      <div className="text-xs muted mono">{tr("selected", { count: poolSelectedCount })}</div>
-                    </div>
-                    
-                    <div className="pool-list">
-                      {poolItems.length === 0 ? (
-                        <div className="placeholder-text">{tr("noItemsInPool")}</div>
-                      ) : (
-                        <div className="table">
-                          <div className="table-head">
-                             <div className="col">{tr("asset")}</div>
-                             <div className="col">{tr("source")}</div>
-                             <div className="col right">{tr("select")}</div>
-                          </div>
-                          {poolItems.map(it => (
-                            <div key={it.id} className="table-row">
-                               <div className="col">
-                                 <div className="font-medium">{it.title || tr("untitled")}</div>
-                                 <div className="badge badge-subtle">{it.kind}</div>
-                               </div>
-                               <div className="col mono text-xs text-truncate" title={it.source_url || ""}>
-                                 {it.source_url || "-"}
-                               </div>
-                               <div className="col right">
-                                 <label className="checkbox-wrapper">
-                                    <input
-                                      type="checkbox"
-                                      checked={it.selected}
-                                      onChange={(e) => void onTogglePoolSelected(it.id, e.target.checked)}
-                                    />
-                                    <span className="checkbox-custom"></span>
-                                 </label>
-                               </div>
-                            </div>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  </section>
-                  
-                  <section className="panel">
-                    <h3 className="panel-title">{tr("export")}</h3>
-                    <div className="export-controls">
-                      <div className="row row-between row-center mb-4">
-                        <label className="toggle">
-                          <input type="checkbox" checked={zipIncludeVideo} onChange={(e) => setZipIncludeVideo(e.target.checked)} />
-                          <span className="label-text">{tr("includeOriginalVideo")}</span>
-                        </label>
-                      </div>
-                      
-                      <div className="button-group">
-                         <button className="btn btn-secondary" onClick={() => void onGenerateReport()} disabled={reportBusy}>
-                           {reportBusy ? tr("generatingReport") : tr("genReport")}
-                         </button>
-                         <button className="btn btn-secondary" onClick={() => void onEstimateZip()} disabled={zipEstimateBusy || zipExportBusy}>
-                           {zipEstimateBusy ? tr("estimating") : tr("estimateSize")}
-                         </button>
-                         <button className="btn btn-primary" onClick={() => void onExportZip()} disabled={zipExportBusy}>
-                           {zipExportBusy ? tr("exporting") : tr("exportZip")}
-                         </button>
-                      </div>
-                      
-                      {(reportError || zipEstimateError || zipExportError) && (
-                         <div className="alert alert-error mt-4">
-                            {reportError} {zipEstimateError} {zipExportError}
+                       <button className="btn btn-primary w-full" onClick={() => void onRunAnalysis()} disabled={analysisBusy} data-testid="run-analysis">
+                          {analysisBusy ? tr("analyzing") : tr("runAnalysis")}
+                       </button>
+                       {analysisError && <div className="alert mt-2">{analysisError}</div>}
+                       
+                       {(analysisText || analysisParsed) ? (
+                         <div className="mt-4 code-viewer">
+                            {analysisParsed ? JSON.stringify(analysisParsed, null, 2) : analysisText}
                          </div>
-                      )}
+                       ) : (
+                         <div className="mt-4 text-center muted text-xs py-4 border border-dashed border-subtle rounded">
+                           {tr("analysisPlaceholder")}
+                         </div>
+                       )}
 
-                      {(reportOut || zipEstimate || zipExport) && (
-                        <div className="export-status mt-4">
-                           {reportOut && <div className="status-line text-ok">{tr("reportManifestGenerated")}</div>}
-                           {zipEstimate && (
-                             <div className="status-line">
-                               {tr("estimateLabel")} <span className="mono">{bytesToSize(zipEstimate.total_bytes)}</span>
+                        {(settings?.think_enabled ?? true) && lastPlan != null && (
+                          <div className="mt-4">
+                             <div className="text-xs muted mb-1">{tr("latestPlan")}</div>
+                             <div className="code-viewer text-xs">{JSON.stringify(lastPlan, null, 2)}</div>
+                          </div>
+                        )}
+                     </div>
+
+                     {/* Search */}
+                     <div className="border-t border-subtle pt-6">
+                        <div className="flex justify-between items-center mb-2">
+                           <div className="text-xs muted uppercase">{tr("contextSearch")}</div>
+                           <div className="text-xs mono dim">{tr("usageStats", { exa: exaSearchCount, fetch: webFetchCount })}</div>
+                        </div>
+                        <div className="flex gap-2 mb-4">
+                           <input 
+                             type="text"
+                             className="flex-1"
+                             placeholder={tr("searchQueryPlaceholder")}
+                             value={exaQuery}
+                             onChange={e => setExaQuery(e.target.value)}
+                             disabled={exaBusy || fetchBusy}
+                           />
+                           <button className="btn btn-secondary" onClick={() => void onExaSearch()} disabled={exaBusy || fetchBusy}>
+                              {exaBusy ? tr("searching") : tr("search")}
+                           </button>
+                        </div>
+                        {exaError && <div className="alert mb-2">{exaError}</div>}
+
+                        {exaResults.length > 0 && (
+                          <div className="flex flex-col gap-2">
+                            {exaResults.map((r, i) => (
+                              <div key={i} className="list-item">
+                                <div className="flex-1 overflow-hidden mr-2">
+                                  <div className="text-sm font-medium truncate" title={r.title}>{r.title || tr("untitled")}</div>
+                                  <a href={r.url} target="_blank" rel="noopener" className="text-xs mono text-success truncate block">{r.url}</a>
+                                </div>
+                                <div className="flex gap-1">
+                                  <button className="btn btn-secondary btn-sm" onClick={() => r.url && void onWebFetch(r.url)} disabled={!r.url || fetchBusy}>
+                                    {tr("fetch")}
+                                  </button>
+                                  <button className="btn btn-secondary btn-sm" onClick={() => r.url && void onAddToPool(r.url, r.title)} disabled={!r.url}>
+                                    {tr("add")}
+                                  </button>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+
+                        {fetchUrl && (
+                          <div className="mt-4 p-2 bg-input rounded">
+                             <div className="text-xs muted mb-1">{tr("fetched", { url: fetchUrl })}</div>
+                             {fetchError ? <div className="text-error text-xs">{fetchError}</div> : 
+                              fetchRaw ? <div className="code-viewer text-xs h-32">{JSON.stringify(fetchRaw, null, 2)}</div> : null}
+                          </div>
+                        )}
+                     </div>
+                  </div>
+                </div>
+
+                {/* Column 3: Results */}
+                <div className="column">
+                  <div className="glass-panel">
+                     <div className="panel-title">{tr("colResults")}</div>
+
+                     {/* Pool */}
+                     <div className="mb-6">
+                        <div className="flex justify-between items-center mb-2">
+                           <div className="text-xs muted uppercase">{tr("assetPool")}</div>
+                           <div className="text-xs mono dim">{tr("selected", { count: poolSelectedCount })}</div>
+                        </div>
+                        
+                        <div className="bg-deep rounded border border-subtle overflow-hidden max-h-96 overflow-y-auto">
+                           {poolItems.length === 0 ? (
+                             <div className="text-center text-xs muted py-4">{tr("noItemsInPool")}</div>
+                           ) : poolItems.map(item => (
+                             <div key={item.id} className="p-2 border-b border-subtle last:border-0 hover:bg-white/5 flex gap-2 items-start">
+                                <div className="pt-1">
+                                   <input
+                                      type="checkbox"
+                                      checked={item.selected}
+                                      onChange={(e) => void onTogglePoolSelected(item.id, e.target.checked)}
+                                   />
+                                </div>
+                                <div className="flex-1 overflow-hidden">
+                                   <div className="text-sm truncate" title={item.title || ""}>{item.title || tr("untitled")}</div>
+                                   <div className="text-xs mono dim truncate" title={item.source_url || ""}>{item.source_url || item.kind}</div>
+                                </div>
                              </div>
-                           )}
+                           ))}
+                        </div>
+                     </div>
+
+                     {/* Export */}
+                     <div className="border-t border-subtle pt-6">
+                        <div className="text-xs muted uppercase mb-4">{tr("export")}</div>
+                        
+                        <label className="flex items-center gap-2 mb-4 cursor-pointer">
+                           <input type="checkbox" checked={zipIncludeVideo} onChange={e => setZipIncludeVideo(e.target.checked)} />
+                           <span className="text-sm">{tr("includeOriginalVideo")}</span>
+                        </label>
+
+                        <div className="flex flex-col gap-2">
+                           <button className="btn btn-secondary w-full" onClick={() => void onGenerateReport()} disabled={reportBusy}>
+                             {reportBusy ? tr("generatingReport") : tr("genReport")}
+                           </button>
+                           <button className="btn btn-secondary w-full" onClick={() => void onEstimateZip()} disabled={zipEstimateBusy}>
+                             {zipEstimateBusy ? tr("estimating") : tr("estimateSize")}
+                           </button>
+                           <button className="btn btn-primary w-full" onClick={() => void onExportZip()} disabled={zipExportBusy} data-testid="export-zip">
+                             {zipExportBusy ? tr("exporting") : tr("exportZip")}
+                           </button>
+                        </div>
+
+                        {(reportError || zipEstimateError || zipExportError) && (
+                          <div className="alert mt-4">{reportError || zipEstimateError || zipExportError}</div>
+                        )}
+
+                        <div className="mt-4 text-xs">
+                           {reportOut && <div className="text-success mb-1">{tr("reportManifestGenerated")}</div>}
+                           {zipEstimate && <div className="mono mb-1">{tr("estimateLabel")} {bytesToSize(zipEstimate.total_bytes)}</div>}
                            {zipExport && (
-                             <div className="status-line">
-                               <span className="text-ok">{tr("zipReady")}</span> <span className="mono">{bytesToSize(zipExport.total_bytes)}</span>
-                               <a className="download-link ml-2" href={`/tool${zipExport.download_url}`}>{tr("download")}</a>
+                             <div className="flex flex-col gap-1 mt-2 p-2 bg-white/5 rounded">
+                                <span className="text-success font-medium">{tr("zipReady")}</span>
+                                <span className="mono">{bytesToSize(zipExport.total_bytes)}</span>
+                                <a href={`/tool${zipExport.download_url}`} className="text-accent-primary underline mt-1 block">
+                                  {tr("download")}
+                                </a>
                              </div>
                            )}
                         </div>
-                      )}
-                    </div>
-                  </section>
+                     </div>
+                  </div>
                 </div>
               </div>
             )}
@@ -956,46 +1013,50 @@ export default function App() {
         )}
       </main>
 
-      {consentModalOpen && (
-        <div className="modal-backdrop fade-in" role="dialog" aria-modal="true">
-          <div className="modal animate-pop">
-            <h3 className="modal-title">{tr("externalContentWarningTitle")}</h3>
-            <p className="modal-text">
-              {tr("externalContentWarningText")}
-            </p>
-            <div className="modal-code">{consentModalUrl}</div>
-            
-            <label className="toggle mt-4">
-              <input
-                type="checkbox"
-                checked={consentModalAutoConfirm}
-                onChange={(e) => setConsentModalAutoConfirm(e.target.checked)}
-                disabled={consentModalBusy}
-              />
-              <span className="label-text">{tr("autoConfirmForThisProject")}</span>
-            </label>
-            
-            {consentModalError && <div className="alert alert-error mt-4">{consentModalError}</div>}
-            
-            <div className="modal-actions row row-right row-gap mt-6">
-              <button
-                className="btn btn-ghost"
-                onClick={() => {
-                  setConsentModalOpen(false);
-                  setConsentModalUrl(null);
-                  setConsentModalError(null);
-                }}
-                disabled={consentModalBusy}
-              >
-                {tr("cancel")}
-              </button>
-              <button className="btn btn-primary" onClick={() => void onConfirmConsentAndSaveUrl()} disabled={consentModalBusy}>
-                {consentModalBusy ? tr("confirming") : tr("iConfirm")}
-              </button>
+       {/* Consent Modal */}
+       {consentModalOpen && (
+        <div className="modal-overlay animate-in" data-testid="consent-modal">
+           <div className="modal-content animate-pop">
+              <h3 className="text-lg font-bold mb-2 text-white">{tr("externalContentWarningTitle")}</h3>
+              <p className="text-sm text-muted mb-4 leading-relaxed">{tr("externalContentWarningText")}</p>
+              <div className="bg-black p-2 rounded text-xs mono text-accent-primary mb-4 break-all">
+                 {consentModalUrl}
+              </div>
+
+              <label className="flex items-center gap-2 mb-6 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={consentModalAutoConfirm}
+                    onChange={e => setConsentModalAutoConfirm(e.target.checked)}
+                    disabled={consentModalBusy}
+                    data-testid="consent-auto-confirm"
+                  />
+                  <span className="text-sm">{tr("autoConfirmForThisProject")}</span>
+               </label>
+
+              {consentModalError && <div className="alert mb-4">{consentModalError}</div>}
+
+               <div className="flex justify-end gap-3">
+                 <button
+                   className="btn btn-ghost"
+                   onClick={() => setConsentModalOpen(false)}
+                   disabled={consentModalBusy}
+                   data-testid="consent-cancel"
+                 >
+                     {tr("cancel")}
+                  </button>
+                 <button
+                   className="btn btn-primary"
+                   onClick={() => void onConfirmConsentAndSaveUrl()}
+                   disabled={consentModalBusy}
+                   data-testid="consent-confirm"
+                 >
+                     {consentModalBusy ? tr("confirming") : tr("iConfirm")}
+                  </button>
+               </div>
             </div>
-          </div>
-        </div>
-      )}
+         </div>
+       )}
     </div>
   );
 }

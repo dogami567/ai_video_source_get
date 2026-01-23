@@ -5,13 +5,15 @@
     "apps/*"
   ],
   "scripts": {
-    "dev": "node scripts/predev.mjs && concurrently -n web,orchestrator,toolserver -c green,blue,magenta \"npm -w @vidunpack/web run dev\" \"npm -w @vidunpack/orchestrator run dev\" \"cargo run -p vidunpack-toolserver\"",
+    "dev": "node scripts/predev.mjs && concurrently -n web,orchestrator,toolserver -c green,blue,magenta \"npm -w @vidunpack/web run dev\" \"npm -w @vidunpack/orchestrator run dev\" \"node scripts/run-toolserver.mjs\"",
     "dev:web": "npm -w @vidunpack/web run dev",
     "dev:orchestrator": "npm -w @vidunpack/orchestrator run dev",
-    "dev:toolserver": "cargo run -p vidunpack-toolserver",
-    "build": "npm -w @vidunpack/web run build && npm -w @vidunpack/orchestrator run build && cargo build -p vidunpack-toolserver"
+    "dev:toolserver": "node scripts/run-toolserver.mjs",
+    "build": "npm -w @vidunpack/web run build && npm -w @vidunpack/orchestrator run build && cargo build -p vidunpack-toolserver",
+    "test:e2e": "playwright test"
   },
   "devDependencies": {
+    "@playwright/test": "^1.50.1",
     "concurrently": "^9.1.2"
   }
 }

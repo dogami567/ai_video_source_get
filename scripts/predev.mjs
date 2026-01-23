@@ -116,6 +116,25 @@ async function ensurePortFree(port) {
     } catch {
       // ignore
     }
+    if (process.platform === "win32") {
+      try {
+        run("taskkill", ["/PID", String(pid), "/T", "/F"]);
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  // Final check.
+  for (let i = 0; i < 20; i += 1) {
+    if (findListeningPids(port).length === 0) return;
+    await sleep(150);
+  }
+
+  const still = findListeningPids(port);
+  if (still.length > 0) {
+    console.error(`[predev] Failed to free port ${port}. PIDs: ${still.join(", ")}. Set WEB_PORT to another port or stop the process.`);
+    process.exitCode = 1;
   }
 }
 

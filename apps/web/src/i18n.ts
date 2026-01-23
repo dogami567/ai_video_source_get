@@ -33,6 +33,10 @@ const en = {
   idLabel: "ID",
   loadingProjectData: "Loading project data…",
 
+  colConfig: "Configuration",
+  colWorkspace: "Workspace",
+  colResults: "Results",
+
   settings: "Settings",
   autoConfirmDownloads: "Auto-confirm downloads",
   consent: "Consent",
@@ -127,6 +131,10 @@ const zhCN: typeof en = {
   backToProjects: "项目",
   idLabel: "ID",
   loadingProjectData: "加载项目数据…",
+
+  colConfig: "配置",
+  colWorkspace: "工作台",
+  colResults: "结果",
 
   settings: "设置",
   autoConfirmDownloads: "自动确认下载",

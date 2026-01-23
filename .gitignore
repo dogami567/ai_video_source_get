@@ -23,6 +23,10 @@ data/
 # Temp
 *.tmp
 
+# Playwright
+playwright-report/
+test-results/
+
 # Python (legacy)
 __pycache__/
 *.py[cod]
