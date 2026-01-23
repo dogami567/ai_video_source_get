@@ -1,5 +1,8 @@
 import { execFileSync } from "node:child_process";
 
+const args = new Set(process.argv.slice(2));
+const mode = args.has("--all") ? "all" : args.has("--backend") ? "backend" : "web";
+
 function readPort(envKey, fallback) {
   const raw = String(process.env[envKey] || "").trim();
   if (!raw) return fallback;
@@ -61,19 +64,42 @@ function getProcessInfo(pid) {
   return { name, cmdline };
 }
 
-function isSafeToKillForWebPort(info) {
+function isSafeToKill(info, kind) {
   const name = String(info.name || "").toLowerCase();
   const cmdline = String(info.cmdline || "").toLowerCase();
 
   // Kill only things that look like our dev server.
   // Be conservative: if we cannot read cmdline, refuse to kill.
-  if (!cmdline) return false;
+  if (!cmdline && !name) return false;
 
+  if (kind === "web") {
+    if (!cmdline) return false;
+    return (
+      cmdline.includes("vite") ||
+      cmdline.includes("ai-video-source-get") ||
+      cmdline.includes("vidunpack") ||
+      (name.includes("node") && cmdline.includes("@vidunpack"))
+    );
+  }
+
+  if (kind === "orchestrator") {
+    if (!cmdline) return false;
+    return (
+      cmdline.includes("apps/orchestrator") ||
+      cmdline.includes("apps\\orchestrator") ||
+      (cmdline.includes("tsx") && cmdline.includes("src/index.ts")) ||
+      (cmdline.includes("node") && cmdline.includes("dist/index.js") && cmdline.includes("orchestrator")) ||
+      cmdline.includes("@vidunpack/orchestrator") ||
+      cmdline.includes("vidunpack/orchestrator")
+    );
+  }
+
+  // toolserver
   return (
-    cmdline.includes("vite") ||
+    name.includes("vidunpack-toolserver") ||
+    cmdline.includes("vidunpack-toolserver") ||
     cmdline.includes("ai-video-source-get") ||
-    cmdline.includes("vidunpack") ||
-    (name.includes("node") && cmdline.includes("@vidunpack"))
+    cmdline.includes("vidunpack")
   );
 }
 
@@ -81,20 +107,20 @@ async function sleep(ms) {
   await new Promise((r) => setTimeout(r, ms));
 }
 
-async function ensurePortFree(port) {
+async function ensurePortFree({ port, envKey, kind, label }) {
   const before = findListeningPids(port);
   if (before.length === 0) return;
 
   for (const pid of before) {
     const info = getProcessInfo(pid);
-    if (!isSafeToKillForWebPort(info)) {
-      const msg = `[predev] Port ${port} is already in use by PID ${pid} (${info.name || "unknown"}). Please stop it or set WEB_PORT to another port.`;
+    if (!isSafeToKill(info, kind)) {
+      const msg = `[predev] ${label} port ${port} is already in use by PID ${pid} (${info.name || "unknown"}). Stop it or set ${envKey} in .env.`;
       console.error(msg);
       process.exitCode = 1;
       return;
     }
 
-    console.log(`[predev] Port ${port} in use; stopping PID ${pid} (${info.name || "unknown"})`);
+    console.log(`[predev] ${label} port ${port} in use; stopping PID ${pid} (${info.name || "unknown"})`);
     try {
       process.kill(pid, "SIGTERM");
     } catch {
@@ -133,10 +159,21 @@ async function ensurePortFree(port) {
 
   const still = findListeningPids(port);
   if (still.length > 0) {
-    console.error(`[predev] Failed to free port ${port}. PIDs: ${still.join(", ")}. Set WEB_PORT to another port or stop the process.`);
+    console.error(
+      `[predev] Failed to free ${label} port ${port}. PIDs: ${still.join(", ")}. Stop the process or set ${envKey} in .env.`,
+    );
     process.exitCode = 1;
   }
 }
 
-const webPort = readPort("WEB_PORT", 6785);
-await ensurePortFree(webPort);
+if (mode === "web" || mode === "all") {
+  const webPort = readPort("WEB_PORT", 6785);
+  await ensurePortFree({ port: webPort, envKey: "WEB_PORT", kind: "web", label: "web" });
+}
+
+if (mode === "backend" || mode === "all") {
+  const orchestratorPort = readPort("ORCHESTRATOR_PORT", 6790);
+  const toolserverPort = readPort("TOOLSERVER_PORT", 6791);
+  await ensurePortFree({ port: orchestratorPort, envKey: "ORCHESTRATOR_PORT", kind: "orchestrator", label: "orchestrator" });
+  await ensurePortFree({ port: toolserverPort, envKey: "TOOLSERVER_PORT", kind: "toolserver", label: "toolserver" });
+}

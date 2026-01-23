@@ -46,6 +46,10 @@ if not exist "node_modules\" (
   if errorlevel 1 exit /b 1
 )
 
+REM Ensure backend ports are free (best-effort)
+node scripts/predev.mjs --backend
+if errorlevel 1 exit /b 1
+
 echo [vidunpack] Starting backend (orchestrator=%ORCHESTRATOR_PORT% toolserver=%TOOLSERVER_PORT% data=%DATA_DIR%)
 start "" "http://127.0.0.1:%ORCHESTRATOR_PORT%/api/health"
 

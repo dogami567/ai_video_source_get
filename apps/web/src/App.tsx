@@ -432,6 +432,20 @@ export default function App() {
     void refreshProjects();
   }, [refreshHealth, refreshProjects]);
 
+  // Dev UX: orchestrator may start a bit later than Vite; keep retrying health until both services are up.
+  React.useEffect(() => {
+    const needsRetry = !!healthError || !orchHealth?.ok || !toolHealth?.ok;
+    if (!needsRetry) return;
+
+    const id = window.setInterval(() => {
+      void refreshHealth();
+    }, 2000);
+
+    return () => {
+      window.clearInterval(id);
+    };
+  }, [healthError, orchHealth?.ok, refreshHealth, toolHealth?.ok]);
+
   React.useEffect(() => {
     let cancelled = false;
     (async () => {
