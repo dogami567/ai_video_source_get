@@ -13,6 +13,7 @@ npm run dev
 打开 `http://127.0.0.1:6785`。
 
 （Windows 一键测试启动）也可以直接双击运行 `run_test.bat`。
+（仅启动后端：orchestrator + toolserver）可以运行 `run_backend.bat`。
 
 ## 设置（可选）
 

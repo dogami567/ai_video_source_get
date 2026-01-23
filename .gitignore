@@ -21,6 +21,9 @@ data/
 .env.*
 !.env.example
 
+# Local notes / screenshots (do not commit)
+问题/
+
 # Temp
 *.tmp
 
