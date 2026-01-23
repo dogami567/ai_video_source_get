@@ -5,7 +5,7 @@
     "apps/*"
   ],
   "scripts": {
-    "dev": "concurrently -n web,orchestrator,toolserver -c green,blue,magenta \"npm -w @vidunpack/web run dev\" \"npm -w @vidunpack/orchestrator run dev\" \"cargo run -p vidunpack-toolserver\"",
+    "dev": "node scripts/predev.mjs && concurrently -n web,orchestrator,toolserver -c green,blue,magenta \"npm -w @vidunpack/web run dev\" \"npm -w @vidunpack/orchestrator run dev\" \"cargo run -p vidunpack-toolserver\"",
     "dev:web": "npm -w @vidunpack/web run dev",
     "dev:orchestrator": "npm -w @vidunpack/orchestrator run dev",
     "dev:toolserver": "cargo run -p vidunpack-toolserver",
@@ -15,4 +15,3 @@
     "concurrently": "^9.1.2"
   }
 }
-
