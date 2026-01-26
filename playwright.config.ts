@@ -25,6 +25,7 @@ export default defineConfig({
     reuseExistingServer: false,
     env: {
       ...process.env,
+      E2E_MOCK_CHAT: process.env.E2E_MOCK_CHAT || "1",
       ORCHESTRATOR_PORT: String(orchestratorPort),
       TOOLSERVER_PORT: String(toolserverPort),
       DATA_DIR: process.env.DATA_DIR || "data/_e2e",
