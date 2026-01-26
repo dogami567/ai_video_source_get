@@ -25,7 +25,7 @@ if errorlevel 1 (
 where npm >nul 2>nul
 if errorlevel 1 (
   echo [vidunpack] ERROR: npm not found on PATH.
-  echo [vidunpack] Reinstall Node.js (npm is included) and try again.
+  echo [vidunpack] Reinstall Node.js ^(npm is included^) and try again.
   pause
   exit /b 1
 )
@@ -65,7 +65,7 @@ if not exist "node_modules\.bin\concurrently.cmd" if not exist "node_modules\.bi
 if not exist "node_modules\.bin\tsx.cmd" if not exist "node_modules\.bin\tsx" set "_NEED_INSTALL=1"
 
 if defined _NEED_INSTALL (
-  echo [vidunpack] Installing npm dependencies (including dev)...
+  echo [vidunpack] Installing npm dependencies ^(including dev^)...
   call npm install --production=false
   if errorlevel 1 goto :err
 )
