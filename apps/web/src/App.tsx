@@ -33,6 +33,8 @@ type RemoteMediaInfoSummary = {
   title: string;
   duration_s: number | null;
   webpage_url: string;
+  thumbnail?: string | null;
+  description?: string | null;
 };
 type ImportRemoteMediaResponse = { info: RemoteMediaInfoSummary; info_artifact: Artifact; input_video?: Artifact | null };
 type PoolItem = {
@@ -46,6 +48,29 @@ type PoolItem = {
   data_json: string | null;
   selected: boolean;
   created_at_ms: number;
+};
+
+type ChatThread = { id: string; project_id: string; title: string; created_at_ms: number };
+type ChatMessage = {
+  id: string;
+  project_id: string;
+  chat_id: string;
+  role: string;
+  content: string;
+  data?: any;
+  created_at_ms: number;
+};
+
+type UploadFileArtifactResponse = { artifact: Artifact; bytes: number; file_name: string; mime: string | null };
+type ChatAttachment = { artifact: Artifact; bytes: number; file_name: string; mime: string | null };
+type ChatTurnResponse = {
+  ok: boolean;
+  needs_consent?: boolean;
+  plan?: unknown | null;
+  plan_artifact?: Artifact | null;
+  user_message: ChatMessage;
+  assistant_message: ChatMessage;
+  mock?: boolean;
 };
 
 const CLIENT_CONFIG_KEY = "vidunpack_client_config_v1";
@@ -319,6 +344,7 @@ export default function App() {
   const [createBusy, setCreateBusy] = React.useState(false);
 
   const [view, setView] = React.useState<View>({ kind: "list" });
+  const [projectTab, setProjectTab] = React.useState<"workspace" | "chat">("workspace");
   const returnFromSettings = React.useRef<View>({ kind: "list" });
 
   const [clientConfig, setClientConfig] = React.useState<ClientConfig>(() => loadClientConfig());
@@ -401,6 +427,31 @@ export default function App() {
   const [consentModalUrl, setConsentModalUrl] = React.useState<string | null>(null);
   const [consentModalBusy, setConsentModalBusy] = React.useState(false);
   const [consentModalError, setConsentModalError] = React.useState<string | null>(null);
+
+  const lastProjectIdRef = React.useRef<string | null>(null);
+
+  const [chatThreads, setChatThreads] = React.useState<ChatThread[]>([]);
+  const [chatThreadsLoading, setChatThreadsLoading] = React.useState(false);
+  const [chatThreadsError, setChatThreadsError] = React.useState<string | null>(null);
+
+  const [activeChatId, setActiveChatId] = React.useState<string | null>(null);
+  const [chatMessages, setChatMessages] = React.useState<ChatMessage[]>([]);
+  const [chatMessagesLoading, setChatMessagesLoading] = React.useState(false);
+  const [chatMessagesError, setChatMessagesError] = React.useState<string | null>(null);
+
+  const [chatDraft, setChatDraft] = React.useState("");
+  const [chatSendBusy, setChatSendBusy] = React.useState(false);
+  const [chatSendError, setChatSendError] = React.useState<string | null>(null);
+
+  const [chatAttachments, setChatAttachments] = React.useState<ChatAttachment[]>([]);
+  const [chatUploadBusy, setChatUploadBusy] = React.useState(false);
+  const [chatUploadError, setChatUploadError] = React.useState<string | null>(null);
+
+  const [chatCardBusyUrl, setChatCardBusyUrl] = React.useState<string | null>(null);
+  const [chatCardError, setChatCardError] = React.useState<string | null>(null);
+
+  const chatEndRef = React.useRef<HTMLDivElement | null>(null);
+  const chatFileInputRef = React.useRef<HTMLInputElement | null>(null);
 
   const refreshHealth = React.useCallback(async () => {
     setHealthError(null);
@@ -495,6 +546,24 @@ export default function App() {
     setRemoteInfoByUrl({});
     void refreshProject(view.projectId);
   }, [refreshProject, view]);
+
+  React.useEffect(() => {
+    if (view.kind !== "project") return;
+    if (lastProjectIdRef.current === view.projectId) return;
+    lastProjectIdRef.current = view.projectId;
+
+    setProjectTab("workspace");
+    setChatThreads([]);
+    setChatThreadsError(null);
+    setActiveChatId(null);
+    setChatMessages([]);
+    setChatMessagesError(null);
+    setChatDraft("");
+    setChatAttachments([]);
+    setChatSendError(null);
+    setChatUploadError(null);
+    setChatCardError(null);
+  }, [view.kind, view.kind === "project" ? view.projectId : ""]);
 
   const onCreateProject = async () => {
     setCreateBusy(true);
@@ -670,6 +739,213 @@ export default function App() {
       setRemoteError(e instanceof Error ? e.message : String(e));
     } finally {
       setRemoteBusyId(null);
+    }
+  };
+
+  const refreshChatThreads = React.useCallback(async (projectId: string) => {
+    setChatThreadsLoading(true);
+    setChatThreadsError(null);
+    try {
+      const threads = await fetchJson<ChatThread[]>(`/tool/projects/${projectId}/chats`);
+      setChatThreads(threads);
+      return threads;
+    } catch (e) {
+      setChatThreadsError(e instanceof Error ? e.message : String(e));
+      return null;
+    } finally {
+      setChatThreadsLoading(false);
+    }
+  }, []);
+
+  const createChatThread = React.useCallback(async (projectId: string, title?: string) => {
+    const created = await postJson<ChatThread>(`/tool/projects/${projectId}/chats`, { title: title?.trim() || undefined });
+    setChatThreads((prev) => [created, ...prev.filter((t) => t.id !== created.id)]);
+    setActiveChatId(created.id);
+    setChatMessages([]);
+    return created;
+  }, []);
+
+  const loadChatMessages = React.useCallback(async (projectId: string, chatId: string) => {
+    setChatMessagesLoading(true);
+    setChatMessagesError(null);
+    try {
+      const msgs = await fetchJson<ChatMessage[]>(`/tool/projects/${projectId}/chats/${chatId}/messages`);
+      setChatMessages(msgs);
+      return msgs;
+    } catch (e) {
+      setChatMessagesError(e instanceof Error ? e.message : String(e));
+      return null;
+    } finally {
+      setChatMessagesLoading(false);
+    }
+  }, []);
+
+  React.useEffect(() => {
+    if (view.kind !== "project") return;
+    if (projectTab !== "chat") return;
+
+    let cancelled = false;
+    (async () => {
+      const threads = await refreshChatThreads(view.projectId);
+      if (cancelled || !threads) return;
+
+      const hasActive = !!activeChatId && threads.some((t) => t.id === activeChatId);
+      if (hasActive) return;
+
+      if (threads.length > 0) {
+        setActiveChatId(threads[0].id);
+        return;
+      }
+
+      try {
+        const created = await createChatThread(view.projectId);
+        if (cancelled) return;
+        setChatThreads([created]);
+        setActiveChatId(created.id);
+      } catch (e) {
+        if (cancelled) return;
+        setChatThreadsError(e instanceof Error ? e.message : String(e));
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [createChatThread, projectTab, refreshChatThreads, view.kind, view.kind === "project" ? view.projectId : ""]);
+
+  React.useEffect(() => {
+    if (view.kind !== "project") return;
+    if (projectTab !== "chat") return;
+    if (!activeChatId) return;
+
+    let cancelled = false;
+    (async () => {
+      const msgs = await loadChatMessages(view.projectId, activeChatId);
+      if (cancelled) return;
+      if (!msgs) return;
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeChatId, loadChatMessages, projectTab, view.kind, view.kind === "project" ? view.projectId : ""]);
+
+  React.useEffect(() => {
+    if (projectTab !== "chat") return;
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [chatMessages, projectTab]);
+
+  const onChatNewThread = async () => {
+    if (view.kind !== "project") return;
+    setChatThreadsError(null);
+    try {
+      await createChatThread(view.projectId);
+    } catch (e) {
+      setChatThreadsError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const onChatUploadFiles = async (files: FileList | null) => {
+    if (view.kind !== "project") return;
+    if (!files || files.length === 0) return;
+
+    setChatUploadBusy(true);
+    setChatUploadError(null);
+    try {
+      const uploaded: ChatAttachment[] = [];
+      for (const file of Array.from(files)) {
+        const form = new FormData();
+        form.append("file", file);
+        const res = await fetch(`/tool/projects/${view.projectId}/artifacts/upload`, { method: "POST", body: form });
+        const text = await res.text();
+        if (!res.ok) {
+          try {
+            const parsed = JSON.parse(text) as { error?: string };
+            throw new Error(parsed.error || `HTTP ${res.status}`);
+          } catch {
+            throw new Error(text || `HTTP ${res.status}`);
+          }
+        }
+        const json = JSON.parse(text) as UploadFileArtifactResponse;
+        uploaded.push({ artifact: json.artifact, bytes: json.bytes, file_name: json.file_name, mime: json.mime });
+      }
+      setChatAttachments((prev) => [...prev, ...uploaded]);
+      await refreshProject(view.projectId);
+    } catch (e) {
+      setChatUploadError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setChatUploadBusy(false);
+      if (chatFileInputRef.current) chatFileInputRef.current.value = "";
+    }
+  };
+
+  const onChatRemoveAttachment = (artifactId: string) => {
+    setChatAttachments((prev) => prev.filter((a) => a.artifact.id !== artifactId));
+  };
+
+  const onChatSend = async () => {
+    if (view.kind !== "project") return;
+    if (!activeChatId) return;
+
+    setChatSendError(null);
+    const message = chatDraft.trimEnd();
+    if (!message.trim()) {
+      setChatSendError(tr("errEnterMessage"));
+      return;
+    }
+
+    setChatSendBusy(true);
+    try {
+      const resp = await postJson<ChatTurnResponse>(`/api/projects/${view.projectId}/chat/turn`, {
+        chat_id: activeChatId,
+        message,
+        base_url: clientConfig.base_url,
+        gemini_api_key: clientConfig.gemini_api_key,
+        exa_api_key: clientConfig.exa_api_key,
+        default_model: clientConfig.default_model,
+        ytdlp_cookies_from_browser: clientConfig.ytdlp_cookies_from_browser,
+        attachments: chatAttachments.map((a) => ({
+          artifact_id: a.artifact.id,
+          file_name: a.file_name,
+          mime: a.mime || "",
+          bytes: a.bytes,
+        })),
+      });
+      setChatDraft("");
+      setChatAttachments([]);
+      setChatMessages((prev) => [...prev, resp.user_message, resp.assistant_message]);
+      if (resp.plan !== undefined) setLastPlan(resp.plan ?? null);
+      if (resp.plan_artifact !== undefined) setLastPlanArtifact(resp.plan_artifact ?? null);
+      await refreshProject(view.projectId);
+    } catch (e) {
+      setChatSendError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setChatSendBusy(false);
+    }
+  };
+
+  const onChatCardResolveOrDownload = async (url: string, download: boolean) => {
+    if (view.kind !== "project") return;
+    setChatCardError(null);
+
+    if (!consent?.consented) {
+      setConsentModalUrl(url);
+      setConsentModalOpen(true);
+      return;
+    }
+
+    setChatCardBusyUrl(url);
+    try {
+      const resp = await postJson<ImportRemoteMediaResponse>(`/tool/projects/${view.projectId}/media/remote`, {
+        url,
+        download,
+        cookies_from_browser: clientConfig.ytdlp_cookies_from_browser,
+      });
+      setRemoteInfoByUrl((prev) => ({ ...prev, [url]: resp.info }));
+      await refreshProject(view.projectId);
+    } catch (e) {
+      setChatCardError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setChatCardBusyUrl(null);
     }
   };
 
@@ -1059,14 +1335,35 @@ export default function App() {
               </div>
             </div>
           ) : (
-            <div className="animate-enter">
-              <div className="flex items-center gap-2 mb-6">
-                <button className="btn btn-ghost btn-sm" onClick={onBackToList} data-testid="back-to-list">
-                  &larr; {tr("backToProjects")}
-                </button>
-                <span className="text-dim">/</span>
-                <span className="font-bold text-lg text-main">{project?.title || tr("untitled")}</span>
-              </div>
+	            <div className="animate-enter">
+	              <div className="flex items-center justify-between mb-6 gap-4">
+	                <div className="flex items-center gap-2">
+	                  <button className="btn btn-ghost btn-sm" onClick={onBackToList} data-testid="back-to-list">
+	                    &larr; {tr("backToProjects")}
+	                  </button>
+	                  <span className="text-dim">/</span>
+	                  <span className="font-bold text-lg text-main">{project?.title || tr("untitled")}</span>
+	                </div>
+
+	                <div className="segmented" data-testid="project-tabs">
+	                  <button
+	                    className={`segmented-btn ${projectTab === "workspace" ? "active" : ""}`}
+	                    type="button"
+	                    onClick={() => setProjectTab("workspace")}
+	                    data-testid="project-tab-workspace"
+	                  >
+	                    {tr("colWorkspace")}
+	                  </button>
+	                  <button
+	                    className={`segmented-btn ${projectTab === "chat" ? "active" : ""}`}
+	                    type="button"
+	                    onClick={() => setProjectTab("chat")}
+	                    data-testid="project-tab-chat"
+	                  >
+	                    {tr("chat")}
+	                  </button>
+	                </div>
+	              </div>
 
               {projectError && <div className="alert mb-6">{projectError}</div>}
               {projectLoading && <div className="text-center text-muted mb-4">{tr("loadingProjectData")}</div>}
@@ -1257,9 +1554,291 @@ export default function App() {
                     </div>
                   </aside>
 
-                  {/* --- Main Content: Workspace & Results --- */}
-                  <main className="layout-content">
-                    <div className="flex flex-col gap-6">
+	                  {/* --- Main Content: Workspace & Results --- */}
+	                  <main className="layout-content">
+	                    {projectTab === "chat" ? (
+	                      <div className="panel chat-panel" data-testid="chat-panel">
+	                        <div className="panel-header">
+	                          <div className="panel-title">{tr("chat")}</div>
+	                          <div className="flex items-center gap-2">
+	                            <button
+	                              className="btn btn-secondary btn-sm"
+	                              type="button"
+	                              onClick={() => void refreshChatThreads(view.projectId)}
+	                              disabled={chatThreadsLoading}
+	                              data-testid="chat-refresh-threads"
+	                            >
+	                              {tr("refresh")}
+	                            </button>
+	                            <button
+	                              className="btn btn-primary btn-sm"
+	                              type="button"
+	                              onClick={() => void onChatNewThread()}
+	                              disabled={chatThreadsLoading}
+	                              data-testid="chat-new-thread"
+	                            >
+	                              + {tr("newChat")}
+	                            </button>
+	                          </div>
+	                        </div>
+
+	                        <div className="chat-split">
+	                          <div className="chat-thread-col" data-testid="chat-threads">
+	                            {chatThreadsError && <div className="alert mb-4">{chatThreadsError}</div>}
+	                            {chatThreadsLoading ? (
+	                              <div className="text-center text-muted text-sm py-6">{tr("loadingChats")}</div>
+	                            ) : chatThreads.length === 0 ? (
+	                              <div className="text-center text-muted text-sm py-6">{tr("noChats")}</div>
+	                            ) : (
+	                              <div className="chat-thread-list">
+	                                {chatThreads.map((c) => (
+	                                  <button
+	                                    key={c.id}
+	                                    type="button"
+	                                    className={`chat-thread ${c.id === activeChatId ? "active" : ""}`}
+	                                    onClick={() => setActiveChatId(c.id)}
+	                                    data-testid={`chat-thread-${c.id}`}
+	                                  >
+	                                    <div className="chat-thread-title">{c.title || tr("untitled")}</div>
+	                                    <div className="chat-thread-meta mono">{formatTs(c.created_at_ms)}</div>
+	                                  </button>
+	                                ))}
+	                              </div>
+	                            )}
+	                          </div>
+
+	                          <div className="chat-main-col">
+	                            <div className="chat-messages" data-testid="chat-messages">
+	                              {chatMessagesError && <div className="alert mb-4">{chatMessagesError}</div>}
+	                              {chatMessagesLoading ? (
+	                                <div className="text-center text-muted text-sm py-6">{tr("loadingMessages")}</div>
+	                              ) : chatMessages.length === 0 ? (
+	                                <div className="text-center text-muted text-sm py-12">{tr("chatEmptyMessages")}</div>
+	                              ) : (
+	                                <div className="chat-message-list">
+	                                  {chatMessages.map((m) => {
+	                                    const role = String(m.role || "");
+	                                    const isUser = role === "user";
+	                                    const data = m.data as any;
+	                                    const attachments = Array.isArray(data?.attachments) ? (data.attachments as any[]) : [];
+	                                    const blocks = Array.isArray(data?.blocks) ? (data.blocks as any[]) : [];
+
+	                                    return (
+	                                      <div
+	                                        key={m.id}
+	                                        className={`chat-row ${isUser ? "right" : "left"}`}
+	                                        data-testid={`chat-message-${m.id}`}
+	                                      >
+	                                        <div className={`chat-bubble ${isUser ? "user" : "assistant"}`}>
+	                                          <div className="chat-meta">
+	                                            <span className="mono">{role}</span>
+	                                            <span className="chat-meta-sep">•</span>
+	                                            <span className="mono">{formatTs(m.created_at_ms)}</span>
+	                                          </div>
+
+	                                          {m.content?.trim() && <div className="chat-text">{m.content}</div>}
+
+	                                          {attachments.length > 0 && (
+	                                            <div className="chat-attachments" data-testid="chat-message-attachments">
+	                                              {attachments.map((a, idx) => {
+	                                                const artifactId = typeof a?.artifact_id === "string" ? a.artifact_id : "";
+	                                                const fileName = typeof a?.file_name === "string" ? a.file_name : "file";
+	                                                const mime = typeof a?.mime === "string" ? a.mime : "";
+	                                                const bytes = typeof a?.bytes === "number" ? a.bytes : 0;
+	                                                const rawUrl = artifactId
+	                                                  ? `/tool/projects/${view.projectId}/artifacts/${artifactId}/raw`
+	                                                  : "";
+	                                                const isImage =
+	                                                  mime.startsWith("image/") ||
+	                                                  !!fileName.toLowerCase().match(/\.(png|jpg|jpeg|webp|gif|svg)$/);
+	                                                return (
+	                                                  <a
+	                                                    key={`${artifactId}-${idx}`}
+	                                                    className="attachment-chip"
+	                                                    href={rawUrl || undefined}
+	                                                    target={rawUrl ? "_blank" : undefined}
+	                                                    rel="noreferrer"
+	                                                  >
+	                                                    {isImage && rawUrl ? (
+	                                                      <img className="attachment-thumb" src={rawUrl} alt={fileName} />
+	                                                    ) : (
+	                                                      <div className="attachment-icon" aria-hidden>
+	                                                        FILE
+	                                                      </div>
+	                                                    )}
+	                                                    <div className="attachment-body">
+	                                                      <div className="attachment-name">{fileName}</div>
+	                                                      <div className="attachment-meta mono">{bytesToSize(bytes)}</div>
+	                                                    </div>
+	                                                  </a>
+	                                                );
+	                                              })}
+	                                            </div>
+	                                          )}
+
+	                                          {blocks.map((b, idx) => {
+	                                            const type = String(b?.type || "");
+	                                            if (type === "prompt") {
+	                                              const title = typeof b?.title === "string" ? b.title : "Prompt";
+	                                              const text = typeof b?.text === "string" ? b.text : "";
+	                                              if (!text) return null;
+	                                              return (
+	                                                <div key={`b-${idx}`} className="chat-block">
+	                                                  <div className="chat-block-title">{title}</div>
+	                                                  <div className="code-block text-xs">{text}</div>
+	                                                </div>
+	                                              );
+	                                            }
+	                                            if (type === "videos") {
+	                                              const videos = Array.isArray(b?.videos) ? (b.videos as any[]) : [];
+	                                              if (videos.length === 0) return null;
+	                                              return (
+	                                                <div key={`b-${idx}`} className="chat-block">
+	                                                  <div className="video-cards">
+	                                                    {videos.map((v, vi) => {
+	                                                      const url = typeof v?.url === "string" ? v.url : "";
+	                                                      const title = typeof v?.title === "string" ? v.title : url;
+	                                                      const desc = typeof v?.description === "string" ? v.description : null;
+	                                                      const thumb = typeof v?.thumbnail === "string" ? v.thumbnail : null;
+	                                                      const busy = chatCardBusyUrl === url;
+	                                                      return (
+	                                                        <div key={`${url}-${vi}`} className="video-card" data-testid="chat-video-card">
+	                                                          {thumb ? (
+	                                                            <img className="video-thumb" src={thumb} alt="" />
+	                                                          ) : (
+	                                                            <div className="video-thumb placeholder" />
+	                                                          )}
+	                                                          <div className="video-info">
+	                                                            <a className="video-title" href={url} target="_blank" rel="noreferrer">
+	                                                              {title}
+	                                                            </a>
+	                                                            {desc ? <div className="video-desc">{desc}</div> : null}
+	                                                            <div className="video-url mono">{url}</div>
+	                                                            <div className="video-actions">
+	                                                              <button
+	                                                                className="btn btn-secondary btn-sm"
+	                                                                type="button"
+	                                                                onClick={() => void onChatCardResolveOrDownload(url, false)}
+	                                                                disabled={!url || busy}
+	                                                              >
+	                                                                {busy ? "…" : tr("resolve")}
+	                                                              </button>
+	                                                              <button
+	                                                                className="btn btn-secondary btn-sm"
+	                                                                type="button"
+	                                                                onClick={() => void onChatCardResolveOrDownload(url, true)}
+	                                                                disabled={!url || busy}
+	                                                              >
+	                                                                {busy ? "…" : tr("downloadNow")}
+	                                                              </button>
+	                                                            </div>
+	                                                          </div>
+	                                                        </div>
+	                                                      );
+	                                                    })}
+	                                                  </div>
+	                                                </div>
+	                                              );
+	                                            }
+	                                            return null;
+	                                          })}
+	                                        </div>
+	                                      </div>
+	                                    );
+	                                  })}
+	                                </div>
+	                              )}
+	                              <div ref={chatEndRef} />
+	                            </div>
+
+	                            {chatCardError && <div className="alert mt-4">{chatCardError}</div>}
+	                            {chatUploadError && <div className="alert mt-4">{chatUploadError}</div>}
+	                            {chatSendError && <div className="alert mt-4">{chatSendError}</div>}
+
+	                            {chatAttachments.length > 0 && (
+	                              <div className="chat-attachments" data-testid="chat-attachments">
+	                                {chatAttachments.map((a) => {
+	                                  const rawUrl = `/tool/projects/${view.projectId}/artifacts/${a.artifact.id}/raw`;
+	                                  const isImage =
+	                                    (a.mime || "").startsWith("image/") ||
+	                                    !!a.file_name.toLowerCase().match(/\.(png|jpg|jpeg|webp|gif|svg)$/);
+	                                  return (
+	                                    <div key={a.artifact.id} className="attachment-chip attachment-pending">
+	                                      {isImage ? (
+	                                        <img className="attachment-thumb" src={rawUrl} alt={a.file_name} />
+	                                      ) : (
+	                                        <div className="attachment-icon" aria-hidden>
+	                                          FILE
+	                                        </div>
+	                                      )}
+	                                      <div className="attachment-body">
+	                                        <div className="attachment-name">{a.file_name}</div>
+	                                        <div className="attachment-meta mono">{bytesToSize(a.bytes)}</div>
+	                                      </div>
+	                                      <button
+	                                        className="btn btn-ghost btn-sm"
+	                                        type="button"
+	                                        onClick={() => onChatRemoveAttachment(a.artifact.id)}
+	                                        data-testid={`chat-remove-attachment-${a.artifact.id}`}
+	                                      >
+	                                        ×
+	                                      </button>
+	                                    </div>
+	                                  );
+	                                })}
+	                              </div>
+	                            )}
+
+	                            <div className="chat-composer" data-testid="chat-composer">
+	                              <input
+	                                ref={chatFileInputRef}
+	                                type="file"
+	                                hidden
+	                                multiple
+	                                onChange={(e) => void onChatUploadFiles(e.target.files)}
+	                                data-testid="chat-file-input"
+	                              />
+	                              <button
+	                                className="btn btn-secondary btn-sm"
+	                                type="button"
+	                                onClick={() => chatFileInputRef.current?.click()}
+	                                disabled={chatUploadBusy}
+	                                data-testid="chat-upload"
+	                              >
+	                                {chatUploadBusy ? "…" : tr("upload")}
+	                              </button>
+	                              <textarea
+	                                className="input-field chat-textarea"
+	                                placeholder={tr("chatPlaceholder")}
+	                                value={chatDraft}
+	                                onChange={(e) => setChatDraft(e.target.value)}
+	                                onKeyDown={(e) => {
+	                                  if (e.key !== "Enter") return;
+	                                  if (e.shiftKey) return;
+	                                  if ((e.nativeEvent as any)?.isComposing) return;
+	                                  e.preventDefault();
+	                                  void onChatSend();
+	                                }}
+	                                disabled={chatSendBusy}
+	                                data-testid="chat-input"
+	                              />
+	                              <button
+	                                className="btn btn-primary btn-sm"
+	                                type="button"
+	                                onClick={() => void onChatSend()}
+	                                disabled={chatSendBusy}
+	                                data-testid="chat-send"
+	                              >
+	                                {chatSendBusy ? tr("sending") : tr("send")}
+	                              </button>
+	                            </div>
+
+	                            <div className="text-xs text-muted mt-2">{tr("chatHint")}</div>
+	                          </div>
+	                        </div>
+	                      </div>
+	                    ) : (
+	                      <div className="flex flex-col gap-6">
                       
                       {/* Analysis Section */}
                       <div className="panel">
@@ -1409,8 +1988,9 @@ export default function App() {
                           )}
                        </div>
 
-                    </div>
-                  </main>
+	                    </div>
+	                    )}
+	                  </main>
                 </div>
               )}
             </div>

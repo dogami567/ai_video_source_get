@@ -43,6 +43,18 @@ const en = {
   colWorkspace: "Workspace",
   colResults: "Results",
 
+  chat: "Chat",
+  newChat: "New chat",
+  loadingChats: "Loading chats…",
+  noChats: "No chats yet.",
+  loadingMessages: "Loading messages…",
+  chatEmptyMessages: "Start a conversation to get video cards.",
+  upload: "Upload",
+  send: "Send",
+  sending: "Sending…",
+  chatPlaceholder: "Describe your idea… (Enter to send, Shift+Enter for newline)",
+  chatHint: "Enter to send • Shift+Enter for newline",
+
   settings: "Settings",
   globalSettingsTitle: "Global Settings",
   globalSettingsHint: "Saved locally in this browser. Leave fields empty to fall back to .env.",
@@ -127,6 +139,7 @@ const en = {
   iConfirm: "I Confirm",
 
   errEnterUrl: "Please enter a URL",
+  errEnterMessage: "Please enter a message",
   errEnterModel: "Please enter a model",
   errPickLocalVideo: "Please select a local video (input_video)",
   errEnterSearchQuery: "Please enter a search query",
@@ -171,6 +184,18 @@ const zhCN: typeof en = {
   colConfig: "配置",
   colWorkspace: "工作台",
   colResults: "结果",
+
+  chat: "聊天",
+  newChat: "新对话",
+  loadingChats: "加载对话…",
+  noChats: "暂无对话。",
+  loadingMessages: "加载消息…",
+  chatEmptyMessages: "开始聊天吧：我会帮你搜索并输出视频卡片。",
+  upload: "上传",
+  send: "发送",
+  sending: "发送中…",
+  chatPlaceholder: "说说你的想法…（Enter 发送，Shift+Enter 换行）",
+  chatHint: "Enter 发送 • Shift+Enter 换行",
 
   settings: "设置",
   globalSettingsTitle: "全局设置",
@@ -256,6 +281,7 @@ const zhCN: typeof en = {
   iConfirm: "我确认",
 
   errEnterUrl: "请输入 URL",
+  errEnterMessage: "请输入内容",
   errEnterModel: "请输入 model",
   errPickLocalVideo: "请选择一个本地视频（input_video）",
   errEnterSearchQuery: "请输入 search query",
