@@ -6,6 +6,7 @@ This package contains **pre-built outputs** (web UI + orchestrator + Rust toolse
 
 - Node.js (recommended: 20+)
 - ffmpeg (optional but recommended; some features will be unavailable without it)
+- yt-dlp (optional; required only if you want to resolve/download URLs like bilibili)
 - Optional API keys (edit `.env`):
   - `GEMINI_API_KEY` (and optional `BASE_URL`, `DEFAULT_MODEL`)
   - `EXA_API_KEY`

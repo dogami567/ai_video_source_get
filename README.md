@@ -22,11 +22,14 @@ npm run dev
 - 留空：使用 `.env`（环境变量）
 - 填写并保存：优先使用浏览器本地设置（localStorage）
 
+另外支持配置 `yt-dlp` 的“从浏览器读取登录态”（例如 `chrome` / `edge`），用于解析/下载需要登录的视频链接（如 B 站）。该设置只保存浏览器名，不会在应用里保存 cookie。
+
 ## 依赖
 
 - Node.js (npm workspaces)
 - Rust（后端工具服务）
 - ffmpeg（后续媒体处理会用到）
+- yt-dlp（可选：用于 URL 解析/下载；下载后会作为本地视频进入项目）
 
 ## GitHub Actions 打包（Windows / macOS）
 

@@ -1,0 +1,9 @@
+{
+  "extractor": "bilibili",
+  "id": "BVxxxxxxxx",
+  "title": "Sample title (sanitized)",
+  "webpage_url": "https://www.bilibili.com/video/BVxxxxxxxx",
+  "duration": 123.45,
+  "note": "This is a sanitized example. Real yt-dlp output contains many more fields and may change across versions."
+}
+

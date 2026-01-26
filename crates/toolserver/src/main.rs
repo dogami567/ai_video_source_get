@@ -29,6 +29,7 @@ struct HealthResponse {
     data_dir: String,
     ffmpeg: bool,
     ffprobe: bool,
+    ytdlp: bool,
     db_path: String,
 }
 
@@ -50,6 +51,12 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("ffmpeg/ffprobe not found on PATH; ffmpeg-dependent features will be unavailable");
     }
 
+    let ytdlp_cmd = std::env::var("YTDLP_PATH").unwrap_or_else(|_| "yt-dlp".to_string());
+    let ytdlp = detect_ytdlp(&ytdlp_cmd);
+    if !ytdlp {
+        tracing::warn!("yt-dlp not found on PATH; URL download/resolve features will be unavailable");
+    }
+
     let db_path = data_dir.join("vidunpack.sqlite3");
     init_db(&db_path)?;
 
@@ -58,6 +65,8 @@ async fn main() -> anyhow::Result<()> {
         db_path,
         ffmpeg,
         ffprobe,
+        ytdlp,
+        ytdlp_cmd,
     };
 
     let app = Router::new()
@@ -74,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/projects/{id}/pool/items/{item_id}/selected", post(set_pool_item_selected))
         .route("/projects/{id}/inputs/url", post(add_input_url))
         .route("/projects/{id}/media/local", post(import_local_video))
+        .route("/projects/{id}/media/remote", post(import_remote_media))
         .route("/projects/{id}/pipeline/ffmpeg", post(ffmpeg_pipeline))
         .route("/projects/{id}/exports/report", post(generate_report))
         .route("/projects/{id}/exports/zip/estimate", post(estimate_export_zip))
@@ -104,6 +114,8 @@ struct AppState {
     db_path: PathBuf,
     ffmpeg: bool,
     ffprobe: bool,
+    ytdlp: bool,
+    ytdlp_cmd: String,
 }
 
 fn detect_ffmpeg() -> bool {
@@ -117,6 +129,15 @@ fn detect_ffmpeg() -> bool {
 
 fn detect_ffprobe() -> bool {
     let output = Command::new("ffprobe").arg("-version").output();
+
+    match output {
+        Ok(out) => out.status.success(),
+        Err(_) => false,
+    }
+}
+
+fn detect_ytdlp(cmd: &str) -> bool {
+    let output = Command::new(cmd).arg("--version").output();
 
     match output {
         Ok(out) => out.status.success(),
@@ -1427,6 +1448,270 @@ async fn import_local_video(
     Err(AppError::BadRequest("missing multipart field 'file'".to_string()))
 }
 
+#[derive(Deserialize)]
+struct ImportRemoteMediaRequest {
+    url: String,
+    download: Option<bool>,
+    cookies_from_browser: Option<String>,
+}
+
+#[derive(Serialize)]
+struct RemoteMediaInfoSummary {
+    extractor: String,
+    id: String,
+    title: String,
+    duration_s: Option<f64>,
+    webpage_url: String,
+}
+
+#[derive(Serialize)]
+struct ImportRemoteMediaResponse {
+    info: RemoteMediaInfoSummary,
+    info_artifact: ArtifactResponse,
+    input_video: Option<ArtifactResponse>,
+}
+
+enum ImportRemoteMediaOutcome {
+    Ok(ImportRemoteMediaResponse),
+    NotFound,
+    PreconditionFailed(String),
+}
+
+fn env_trim(key: &str) -> Option<String> {
+    std::env::var(key).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+}
+
+fn json_string(v: &serde_json::Value, key: &str) -> Option<String> {
+    v.get(key).and_then(|x| x.as_str()).map(|s| s.to_string())
+}
+
+fn json_f64(v: &serde_json::Value, key: &str) -> Option<f64> {
+    let x = v.get(key)?;
+    if let Some(n) = x.as_f64() {
+        return Some(n);
+    }
+    x.as_str().and_then(|s| s.parse::<f64>().ok())
+}
+
+fn pick_downloaded_file(out_dir: &FsPath, file_base: &str) -> anyhow::Result<Option<PathBuf>> {
+    let mut candidates: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    let rd = match std::fs::read_dir(out_dir) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    for entry in rd {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = match path.file_name().and_then(|s| s.to_str()) {
+            Some(s) => s,
+            None => continue,
+        };
+        if !name.starts_with(file_base) {
+            continue;
+        }
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let modified = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        candidates.push((modified, path));
+    }
+    candidates.sort_by_key(|(ts, _)| *ts);
+    Ok(candidates.pop().map(|(_, p)| p))
+}
+
+async fn import_remote_media(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    Json(req): Json<ImportRemoteMediaRequest>,
+) -> AppResult<Json<ImportRemoteMediaResponse>> {
+    if project_id.trim().is_empty() {
+        return Err(AppError::BadRequest("missing project id".to_string()));
+    }
+
+    let url = req.url.trim().to_string();
+    if url.is_empty() {
+        return Err(AppError::BadRequest("missing url".to_string()));
+    }
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err(AppError::BadRequest("url must start with http:// or https://".to_string()));
+    }
+
+    if !state.ytdlp {
+        return Err(AppError::PreconditionFailed(
+            "yt-dlp not found; install yt-dlp (and restart toolserver) to enable URL resolve/download".to_string(),
+        ));
+    }
+
+    let download = req.download.unwrap_or(false);
+    if download && !state.ffmpeg {
+        return Err(AppError::PreconditionFailed(
+            "ffmpeg not found on PATH; install ffmpeg to enable URL downloads (mp4 merge)".to_string(),
+        ));
+    }
+
+    let cookies_from_browser = req
+        .cookies_from_browser
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| env_trim("YTDLP_COOKIES_FROM_BROWSER"));
+
+    let data_dir = state.data_dir.clone();
+    let db_path = state.db_path.clone();
+    let ytdlp_cmd = state.ytdlp_cmd.clone();
+
+    let outcome = tokio::task::spawn_blocking(move || -> anyhow::Result<ImportRemoteMediaOutcome> {
+        let conn = Connection::open(&db_path)?;
+
+        let exists: bool = conn
+            .query_row("SELECT 1 FROM projects WHERE id = ?1", [&project_id], |_row| Ok(()))
+            .optional()?
+            .is_some();
+        if !exists {
+            return Ok(ImportRemoteMediaOutcome::NotFound);
+        }
+
+        let consented: bool = conn
+            .query_row("SELECT consented FROM consents WHERE project_id = ?1", [&project_id], |r| {
+                Ok(r.get::<_, i64>(0)? != 0)
+            })
+            .optional()?
+            .unwrap_or(false);
+        if !consented {
+            return Ok(ImportRemoteMediaOutcome::PreconditionFailed(
+                "consent required: save URL and confirm consent first".to_string(),
+            ));
+        }
+
+        // Resolve URL to yt-dlp info JSON (works for bilibili + other supported sites).
+        let mut cmd = Command::new(&ytdlp_cmd);
+        cmd.args(["--dump-single-json", "--skip-download", "--no-playlist", "--no-warnings"]);
+        if let Some(c) = cookies_from_browser.as_ref() {
+            cmd.args(["--cookies-from-browser", c]);
+        }
+        cmd.arg(&url);
+
+        let output = run_cmd_output(&mut cmd)?;
+        let stdout = String::from_utf8(output.stdout)?;
+        let info_json: serde_json::Value = serde_json::from_str(stdout.trim())?;
+
+        let created_at_ms = now_ms();
+        let safe_out_path = sanitize_out_path(&format!("ytdlp/info-{created_at_ms}.json"))
+            .ok_or_else(|| anyhow::anyhow!("failed to build safe out_path"))?;
+        let rel_info_path = format!("projects/{}/out/{}", project_id, safe_out_path);
+        let abs_info_path = data_dir.join(&rel_info_path);
+        if let Some(parent) = abs_info_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&abs_info_path, serde_json::to_vec_pretty(&info_json)?)?;
+        let info_artifact = ensure_artifact(&conn, &project_id, "ytdlp_info", &rel_info_path, created_at_ms)?;
+
+        conn.execute(
+            "INSERT INTO events (project_id, ts_ms, level, message, data_json) VALUES (?1, ?2, 'info', 'remote_resolve', ?3)",
+            params![&project_id, created_at_ms, serde_json::json!({ "url": &url }).to_string()],
+        )?;
+
+        let extractor = json_string(&info_json, "extractor")
+            .or_else(|| json_string(&info_json, "extractor_key"))
+            .unwrap_or_else(|| "unknown".to_string());
+        let id = json_string(&info_json, "id").unwrap_or_else(|| "unknown".to_string());
+        let title = json_string(&info_json, "title").unwrap_or_else(|| "untitled".to_string());
+        let webpage_url = json_string(&info_json, "webpage_url").unwrap_or_else(|| url.clone());
+        let duration_s = json_f64(&info_json, "duration");
+
+        let mut input_video: Option<ArtifactResponse> = None;
+
+        if download {
+            let out_dir_rel = format!("projects/{}/media/remote", project_id);
+            let out_dir_abs = data_dir.join(&out_dir_rel);
+            std::fs::create_dir_all(&out_dir_abs)?;
+
+            let file_base = {
+                let ex = sanitize_file_name(&extractor);
+                let vid = sanitize_file_name(&id);
+                let base = format!("{ex}-{vid}");
+                if base.trim_matches('_').is_empty() {
+                    format!("remote-{created_at_ms}")
+                } else {
+                    base
+                }
+            };
+
+            let out_template = out_dir_abs.join(format!("{file_base}.%(ext)s"));
+            let out_template_str = out_template.display().to_string();
+
+            let mut dl = Command::new(&ytdlp_cmd);
+            dl.args([
+                "--no-playlist",
+                "--restrict-filenames",
+                "--no-warnings",
+                "--no-progress",
+                "--merge-output-format",
+                "mp4",
+                "-o",
+                &out_template_str,
+            ]);
+            if let Some(c) = cookies_from_browser.as_ref() {
+                dl.args(["--cookies-from-browser", c]);
+            }
+            dl.arg(&url);
+            run_cmd(&mut dl)?;
+
+            let expected = out_dir_abs.join(format!("{file_base}.mp4"));
+            let downloaded_abs = if expected.exists() {
+                expected
+            } else {
+                pick_downloaded_file(&out_dir_abs, &file_base)?
+                    .ok_or_else(|| anyhow::anyhow!("download finished but output file not found"))?
+            };
+
+            let rel_video_path = downloaded_abs
+                .strip_prefix(&data_dir)
+                .unwrap_or(&downloaded_abs)
+                .display()
+                .to_string();
+            let video_artifact = ensure_artifact(&conn, &project_id, "input_video", &rel_video_path, created_at_ms)?;
+            input_video = Some(video_artifact);
+
+            conn.execute(
+                "INSERT INTO events (project_id, ts_ms, level, message, data_json) VALUES (?1, ?2, 'info', 'remote_download', ?3)",
+                params![
+                    &project_id,
+                    created_at_ms,
+                    serde_json::json!({ "url": &url, "path": &rel_video_path }).to_string()
+                ],
+            )?;
+        }
+
+        Ok(ImportRemoteMediaOutcome::Ok(ImportRemoteMediaResponse {
+            info: RemoteMediaInfoSummary {
+                extractor,
+                id,
+                title,
+                duration_s,
+                webpage_url,
+            },
+            info_artifact,
+            input_video,
+        }))
+    })
+    .await
+    .context("import_remote_media task failed")??;
+
+    match outcome {
+        ImportRemoteMediaOutcome::Ok(r) => Ok(Json(r)),
+        ImportRemoteMediaOutcome::NotFound => Err(AppError::NotFound("project not found".to_string())),
+        ImportRemoteMediaOutcome::PreconditionFailed(msg) => Err(AppError::PreconditionFailed(msg)),
+    }
+}
+
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         ok: true,
@@ -1434,6 +1719,7 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         data_dir: state.data_dir.display().to_string(),
         ffmpeg: state.ffmpeg,
         ffprobe: state.ffprobe,
+        ytdlp: state.ytdlp,
         db_path: state.db_path.display().to_string(),
     })
 }
@@ -1555,6 +1841,15 @@ fn run_cmd(cmd: &mut Command) -> anyhow::Result<()> {
     let output = cmd.output()?;
     if output.status.success() {
         return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    anyhow::bail!("command failed: {stderr}");
+}
+
+fn run_cmd_output(cmd: &mut Command) -> anyhow::Result<std::process::Output> {
+    let output = cmd.output()?;
+    if output.status.success() {
+        return Ok(output);
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
     anyhow::bail!("command failed: {stderr}");

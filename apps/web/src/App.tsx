@@ -3,7 +3,15 @@ import { getInitialLocale, persistLocale, t, type I18nVars, type Locale, type Me
 
 // --- Types ---
 type OrchestratorHealth = { ok: boolean; service?: string };
-type ToolserverHealth = { ok: boolean; service: string; ffmpeg: boolean; data_dir: string; db_path: string };
+type ToolserverHealth = {
+  ok: boolean;
+  service: string;
+  ffmpeg: boolean;
+  ffprobe: boolean;
+  ytdlp: boolean;
+  data_dir: string;
+  db_path: string;
+};
 type OrchestratorConfig = { ok: boolean; default_model: string; base_url: string };
 
 type ClientConfig = {
@@ -11,6 +19,7 @@ type ClientConfig = {
   gemini_api_key?: string;
   exa_api_key?: string;
   default_model?: string;
+  ytdlp_cookies_from_browser?: string;
 };
 
 type Project = { id: string; title: string; created_at_ms: number };
@@ -18,6 +27,14 @@ type Consent = { project_id: string; consented: boolean; auto_confirm: boolean; 
 type ProjectSettings = { project_id: string; think_enabled: boolean; updated_at_ms: number };
 type Artifact = { id: string; project_id: string; kind: string; path: string; created_at_ms: number };
 type ImportLocalResponse = { artifact: Artifact; bytes: number; file_name: string };
+type RemoteMediaInfoSummary = {
+  extractor: string;
+  id: string;
+  title: string;
+  duration_s: number | null;
+  webpage_url: string;
+};
+type ImportRemoteMediaResponse = { info: RemoteMediaInfoSummary; info_artifact: Artifact; input_video?: Artifact | null };
 type PoolItem = {
   id: string;
   project_id: string;
@@ -39,11 +56,13 @@ function normalizeClientConfig(cfg: ClientConfig): ClientConfig {
   const geminiKey = cfg.gemini_api_key?.trim();
   const exaKey = cfg.exa_api_key?.trim();
   const defaultModel = cfg.default_model?.trim();
+  const ytdlpCookiesFromBrowser = cfg.ytdlp_cookies_from_browser?.trim();
 
   if (baseUrl) out.base_url = baseUrl;
   if (geminiKey) out.gemini_api_key = geminiKey;
   if (exaKey) out.exa_api_key = exaKey;
   if (defaultModel) out.default_model = defaultModel;
+  if (ytdlpCookiesFromBrowser) out.ytdlp_cookies_from_browser = ytdlpCookiesFromBrowser;
 
   return out;
 }
@@ -60,6 +79,8 @@ function loadClientConfig(): ClientConfig {
       gemini_api_key: typeof obj.gemini_api_key === "string" ? obj.gemini_api_key : undefined,
       exa_api_key: typeof obj.exa_api_key === "string" ? obj.exa_api_key : undefined,
       default_model: typeof obj.default_model === "string" ? obj.default_model : undefined,
+      ytdlp_cookies_from_browser:
+        typeof obj.ytdlp_cookies_from_browser === "string" ? obj.ytdlp_cookies_from_browser : undefined,
     });
   } catch {
     return {};
@@ -310,6 +331,7 @@ export default function App() {
       gemini_api_key: cfg.gemini_api_key ?? "",
       exa_api_key: cfg.exa_api_key ?? "",
       default_model: cfg.default_model ?? "",
+      ytdlp_cookies_from_browser: cfg.ytdlp_cookies_from_browser ?? "",
     };
   });
   const [settingsSavedAt, setSettingsSavedAt] = React.useState<number | null>(null);
@@ -329,6 +351,9 @@ export default function App() {
   const [inputUrl, setInputUrl] = React.useState("");
   const [saveUrlBusy, setSaveUrlBusy] = React.useState(false);
   const [saveUrlError, setSaveUrlError] = React.useState<string | null>(null);
+  const [remoteBusyId, setRemoteBusyId] = React.useState<string | null>(null);
+  const [remoteError, setRemoteError] = React.useState<string | null>(null);
+  const [remoteInfoByUrl, setRemoteInfoByUrl] = React.useState<Record<string, RemoteMediaInfoSummary>>({});
 
   const [analysisModel, setAnalysisModel] = React.useState(() => clientConfig.default_model ?? "gemini-3-preview");
   const [analysisVideoArtifactId, setAnalysisVideoArtifactId] = React.useState<string>("");
@@ -465,6 +490,9 @@ export default function App() {
 
   React.useEffect(() => {
     if (view.kind !== "project") return;
+    setRemoteBusyId(null);
+    setRemoteError(null);
+    setRemoteInfoByUrl({});
     void refreshProject(view.projectId);
   }, [refreshProject, view]);
 
@@ -494,6 +522,7 @@ export default function App() {
       gemini_api_key: clientConfig.gemini_api_key ?? "",
       exa_api_key: clientConfig.exa_api_key ?? "",
       default_model: clientConfig.default_model ?? "",
+      ytdlp_cookies_from_browser: clientConfig.ytdlp_cookies_from_browser ?? "",
     });
     setSettingsSavedAt(null);
     setView({ kind: "settings" });
@@ -510,6 +539,7 @@ export default function App() {
       gemini_api_key: settingsDraft.gemini_api_key,
       exa_api_key: settingsDraft.exa_api_key,
       default_model: settingsDraft.default_model,
+      ytdlp_cookies_from_browser: settingsDraft.ytdlp_cookies_from_browser,
     });
     saveClientConfig(next);
     setClientConfig(next);
@@ -520,7 +550,7 @@ export default function App() {
   const onClearSettings = () => {
     saveClientConfig({});
     setClientConfig({});
-    setSettingsDraft({ base_url: "", gemini_api_key: "", exa_api_key: "", default_model: "" });
+    setSettingsDraft({ base_url: "", gemini_api_key: "", exa_api_key: "", default_model: "", ytdlp_cookies_from_browser: "" });
     setSettingsSavedAt(Date.now());
     setAnalysisModel(orchConfig?.default_model ?? "gemini-3-preview");
   };
@@ -536,6 +566,9 @@ export default function App() {
     setImportError(null);
     setInputUrl("");
     setSaveUrlError(null);
+    setRemoteBusyId(null);
+    setRemoteError(null);
+    setRemoteInfoByUrl({});
     setLastPlan(null);
     setLastPlanArtifact(null);
     setView({ kind: "list" });
@@ -618,6 +651,25 @@ export default function App() {
       setSaveUrlError(e instanceof Error ? e.message : String(e));
     } finally {
       setSaveUrlBusy(false);
+    }
+  };
+
+  const onResolveOrDownloadRemote = async (u: Artifact, download: boolean) => {
+    if (view.kind !== "project") return;
+    setRemoteError(null);
+    setRemoteBusyId(u.id);
+    try {
+      const resp = await postJson<ImportRemoteMediaResponse>(`/tool/projects/${view.projectId}/media/remote`, {
+        url: u.path,
+        download,
+        cookies_from_browser: clientConfig.ytdlp_cookies_from_browser,
+      });
+      setRemoteInfoByUrl((prev) => ({ ...prev, [u.path]: resp.info }));
+      await refreshProject(view.projectId);
+    } catch (e) {
+      setRemoteError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRemoteBusyId(null);
     }
   };
 
@@ -967,6 +1019,25 @@ export default function App() {
 
                     <div className="text-sm text-muted">{tr("settingsExaHint")}</div>
                   </div>
+
+                  <div className="panel">
+                    <div className="panel-header">
+                      <div className="panel-title">{tr("settingsDownloader")}</div>
+                    </div>
+
+                    <div className="input-group">
+                      <label className="input-label">{tr("settingsCookiesFromBrowser")}</label>
+                      <input
+                        className="input-field"
+                        type="text"
+                        data-testid="settings-ytdlp-cookies-from-browser"
+                        placeholder="chrome | edge | firefox"
+                        value={settingsDraft.ytdlp_cookies_from_browser}
+                        onChange={(e) => setSettingsDraft((p) => ({ ...p, ytdlp_cookies_from_browser: e.target.value }))}
+                      />
+                      <div className="text-xs text-dim mt-1">{tr("settingsCookiesFromBrowserHint")}</div>
+                    </div>
+                  </div>
                 </div>
 
                 <div className="flex items-center justify-between mt-6">
@@ -1058,7 +1129,49 @@ export default function App() {
                           <div className="text-xs text-dim mb-2">{tr("videosCount", { count: inputVideos.length })}</div>
                           {inputVideos.map(v => <div key={v.id} className="text-xs mono truncate text-muted mb-1" title={v.path}>• {v.path}</div>)}
                           <div className="text-xs text-dim mt-3 mb-2">{tr("urlsCount", { count: inputUrls.length })}</div>
-                          {inputUrls.map(u => <div key={u.id} className="text-xs mono truncate text-muted mb-1" title={u.path}>• {u.path}</div>)}
+                          {inputUrls.length === 0 ? (
+                            <div className="text-xs text-muted">—</div>
+                          ) : (
+                            <div className="flex flex-col gap-2">
+                              {inputUrls.map((u) => {
+                                const info = remoteInfoByUrl[u.path];
+                                const busy = remoteBusyId === u.id;
+                                return (
+                                  <div key={u.id} className="flex gap-2 items-center">
+                                    <div className="flex-1 min-w-0">
+                                      <div className="text-xs mono truncate text-muted" title={u.path}>
+                                        • {u.path}
+                                      </div>
+                                      {info && (
+                                        <div className="text-xs truncate text-dim" title={info.title}>
+                                          {info.title} <span className="mono">({info.extractor})</span>
+                                        </div>
+                                      )}
+                                    </div>
+                                    <div className="flex gap-1 shrink-0">
+                                      <button
+                                        className="btn btn-secondary btn-sm"
+                                        type="button"
+                                        onClick={() => void onResolveOrDownloadRemote(u, false)}
+                                        disabled={busy}
+                                      >
+                                        {busy ? "…" : tr("resolve")}
+                                      </button>
+                                      <button
+                                        className="btn btn-secondary btn-sm"
+                                        type="button"
+                                        onClick={() => void onResolveOrDownloadRemote(u, true)}
+                                        disabled={busy}
+                                      >
+                                        {busy ? "…" : tr("downloadNow")}
+                                      </button>
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )}
+                          {remoteError && <div className="text-error text-xs mt-2">{remoteError}</div>}
                         </div>
                       </div>
 

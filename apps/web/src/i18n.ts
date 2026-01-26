@@ -53,6 +53,10 @@ const en = {
   settingsExa: "Exa",
   settingsExaKey: "Exa API Key",
   settingsExaHint: "Used for search and fetch tools.",
+  settingsDownloader: "Downloader",
+  settingsCookiesFromBrowser: "Cookies from browser",
+  settingsCookiesFromBrowserHint:
+    "Optional. If you are logged in in your browser, set e.g. 'chrome' or 'edge' to let yt-dlp reuse it. (This does not store cookies here.)",
   settingsKeyPlaceholder: "Paste your API key",
   settingsEmptyUsesEnv: "Leave blank to use .env",
   clear: "Clear",
@@ -73,6 +77,8 @@ const en = {
   import: "Import",
   videoUrl: "Video URL",
   save: "Save",
+  resolve: "Resolve",
+  downloadNow: "Download",
   videosCount: "Videos ({count})",
   urlsCount: "URLs ({count})",
 
@@ -176,6 +182,10 @@ const zhCN: typeof en = {
   settingsExa: "Exa",
   settingsExaKey: "Exa API Key",
   settingsExaHint: "用于联网搜索与抓取。",
+  settingsDownloader: "下载/解析",
+  settingsCookiesFromBrowser: "从浏览器读取登录态",
+  settingsCookiesFromBrowserHint:
+    "可选：先在浏览器完成登录，再填 chrome/edge/firefox 让 yt-dlp 复用登录态（这里只保存浏览器名，不保存 cookie）。",
   settingsKeyPlaceholder: "粘贴你的 API Key",
   settingsEmptyUsesEnv: "留空则使用 .env",
   clear: "清除",
@@ -196,6 +206,8 @@ const zhCN: typeof en = {
   import: "导入",
   videoUrl: "视频链接",
   save: "保存",
+  resolve: "解析",
+  downloadNow: "下载",
   videosCount: "视频（{count}）",
   urlsCount: "链接（{count}）",
 
