@@ -80,6 +80,16 @@ async fn main() -> anyhow::Result<()> {
         .route("/projects/{id}/settings", get(get_project_settings).post(update_project_settings))
         .route("/projects/{id}/artifacts", get(list_artifacts))
         .route("/projects/{id}/artifacts/text", post(create_text_artifact))
+        .route("/projects/{id}/artifacts/upload", post(upload_file_artifact))
+        .route(
+            "/projects/{id}/artifacts/{artifact_id}/raw",
+            get(download_artifact_raw),
+        )
+        .route("/projects/{id}/chats", post(create_chat).get(list_chats))
+        .route(
+            "/projects/{id}/chats/{chat_id}/messages",
+            get(list_chat_messages).post(create_chat_message),
+        )
         .route("/projects/{id}/pool/items", get(list_pool_items).post(add_pool_item))
         .route("/projects/{id}/pool/items/{item_id}/selected", post(set_pool_item_selected))
         .route("/projects/{id}/inputs/url", post(add_input_url))
@@ -492,6 +502,29 @@ CREATE TABLE IF NOT EXISTS events (
   FOREIGN KEY(project_id) REFERENCES projects(id)
 );
 CREATE INDEX IF NOT EXISTS idx_events_project_id ON events(project_id);
+
+CREATE TABLE IF NOT EXISTS chats (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  FOREIGN KEY(project_id) REFERENCES projects(id)
+);
+CREATE INDEX IF NOT EXISTS idx_chats_project_id ON chats(project_id);
+
+CREATE TABLE IF NOT EXISTS chat_messages (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  chat_id TEXT NOT NULL,
+  role TEXT NOT NULL,
+  content TEXT NOT NULL,
+  data_json TEXT,
+  created_at_ms INTEGER NOT NULL,
+  FOREIGN KEY(project_id) REFERENCES projects(id),
+  FOREIGN KEY(chat_id) REFERENCES chats(id)
+);
+CREATE INDEX IF NOT EXISTS idx_chat_messages_chat_id ON chat_messages(chat_id);
+CREATE INDEX IF NOT EXISTS idx_chat_messages_project_id ON chat_messages(project_id);
         "#,
     )
     .context("failed to init sqlite schema")?;
@@ -878,6 +911,252 @@ async fn update_project_settings(
     match settings {
         Some(s) => Ok(Json(s)),
         None => Err(AppError::NotFound("project not found".to_string())),
+    }
+}
+
+#[derive(Serialize)]
+struct ChatThreadResponse {
+    id: String,
+    project_id: String,
+    title: String,
+    created_at_ms: i64,
+}
+
+#[derive(Deserialize)]
+struct CreateChatRequest {
+    title: Option<String>,
+}
+
+async fn list_chats(State(state): State<AppState>, Path(project_id): Path<String>) -> AppResult<Json<Vec<ChatThreadResponse>>> {
+    if project_id.trim().is_empty() {
+        return Err(AppError::BadRequest("missing project id".to_string()));
+    }
+
+    let db_path = state.db_path.clone();
+    let chats = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Vec<ChatThreadResponse>>> {
+        let conn = Connection::open(&db_path)?;
+
+        let exists: bool = conn
+            .query_row("SELECT 1 FROM projects WHERE id = ?1", [&project_id], |_row| Ok(()))
+            .optional()?
+            .is_some();
+        if !exists {
+            return Ok(None);
+        }
+
+        let mut stmt = conn.prepare(
+            "SELECT id, project_id, title, created_at_ms FROM chats WHERE project_id = ?1 ORDER BY created_at_ms DESC LIMIT 100",
+        )?;
+        let rows = stmt.query_map([&project_id], |row| {
+            Ok(ChatThreadResponse {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                title: row.get(2)?,
+                created_at_ms: row.get(3)?,
+            })
+        })?;
+        Ok(Some(rows.filter_map(Result::ok).collect()))
+    })
+    .await
+    .context("list_chats task failed")??;
+
+    match chats {
+        Some(v) => Ok(Json(v)),
+        None => Err(AppError::NotFound("project not found".to_string())),
+    }
+}
+
+async fn create_chat(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    Json(req): Json<CreateChatRequest>,
+) -> AppResult<Json<ChatThreadResponse>> {
+    if project_id.trim().is_empty() {
+        return Err(AppError::BadRequest("missing project id".to_string()));
+    }
+
+    let title = req.title.unwrap_or_default();
+    let title = title.trim().to_string();
+
+    let db_path = state.db_path.clone();
+    let chat = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<ChatThreadResponse>> {
+        let conn = Connection::open(&db_path)?;
+
+        let exists: bool = conn
+            .query_row("SELECT 1 FROM projects WHERE id = ?1", [&project_id], |_row| Ok(()))
+            .optional()?
+            .is_some();
+        if !exists {
+            return Ok(None);
+        }
+
+        let id = Uuid::new_v4().to_string();
+        let created_at_ms = now_ms();
+        let title = if title.is_empty() {
+            format!("Chat {created_at_ms}")
+        } else {
+            title
+        };
+
+        conn.execute(
+            "INSERT INTO chats (id, project_id, title, created_at_ms) VALUES (?1, ?2, ?3, ?4)",
+            params![&id, &project_id, &title, created_at_ms],
+        )?;
+        conn.execute(
+            "INSERT INTO events (project_id, ts_ms, level, message, data_json) VALUES (?1, ?2, 'info', 'chat_created', ?3)",
+            params![&project_id, created_at_ms, serde_json::json!({ "chat_id": &id, "title": &title }).to_string()],
+        )?;
+
+        Ok(Some(ChatThreadResponse {
+            id,
+            project_id,
+            title,
+            created_at_ms,
+        }))
+    })
+    .await
+    .context("create_chat task failed")??;
+
+    match chat {
+        Some(c) => Ok(Json(c)),
+        None => Err(AppError::NotFound("project not found".to_string())),
+    }
+}
+
+#[derive(Serialize)]
+struct ChatMessageResponse {
+    id: String,
+    project_id: String,
+    chat_id: String,
+    role: String,
+    content: String,
+    data: Option<serde_json::Value>,
+    created_at_ms: i64,
+}
+
+#[derive(Deserialize)]
+struct CreateChatMessageRequest {
+    role: String,
+    content: String,
+    data: Option<serde_json::Value>,
+}
+
+fn is_valid_chat_role(role: &str) -> bool {
+    matches!(role, "user" | "assistant" | "system" | "tool")
+}
+
+async fn list_chat_messages(
+    State(state): State<AppState>,
+    Path((project_id, chat_id)): Path<(String, String)>,
+) -> AppResult<Json<Vec<ChatMessageResponse>>> {
+    if project_id.trim().is_empty() {
+        return Err(AppError::BadRequest("missing project id".to_string()));
+    }
+    if chat_id.trim().is_empty() {
+        return Err(AppError::BadRequest("missing chat id".to_string()));
+    }
+
+    let db_path = state.db_path.clone();
+    let messages = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Vec<ChatMessageResponse>>> {
+        let conn = Connection::open(&db_path)?;
+
+        let exists: bool = conn
+            .query_row("SELECT 1 FROM chats WHERE id = ?1 AND project_id = ?2", params![&chat_id, &project_id], |_row| Ok(()))
+            .optional()?
+            .is_some();
+        if !exists {
+            return Ok(None);
+        }
+
+        let mut stmt = conn.prepare(
+            "SELECT id, project_id, chat_id, role, content, data_json, created_at_ms\n             FROM chat_messages WHERE project_id = ?1 AND chat_id = ?2 ORDER BY created_at_ms ASC LIMIT 500",
+        )?;
+        let rows = stmt.query_map(params![&project_id, &chat_id], |row| {
+            let data_json: Option<String> = row.get(5)?;
+            let data: Option<serde_json::Value> = data_json.and_then(|s| serde_json::from_str(&s).ok());
+            Ok(ChatMessageResponse {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                chat_id: row.get(2)?,
+                role: row.get(3)?,
+                content: row.get(4)?,
+                data,
+                created_at_ms: row.get(6)?,
+            })
+        })?;
+        Ok(Some(rows.filter_map(Result::ok).collect()))
+    })
+    .await
+    .context("list_chat_messages task failed")??;
+
+    match messages {
+        Some(v) => Ok(Json(v)),
+        None => Err(AppError::NotFound("chat not found".to_string())),
+    }
+}
+
+async fn create_chat_message(
+    State(state): State<AppState>,
+    Path((project_id, chat_id)): Path<(String, String)>,
+    Json(req): Json<CreateChatMessageRequest>,
+) -> AppResult<Json<ChatMessageResponse>> {
+    if project_id.trim().is_empty() {
+        return Err(AppError::BadRequest("missing project id".to_string()));
+    }
+    if chat_id.trim().is_empty() {
+        return Err(AppError::BadRequest("missing chat id".to_string()));
+    }
+
+    let role = req.role.trim().to_string();
+    if role.is_empty() || !is_valid_chat_role(&role) {
+        return Err(AppError::BadRequest("invalid role".to_string()));
+    }
+
+    let content = req.content.trim_end().to_string();
+    let data_json = req.data.as_ref().map(|v| v.to_string());
+    if content.trim().is_empty() && data_json.is_none() {
+        return Err(AppError::BadRequest("missing content".to_string()));
+    }
+    let db_path = state.db_path.clone();
+
+    let msg = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<ChatMessageResponse>> {
+        let conn = Connection::open(&db_path)?;
+
+        let exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM chats WHERE id = ?1 AND project_id = ?2",
+                params![&chat_id, &project_id],
+                |_row| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !exists {
+            return Ok(None);
+        }
+
+        let id = Uuid::new_v4().to_string();
+        let created_at_ms = now_ms();
+        conn.execute(
+            "INSERT INTO chat_messages (id, project_id, chat_id, role, content, data_json, created_at_ms)\n             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![&id, &project_id, &chat_id, &role, &content, data_json.as_deref(), created_at_ms],
+        )?;
+
+        Ok(Some(ChatMessageResponse {
+            id,
+            project_id,
+            chat_id,
+            role,
+            content,
+            data: data_json.and_then(|s| serde_json::from_str(&s).ok()),
+            created_at_ms,
+        }))
+    })
+    .await
+    .context("create_chat_message task failed")??;
+
+    match msg {
+        Some(m) => Ok(Json(m)),
+        None => Err(AppError::NotFound("chat not found".to_string())),
     }
 }
 
@@ -1283,6 +1562,184 @@ async fn create_text_artifact(
     }
 }
 
+#[derive(Serialize)]
+struct UploadFileArtifactResponse {
+    artifact: ArtifactResponse,
+    bytes: u64,
+    file_name: String,
+    mime: Option<String>,
+}
+
+async fn upload_file_artifact(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    mut multipart: Multipart,
+) -> AppResult<Json<UploadFileArtifactResponse>> {
+    if project_id.trim().is_empty() {
+        return Err(AppError::BadRequest("missing project id".to_string()));
+    }
+
+    // Ensure project exists before writing files.
+    let db_path = state.db_path.clone();
+    let project_id_check = project_id.clone();
+    let exists = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+        let conn = Connection::open(&db_path)?;
+        Ok(conn
+            .query_row("SELECT 1 FROM projects WHERE id = ?1", [&project_id_check], |_row| Ok(()))
+            .optional()?
+            .is_some())
+    })
+    .await
+    .context("upload_file_artifact db preflight failed")??;
+    if !exists {
+        return Err(AppError::NotFound("project not found".to_string()));
+    }
+
+    while let Some(field) = multipart.next_field().await.map_err(|e| AppError::BadRequest(e.to_string()))? {
+        let name = field.name().unwrap_or_default().to_string();
+        if name != "file" {
+            continue;
+        }
+
+        let file_name_raw = field.file_name().unwrap_or("upload").to_string();
+        let file_name_safe = sanitize_file_name(&file_name_raw);
+        let file_name = if file_name_safe.trim_matches('_').is_empty() {
+            "upload".to_string()
+        } else {
+            file_name_safe
+        };
+
+        let mime = field.content_type().map(|m| m.to_string());
+        let mime_for_event = mime.clone();
+        let created_at_ms = now_ms();
+
+        let rel_path = format!("projects/{}/uploads/{}-{}", project_id, created_at_ms, file_name);
+        let abs_path = state.data_dir.join(&rel_path);
+        if let Some(parent) = abs_path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("failed to create upload dir {}", parent.display()))?;
+        }
+
+        let mut f = tokio::fs::File::create(&abs_path)
+            .await
+            .with_context(|| format!("failed to create {}", abs_path.display()))?;
+
+        let mut bytes: u64 = 0;
+        let mut field = field;
+        while let Some(chunk) = field
+            .chunk()
+            .await
+            .map_err(|e| AppError::BadRequest(e.to_string()))?
+        {
+            bytes = bytes.saturating_add(chunk.len() as u64);
+            f.write_all(&chunk)
+                .await
+                .with_context(|| format!("failed to write {}", abs_path.display()))?;
+        }
+        f.flush().await.ok();
+
+        let db_path = state.db_path.clone();
+        let rel_path_db = rel_path.clone();
+        let artifact = tokio::task::spawn_blocking(move || -> anyhow::Result<ArtifactResponse> {
+            let conn = Connection::open(&db_path)?;
+
+            let artifact = ensure_artifact(&conn, &project_id, "upload", &rel_path_db, created_at_ms)?;
+            conn.execute(
+                "INSERT INTO events (project_id, ts_ms, level, message, data_json) VALUES (?1, ?2, 'info', 'upload', ?3)",
+                params![
+                    &project_id,
+                    created_at_ms,
+                    serde_json::json!({ "path": &rel_path_db, "bytes": bytes, "mime": mime_for_event }).to_string()
+                ],
+            )?;
+            Ok(artifact)
+        })
+        .await
+        .context("upload_file_artifact db task failed")??;
+
+        return Ok(Json(UploadFileArtifactResponse {
+            artifact,
+            bytes,
+            file_name,
+            mime,
+        }));
+    }
+
+    Err(AppError::BadRequest("missing multipart field 'file'".to_string()))
+}
+
+fn content_type_for_path(path: &FsPath) -> &'static str {
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "json" => "application/json",
+        "txt" | "log" | "md" => "text/plain; charset=utf-8",
+        "html" => "text/html; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
+async fn download_artifact_raw(
+    State(state): State<AppState>,
+    Path((project_id, artifact_id)): Path<(String, String)>,
+) -> AppResult<Response> {
+    if project_id.trim().is_empty() {
+        return Err(AppError::BadRequest("missing project id".to_string()));
+    }
+    if artifact_id.trim().is_empty() {
+        return Err(AppError::BadRequest("missing artifact id".to_string()));
+    }
+
+    let db_path = state.db_path.clone();
+    let rel_path = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<String>> {
+        let conn = Connection::open(&db_path)?;
+        let path: Option<String> = conn
+            .query_row(
+                "SELECT path FROM artifacts WHERE id = ?1 AND project_id = ?2 LIMIT 1",
+                params![&artifact_id, &project_id],
+                |row| Ok(row.get(0)?),
+            )
+            .optional()?;
+        Ok(path)
+    })
+    .await
+    .context("download_artifact_raw db task failed")??;
+
+    let Some(rel_path) = rel_path else {
+        return Err(AppError::NotFound("artifact not found".to_string()));
+    };
+    if rel_path.starts_with("http://") || rel_path.starts_with("https://") {
+        return Err(AppError::BadRequest("artifact is not a file".to_string()));
+    }
+
+    let abs = state.data_dir.join(&rel_path);
+    if !abs.exists() {
+        return Err(AppError::NotFound("file not found".to_string()));
+    }
+
+    let file = tokio::fs::File::open(&abs)
+        .await
+        .with_context(|| format!("failed to open {}", abs.display()))?;
+    let stream = ReaderStream::new(file);
+    let body = Body::from_stream(stream);
+
+    let mut res = Response::new(body);
+    res.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(content_type_for_path(&abs)).unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+    );
+    Ok(res)
+}
+
 #[derive(Deserialize)]
 struct AddInputUrlRequest {
     url: String,
@@ -1484,6 +1941,8 @@ struct RemoteMediaInfoSummary {
     title: String,
     duration_s: Option<f64>,
     webpage_url: String,
+    thumbnail: Option<String>,
+    description: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1513,6 +1972,20 @@ fn json_f64(v: &serde_json::Value, key: &str) -> Option<f64> {
         return Some(n);
     }
     x.as_str().and_then(|s| s.parse::<f64>().ok())
+}
+
+fn clean_one_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ").trim().to_string()
+}
+
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    let trimmed = s.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    let mut out: String = trimmed.chars().take(max_chars).collect();
+    out.push('…');
+    out
 }
 
 fn pick_downloaded_file(out_dir: &FsPath, file_base: &str) -> anyhow::Result<Option<PathBuf>> {
@@ -1647,6 +2120,12 @@ async fn import_remote_media(
         let title = json_string(&info_json, "title").unwrap_or_else(|| "untitled".to_string());
         let webpage_url = json_string(&info_json, "webpage_url").unwrap_or_else(|| url.clone());
         let duration_s = json_f64(&info_json, "duration");
+        let thumbnail = json_string(&info_json, "thumbnail")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let description = json_string(&info_json, "description")
+            .map(|s| truncate_chars(&clean_one_line(&s), 280))
+            .filter(|s| !s.is_empty());
 
         let mut input_video: Option<ArtifactResponse> = None;
 
@@ -1719,6 +2198,8 @@ async fn import_remote_media(
                 title,
                 duration_s,
                 webpage_url,
+                thumbnail,
+                description,
             },
             info_artifact,
             input_video,

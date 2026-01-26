@@ -56,7 +56,17 @@ function getProcessInfo(pid) {
       "-Command",
       `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").Name`,
     ]).trim();
-    return { name, cmdline };
+    if (cmdline || name) return { name, cmdline };
+
+    // Fallback: tasklist usually works even when CIM is restricted.
+    // Example: "node.exe","1234","Console","1","123,456 K"
+    const csv = run("tasklist", ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"]).trim();
+    const m = csv.match(/^"([^"]+)"\s*,\s*"(\d+)"/);
+    if (m?.[1]) {
+      return { name: m[1], cmdline: "" };
+    }
+
+    return { name: "", cmdline: "" };
   }
 
   const name = run("ps", ["-p", String(pid), "-o", "comm="]).trim();
@@ -112,8 +122,15 @@ async function ensurePortFree({ port, envKey, kind, label }) {
   if (before.length === 0) return;
 
   for (const pid of before) {
+    // netstat output can be briefly stale; re-check before failing hard.
+    if (!findListeningPids(port).includes(pid)) continue;
+
     const info = getProcessInfo(pid);
     if (!isSafeToKill(info, kind)) {
+      // If we couldn't read process info, it may have exited already.
+      await sleep(200);
+      if (!findListeningPids(port).includes(pid)) continue;
+
       const msg = `[predev] ${label} port ${port} is already in use by PID ${pid} (${info.name || "unknown"}). Stop it or set ${envKey} in .env.`;
       console.error(msg);
       process.exitCode = 1;

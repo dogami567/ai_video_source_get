@@ -16,12 +16,36 @@ app.use(express.json({ limit: "2mb" }));
 
 type ToolserverArtifact = { id: string; project_id: string; kind: string; path: string; created_at_ms: number };
 type ToolserverSettings = { project_id: string; think_enabled: boolean; updated_at_ms: number };
+type ToolserverConsent = { project_id: string; consented: boolean; auto_confirm: boolean; updated_at_ms: number };
 type ToolserverFfmpegPipeline = {
   input_video_artifact_id: string;
   fingerprint: string;
   clips: ToolserverArtifact[];
 };
 type ToolserverProfile = { profile?: { prompt?: string } };
+type ToolserverChatMessage = {
+  id: string;
+  project_id: string;
+  chat_id: string;
+  role: string;
+  content: string;
+  data?: unknown | null;
+  created_at_ms: number;
+};
+type ToolserverRemoteMediaInfoSummary = {
+  extractor: string;
+  id: string;
+  title: string;
+  duration_s: number | null;
+  webpage_url: string;
+  thumbnail?: string | null;
+  description?: string | null;
+};
+type ToolserverImportRemoteMediaResponse = {
+  info: ToolserverRemoteMediaInfoSummary;
+  info_artifact: ToolserverArtifact;
+  input_video?: ToolserverArtifact | null;
+};
 
 const repoRoot = path.resolve(process.cwd(), "../..");
 const dataDir = path.resolve(repoRoot, process.env.DATA_DIR || "data");
@@ -146,6 +170,319 @@ app.get("/api/config", (_req, res) => {
 function str(v: unknown): string {
   return String(v ?? "").trim();
 }
+
+function uniqStrings(xs: string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const x of xs) {
+    const v = String(x || "").trim();
+    if (!v) continue;
+    if (seen.has(v)) continue;
+    seen.add(v);
+    out.push(v);
+  }
+  return out;
+}
+
+function escapeDataUrlSvg(svg: string): string {
+  return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
+}
+
+async function createChatMessage(
+  projectId: string,
+  chatId: string,
+  role: "user" | "assistant" | "system" | "tool",
+  content: string,
+  data?: unknown,
+): Promise<ToolserverChatMessage> {
+  return toolserverJson<ToolserverChatMessage>(`/projects/${projectId}/chats/${chatId}/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ role, content, data: data ?? null }),
+  });
+}
+
+async function getChatMessages(projectId: string, chatId: string): Promise<ToolserverChatMessage[]> {
+  return toolserverJson<ToolserverChatMessage[]>(`/projects/${projectId}/chats/${chatId}/messages`);
+}
+
+async function getConsent(projectId: string): Promise<ToolserverConsent | null> {
+  try {
+    return await toolserverJson<ToolserverConsent>(`/projects/${projectId}/consent`);
+  } catch {
+    return null;
+  }
+}
+
+async function resolveRemoteInfo(
+  projectId: string,
+  url: string,
+  cookiesFromBrowser?: string,
+): Promise<ToolserverImportRemoteMediaResponse> {
+  return toolserverJson<ToolserverImportRemoteMediaResponse>(`/projects/${projectId}/media/remote`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      url,
+      download: false,
+      cookies_from_browser: cookiesFromBrowser || undefined,
+    }),
+  });
+}
+
+type ChatVideoCard = {
+  url: string;
+  title: string;
+  description?: string | null;
+  thumbnail?: string | null;
+  duration_s?: number | null;
+  extractor?: string;
+  id?: string;
+};
+
+type ChatAgentPlan = {
+  reply: string;
+  prompt_draft: string | null;
+  should_search: boolean;
+  search_queries: string[];
+};
+
+app.post("/api/projects/:projectId/chat/turn", async (req, res) => {
+  try {
+    const projectId = String(req.params.projectId || "").trim();
+    if (!projectId) return res.status(400).json({ ok: false, error: "missing project id" });
+
+    const chatId = str(req.body?.chat_id);
+    if (!chatId) return res.status(400).json({ ok: false, error: "missing chat_id" });
+
+    const userText = String(req.body?.message || "").trimEnd();
+    if (!userText.trim()) return res.status(400).json({ ok: false, error: "missing message" });
+
+    const attachmentsRaw = Array.isArray(req.body?.attachments) ? req.body.attachments : [];
+    const attachments = attachmentsRaw
+      .map((a: any) => ({
+        artifact_id: typeof a?.artifact_id === "string" ? a.artifact_id : "",
+        file_name: typeof a?.file_name === "string" ? a.file_name : "",
+        mime: typeof a?.mime === "string" ? a.mime : "",
+        bytes: typeof a?.bytes === "number" ? a.bytes : null,
+      }))
+      .filter((a: any) => !!a.artifact_id);
+
+    const thinkEnabled = await getThinkEnabled(projectId);
+
+    const geminiApiKey = str(req.body?.gemini_api_key) || str(req.body?.api_key) || str(process.env.GEMINI_API_KEY);
+    const exaApiKey = str(req.body?.exa_api_key) || str(req.body?.api_key) || str(process.env.EXA_API_KEY);
+    const baseUrl = str(req.body?.base_url) || str(process.env.BASE_URL) || "https://generativelanguage.googleapis.com";
+    const model =
+      str(req.body?.model) ||
+      str(req.body?.default_model) ||
+      str(process.env.DEFAULT_MODEL) ||
+      "gemini-3-preview";
+    const cookiesFromBrowser =
+      str(req.body?.ytdlp_cookies_from_browser) || str(process.env.YTDLP_COOKIES_FROM_BROWSER) || "";
+
+    const userMessage = await createChatMessage(
+      projectId,
+      chatId,
+      "user",
+      userText,
+      attachments.length > 0 ? { attachments } : undefined,
+    );
+
+    const mock = str(process.env.E2E_MOCK_CHAT || process.env.MOCK_CHAT) === "1";
+    if (mock) {
+      const thumb = escapeDataUrlSvg(
+        `<svg xmlns="http://www.w3.org/2000/svg" width="320" height="180"><rect width="100%" height="100%" fill="#F2F2F7"/><text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" font-family="Arial" font-size="20" fill="#1D1D1F">Video</text></svg>`,
+      );
+      const videos: ChatVideoCard[] = [
+        {
+          url: "https://www.bilibili.com/video/BV1xx411c7mD",
+          title: "Mock: 猫咪搞笑素材合集",
+          description: "（E2E mock）用于验证卡片渲染与按钮交互。",
+          thumbnail: thumb,
+          duration_s: 123,
+          extractor: "bilibili",
+          id: "BV1xx411c7mD",
+        },
+        {
+          url: "https://www.bilibili.com/video/BV1yy411c7mE",
+          title: "Mock: 热门剪辑灵感参考",
+          description: "（E2E mock）第二条卡片。",
+          thumbnail: thumb,
+          duration_s: 98,
+          extractor: "bilibili",
+          id: "BV1yy411c7mE",
+        },
+      ];
+
+      const assistantMessage = await createChatMessage(projectId, chatId, "assistant", "我先给你两条示例卡片（mock 模式）。", {
+        blocks: [{ type: "videos", videos }],
+      });
+      return res.json({ ok: true, user_message: userMessage, assistant_message: assistantMessage, mock: true });
+    }
+
+    if (!geminiApiKey) {
+      const assistantMessage = await createChatMessage(
+        projectId,
+        chatId,
+        "assistant",
+        "GEMINI_API_KEY is not set. Open Settings and set Gemini API Key first, then try again.",
+      );
+      return res.json({ ok: true, user_message: userMessage, assistant_message: assistantMessage });
+    }
+
+    const history = await getChatMessages(projectId, chatId);
+    const recent = history.slice(Math.max(0, history.length - 12));
+
+    const systemPrompt = [
+      "You are VidUnpack Chat (视频拆解箱对话助手).",
+      "Goal: chat with the user to clarify their intent, then search for candidate source videos (prefer bilibili) and present them as cards.",
+      "Rules:",
+      "- Ask 1-3 clarifying questions if needed.",
+      "- When ready, output JSON ONLY (no markdown).",
+      "- JSON schema:",
+      `  { "reply": string, "prompt_draft"?: string, "should_search"?: boolean, "search_queries"?: string[] }`,
+      "- Use Chinese in reply when user is Chinese.",
+      "- search_queries should be short and actionable; include platform hints if relevant.",
+    ].join("\n");
+
+    const contents = [
+      { role: "user", parts: [{ text: systemPrompt }] },
+      ...recent.map((m) => ({
+        role: m.role === "assistant" ? "model" : "user",
+        parts: [{ text: `${m.role}: ${m.content}` }],
+      })),
+    ];
+
+    const plan = thinkEnabled
+      ? {
+          action: "chat_turn",
+          steps: [{ action: "gemini.generateContent", model }, { action: "maybe_search_and_resolve" }],
+        }
+      : null;
+    const planArtifact = plan ? await maybeStorePlan(projectId, "chat-turn", plan) : null;
+
+    const url = new URL(`/v1beta/models/${encodeURIComponent(model)}:generateContent`, baseUrl);
+    url.searchParams.set("key", geminiApiKey);
+
+    const geminiPayload = await fetchJson<any>(url.toString(), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        contents,
+        generationConfig: { temperature: 0.4, maxOutputTokens: 1024 },
+      }),
+    });
+
+    const text = extractGeminiText(geminiPayload);
+    const parsed = tryParseJson(text);
+
+    const parsedObj = (parsed && typeof parsed === "object" ? (parsed as any) : null) as any;
+    const agentPlan: ChatAgentPlan = {
+      reply: typeof parsedObj?.reply === "string" ? parsedObj.reply : String(text || "").trim(),
+      prompt_draft: typeof parsedObj?.prompt_draft === "string" ? parsedObj.prompt_draft : null,
+      should_search: !!parsedObj?.should_search,
+      search_queries: Array.isArray(parsedObj?.search_queries) ? parsedObj.search_queries.map((s: any) => String(s)) : [],
+    };
+
+    const blocks: any[] = [];
+    if (agentPlan.prompt_draft && agentPlan.prompt_draft.trim()) {
+      blocks.push({ type: "prompt", title: "Prompt", text: agentPlan.prompt_draft.trim() });
+    }
+
+    let videos: ChatVideoCard[] = [];
+    let needsConsent = false;
+
+    const shouldSearch = agentPlan.should_search && agentPlan.search_queries && agentPlan.search_queries.length > 0;
+    if (shouldSearch) {
+      const consent = await getConsent(projectId);
+      if (!consent?.consented) {
+        agentPlan.reply = `${agentPlan.reply}\n\n要开始联网搜索/解析链接前，请先在本项目完成一次「授权确认」（外部内容提示）。`;
+        needsConsent = true;
+      } else if (!exaApiKey) {
+        agentPlan.reply = `${agentPlan.reply}\n\nEXA_API_KEY 未设置：暂时没法联网搜索。你可以先在设置里填 Exa API Key，或直接把候选链接贴给我。`;
+      } else {
+        const exa = new Exa(exaApiKey);
+        const q0 = str(agentPlan.search_queries[0]);
+        const query = q0.includes("bilibili.com") ? q0 : `${q0} site:bilibili.com`;
+        const raw = await withTimeout(exa.search(query, { numResults: 6 }), 20_000);
+        const results = Array.isArray((raw as any)?.results) ? ((raw as any).results as any[]) : [];
+        const urls = uniqStrings(
+          results
+            .map((r) => (typeof r?.url === "string" ? r.url : ""))
+            .filter((u) => u.startsWith("http")),
+        ).slice(0, 6);
+
+        for (const u of urls) {
+          try {
+            const r = await resolveRemoteInfo(projectId, u, cookiesFromBrowser);
+            videos.push({
+              url: r.info.webpage_url || u,
+              title: r.info.title || u,
+              description: r.info.description || null,
+              thumbnail: r.info.thumbnail || null,
+              duration_s: r.info.duration_s ?? null,
+              extractor: r.info.extractor,
+              id: r.info.id,
+            });
+          } catch {
+            // ignore
+          }
+        }
+
+        if (videos.length > 0) {
+          blocks.push({ type: "videos", videos });
+        } else {
+          agentPlan.reply = `${agentPlan.reply}\n\n我搜到了候选链接，但解析标题/封面失败（可能需要登录态或链接不可用）。你也可以直接把 BV 号/链接贴出来，我再帮你解析。`;
+        }
+      }
+    }
+
+    const debugArtifact = await toolserverJson<ToolserverArtifact>(`/projects/${projectId}/artifacts/text`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        kind: "chat_turn",
+        out_path: `chat/turn-${Date.now()}.json`,
+        content: JSON.stringify(
+          {
+            model,
+            user_message_id: userMessage.id,
+            assistant_reply: agentPlan.reply,
+            prompt_draft: agentPlan.prompt_draft,
+            should_search: shouldSearch,
+            search_queries: agentPlan.search_queries,
+            videos,
+            gemini: { text, parsed, payload: geminiPayload },
+          },
+          null,
+          2,
+        ),
+      }),
+    });
+
+    const assistantMessage = await createChatMessage(projectId, chatId, "assistant", agentPlan.reply || "OK", {
+      blocks,
+      debug_artifact: debugArtifact,
+    });
+
+    return res.json({
+      ok: true,
+      needs_consent: needsConsent,
+      plan,
+      plan_artifact: planArtifact,
+      user_message: userMessage,
+      assistant_message: assistantMessage,
+    });
+  } catch (e) {
+    if (e instanceof HttpError) {
+      const status = e.status >= 400 && e.status < 600 ? e.status : 500;
+      return res.status(status).json({ ok: false, error: e.message });
+    }
+    const message = e instanceof Error ? e.message : String(e);
+    return res.status(500).json({ ok: false, error: message });
+  }
+});
 
 app.post("/api/projects/:projectId/gemini/analyze", async (req, res) => {
   try {
