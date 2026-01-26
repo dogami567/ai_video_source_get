@@ -57,10 +57,11 @@ const en = {
 
   settings: "Settings",
   globalSettingsTitle: "Global Settings",
-  globalSettingsHint: "Saved locally in this browser. Leave fields empty to fall back to .env.",
+  globalSettingsHint:
+    "Saved locally in this browser. Leave fields empty to fall back to .env. Tip: for OpenAI-compatible relays, set Base URL to your relay (with or without /v1) and put the relay key in API Key.",
   settingsGemini: "Gemini",
   settingsBaseUrl: "Base URL",
-  settingsGeminiKey: "Gemini API Key",
+  settingsGeminiKey: "API Key",
   settingsDefaultModel: "Default Model",
   settingsExa: "Exa",
   settingsExaKey: "Exa API Key",
@@ -199,10 +200,11 @@ const zhCN: typeof en = {
 
   settings: "设置",
   globalSettingsTitle: "全局设置",
-  globalSettingsHint: "保存到本浏览器本地。留空则回退到 .env。",
+  globalSettingsHint:
+    "保存到本浏览器本地。留空则回退到 .env。提示：如果你用「中转/OpenAI 兼容」，Base URL 填中转地址（可带 /v1），API Key 填中转 key。",
   settingsGemini: "Gemini",
   settingsBaseUrl: "Base URL",
-  settingsGeminiKey: "Gemini API Key",
+  settingsGeminiKey: "API Key（Gemini/中转）",
   settingsDefaultModel: "默认模型",
   settingsExa: "Exa",
   settingsExaKey: "Exa API Key",

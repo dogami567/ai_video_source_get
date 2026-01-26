@@ -188,6 +188,91 @@ function escapeDataUrlSvg(svg: string): string {
   return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
 }
 
+type OpenAIChatMessage =
+  | { role: "system" | "user" | "assistant" | "tool"; content: string }
+  | { role: "system" | "user" | "assistant" | "tool"; content: Array<Record<string, any>> };
+
+function joinUrl(base: string, pathName: string): string {
+  const b = String(base || "").trim();
+  const p = String(pathName || "");
+  if (!b) return p;
+  if (!p) return b;
+  const bEnds = b.endsWith("/");
+  const pStarts = p.startsWith("/");
+  if (bEnds && pStarts) return b + p.slice(1);
+  if (!bEnds && !pStarts) return `${b}/${p}`;
+  return b + p;
+}
+
+function isGeminiNativeBaseUrl(baseUrl: string): boolean {
+  const b = String(baseUrl || "").trim().toLowerCase();
+  if (!b) return true;
+  if (!b.includes("generativelanguage.googleapis.com")) return false;
+  // Gemini "OpenAI compatibility" lives under /openai. Treat that as non-native.
+  if (b.includes("/openai")) return false;
+  return true;
+}
+
+function chatCompletionsUrl(baseUrl: string): string {
+  const b = String(baseUrl || "").trim();
+  const lower = b.toLowerCase();
+  if (!b) return "/v1/chat/completions";
+  if (lower.includes("/chat/completions")) return b;
+  if (lower.includes("/openai")) return joinUrl(b, "chat/completions");
+  if (lower.match(/\/v1\/?$/)) return joinUrl(b, "chat/completions");
+  return joinUrl(b, "/v1/chat/completions");
+}
+
+function authBearer(apiKey: string): string {
+  const k = String(apiKey || "").trim();
+  if (!k) return "";
+  if (/^bearer\s+/i.test(k)) return k;
+  return `Bearer ${k}`;
+}
+
+function toOpenAiRole(role: string): "system" | "user" | "assistant" | "tool" {
+  const r = String(role || "").trim();
+  if (r === "assistant" || r === "system" || r === "tool") return r;
+  return "user";
+}
+
+function extractChatCompletionsText(payload: any): string {
+  const choices = payload?.choices;
+  if (!Array.isArray(choices) || choices.length === 0) return "";
+  const msg = choices[0]?.message;
+  const content = msg?.content;
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.map((p: any) => (typeof p?.text === "string" ? p.text : "")).filter(Boolean).join("\n");
+  }
+  return "";
+}
+
+async function callChatCompletions(opts: {
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+  messages: OpenAIChatMessage[];
+  temperature?: number;
+  maxTokens?: number;
+}): Promise<any> {
+  const url = chatCompletionsUrl(opts.baseUrl);
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  const bearer = authBearer(opts.apiKey);
+  if (bearer) headers["authorization"] = bearer;
+  return fetchJson<any>(url, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      model: opts.model,
+      messages: opts.messages,
+      temperature: typeof opts.temperature === "number" ? opts.temperature : 0.4,
+      max_tokens: typeof opts.maxTokens === "number" ? opts.maxTokens : 1024,
+      stream: false,
+    }),
+  });
+}
+
 async function createChatMessage(
   projectId: string,
   chatId: string,
@@ -321,12 +406,14 @@ app.post("/api/projects/:projectId/chat/turn", async (req, res) => {
       return res.json({ ok: true, user_message: userMessage, assistant_message: assistantMessage, mock: true });
     }
 
+    const useGeminiNative = isGeminiNativeBaseUrl(baseUrl);
+
     if (!geminiApiKey) {
       const assistantMessage = await createChatMessage(
         projectId,
         chatId,
         "assistant",
-        "GEMINI_API_KEY is not set. Open Settings and set Gemini API Key first, then try again.",
+        "API key is not set. Open Settings and set the API Key first, then try again.",
       );
       return res.json({ ok: true, user_message: userMessage, assistant_message: assistantMessage });
     }
@@ -354,27 +441,49 @@ app.post("/api/projects/:projectId/chat/turn", async (req, res) => {
       })),
     ];
 
+    const openAiMessages: OpenAIChatMessage[] = [
+      { role: "system", content: systemPrompt },
+      ...recent.map((m) => ({
+        role: toOpenAiRole(m.role),
+        content: m.content || "",
+      })),
+    ];
+
     const plan = thinkEnabled
       ? {
           action: "chat_turn",
-          steps: [{ action: "gemini.generateContent", model }, { action: "maybe_search_and_resolve" }],
+          steps: [
+            useGeminiNative ? { action: "gemini.generateContent", model } : { action: "chat.completions", model, base_url: baseUrl },
+            { action: "maybe_search_and_resolve" },
+          ],
         }
       : null;
     const planArtifact = plan ? await maybeStorePlan(projectId, "chat-turn", plan) : null;
 
-    const url = new URL(`/v1beta/models/${encodeURIComponent(model)}:generateContent`, baseUrl);
-    url.searchParams.set("key", geminiApiKey);
+    let llmPayload: any;
+    if (useGeminiNative) {
+      const url = new URL(`/v1beta/models/${encodeURIComponent(model)}:generateContent`, baseUrl);
+      url.searchParams.set("key", geminiApiKey);
+      llmPayload = await fetchJson<any>(url.toString(), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          contents,
+          generationConfig: { temperature: 0.4, maxOutputTokens: 1024 },
+        }),
+      });
+    } else {
+      llmPayload = await callChatCompletions({
+        baseUrl,
+        apiKey: geminiApiKey,
+        model,
+        messages: openAiMessages,
+        temperature: 0.4,
+        maxTokens: 1024,
+      });
+    }
 
-    const geminiPayload = await fetchJson<any>(url.toString(), {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        contents,
-        generationConfig: { temperature: 0.4, maxOutputTokens: 1024 },
-      }),
-    });
-
-    const text = extractGeminiText(geminiPayload);
+    const text = useGeminiNative ? extractGeminiText(llmPayload) : extractChatCompletionsText(llmPayload);
     const parsed = tryParseJson(text);
 
     const parsedObj = (parsed && typeof parsed === "object" ? (parsed as any) : null) as any;
@@ -446,6 +555,8 @@ app.post("/api/projects/:projectId/chat/turn", async (req, res) => {
         out_path: `chat/turn-${Date.now()}.json`,
         content: JSON.stringify(
           {
+            provider: useGeminiNative ? "gemini_native" : "openai_compat",
+            base_url: baseUrl,
             model,
             user_message_id: userMessage.id,
             assistant_reply: agentPlan.reply,
@@ -453,7 +564,7 @@ app.post("/api/projects/:projectId/chat/turn", async (req, res) => {
             should_search: shouldSearch,
             search_queries: agentPlan.search_queries,
             videos,
-            gemini: { text, parsed, payload: geminiPayload },
+            llm: { text, parsed, payload: llmPayload },
           },
           null,
           2,
@@ -495,7 +606,7 @@ app.post("/api/projects/:projectId/gemini/analyze", async (req, res) => {
     if (!apiKey) {
       return res.status(400).json({
         ok: false,
-        error: "GEMINI_API_KEY is not set; set it in .env or in the UI Settings and retry",
+        error: "API key is not set; set it in .env or in the UI Settings and retry",
       });
     }
 
@@ -504,6 +615,7 @@ app.post("/api/projects/:projectId/gemini/analyze", async (req, res) => {
       str(process.env.BASE_URL) ||
       "https://generativelanguage.googleapis.com";
     const model = str(req.body?.model) || str(process.env.DEFAULT_MODEL) || "gemini-3-preview";
+    const useGeminiNative = isGeminiNativeBaseUrl(baseUrl);
 
     let inputVideoArtifactId = String(req.body?.input_video_artifact_id || "").trim();
     if (!inputVideoArtifactId) {
@@ -518,7 +630,7 @@ app.post("/api/projects/:projectId/gemini/analyze", async (req, res) => {
           action: "gemini_analyze",
           steps: [
             { action: "ffmpeg_pipeline", input_video_artifact_id: inputVideoArtifactId },
-            { action: "gemini_generate", model },
+            useGeminiNative ? { action: "gemini.generateContent", model } : { action: "chat.completions", model, base_url: baseUrl },
             { action: "store_analysis" },
           ],
         }
@@ -535,44 +647,54 @@ app.post("/api/projects/:projectId/gemini/analyze", async (req, res) => {
     if (clips.length === 0) return res.status(500).json({ ok: false, error: "ffmpeg pipeline returned no clips" });
 
     const profilePrompt = await getProfilePrompt();
-    const parts: any[] = [
-      {
-        text: [
-          "You are VidUnpack (视频拆解箱).",
-          "Analyze the provided video clips (start/mid/end) and infer how this video was made, focusing on meme-story style videos.",
-          "Return JSON only (no markdown) with keys:",
-          "- summary",
-          "- likely_assets (array)",
-          "- voice_over (how it was made; platform guesses)",
-          "- editing_steps (short steps)",
-          "- search_queries (array, for finding assets)",
-          "- extra_clips_needed (array of {start_s,duration_s,reason})",
-          ...(profilePrompt ? ["", "User profile (cross-project preferences):", profilePrompt] : []),
-        ].join("\n"),
-      },
-    ];
+    const promptText = [
+      "You are VidUnpack (视频拆解箱).",
+      "Analyze the provided video clips (start/mid/end) and infer how this video was made, focusing on meme-story style videos.",
+      "Return JSON only (no markdown) with keys:",
+      "- summary",
+      "- likely_assets (array)",
+      "- voice_over (how it was made; platform guesses)",
+      "- editing_steps (short steps)",
+      "- search_queries (array, for finding assets)",
+      "- extra_clips_needed (array of {start_s,duration_s,reason})",
+      ...(profilePrompt ? ["", "User profile (cross-project preferences):", profilePrompt] : []),
+    ].join("\n");
+
+    const parts: any[] = [{ text: promptText }];
+    const openAiContent: any[] = [{ type: "text", text: promptText }];
 
     for (const clip of clips) {
       const abs = path.join(dataDir, clip.path);
       const buf = await readFile(abs);
-      parts.push({
-        inline_data: { mime_type: "video/mp4", data: buf.toString("base64") },
+      const b64 = buf.toString("base64");
+      parts.push({ inline_data: { mime_type: "video/mp4", data: b64 } });
+      openAiContent.push({ type: "image_url", image_url: { url: `data:video/mp4;base64,${b64}` } });
+    }
+
+    let llmPayload: any;
+    if (useGeminiNative) {
+      const url = new URL(`/v1beta/models/${encodeURIComponent(model)}:generateContent`, baseUrl);
+      url.searchParams.set("key", apiKey);
+      llmPayload = await fetchJson<any>(url.toString(), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ role: "user", parts }],
+          generationConfig: { temperature: 0.2, maxOutputTokens: 2048 },
+        }),
+      });
+    } else {
+      llmPayload = await callChatCompletions({
+        baseUrl,
+        apiKey,
+        model,
+        messages: [{ role: "user", content: openAiContent }],
+        temperature: 0.2,
+        maxTokens: 2048,
       });
     }
 
-    const url = new URL(`/v1beta/models/${encodeURIComponent(model)}:generateContent`, baseUrl);
-    url.searchParams.set("key", apiKey);
-
-    const geminiPayload = await fetchJson<any>(url.toString(), {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ role: "user", parts }],
-        generationConfig: { temperature: 0.2, maxOutputTokens: 2048 },
-      }),
-    });
-
-    const text = extractGeminiText(geminiPayload);
+    const text = useGeminiNative ? extractGeminiText(llmPayload) : extractChatCompletionsText(llmPayload);
     const parsed = tryParseJson(text);
 
     const outPath = `analysis/gemini-${Date.now()}.json`;
@@ -584,10 +706,12 @@ app.post("/api/projects/:projectId/gemini/analyze", async (req, res) => {
         out_path: outPath,
         content: JSON.stringify(
           {
+            provider: useGeminiNative ? "gemini_native" : "openai_compat",
+            base_url: baseUrl,
             model,
             input_video_artifact_id: inputVideoArtifactId,
             clips,
-            gemini: geminiPayload,
+            llm: llmPayload,
             text,
             parsed,
           },
