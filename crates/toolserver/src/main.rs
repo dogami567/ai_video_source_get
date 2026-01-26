@@ -11,6 +11,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::{
+    io::ErrorKind,
     net::SocketAddr,
     path::{Path as FsPath, PathBuf},
     process::Command,
@@ -99,13 +100,34 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(6791);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    tracing::info!("toolserver listening on http://{addr}");
+    let listener = bind_with_retry(addr).await?;
 
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("failed to bind to {addr}"))?;
+    tracing::info!("toolserver listening on http://{addr}");
     axum::serve(listener, app).await.context("toolserver failed")?;
     Ok(())
+}
+
+async fn bind_with_retry(addr: SocketAddr) -> anyhow::Result<tokio::net::TcpListener> {
+    let mut last: Option<std::io::Error> = None;
+    for _attempt in 0..20 {
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => return Ok(listener),
+            Err(e) if e.kind() == ErrorKind::AddrInUse => {
+                last = Some(e);
+                // Best-effort: allow a short grace period for a previous process to release the port.
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            }
+            Err(e) => return Err(anyhow::Error::new(e).context(format!("failed to bind to {addr}"))),
+        }
+    }
+
+    let msg = last
+        .as_ref()
+        .map(|e| e.to_string())
+        .unwrap_or_else(|| "address already in use".to_string());
+    Err(anyhow::anyhow!(
+        "failed to bind to {addr} after retries: {msg}. Stop the process using this port or set TOOLSERVER_PORT."
+    ))
 }
 
 #[derive(Clone)]
