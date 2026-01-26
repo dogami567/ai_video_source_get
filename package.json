@@ -5,12 +5,13 @@
     "apps/*"
   ],
   "scripts": {
-    "dev": "node scripts/predev.mjs --all && concurrently --kill-others-on-fail -n web,orchestrator,toolserver -c green,blue,magenta \"npm -w @vidunpack/web run dev\" \"npm -w @vidunpack/orchestrator run dev\" \"node scripts/run-toolserver.mjs\"",
+    "dev": "node scripts/predev.mjs --all && concurrently --kill-others-on-fail -n web,orchestrator,toolserver -c green,blue,magenta \"npm -w @vidunpack/web run dev\" \"npm -w @vidunpack/orchestrator run dev:serve\" \"node scripts/run-toolserver.mjs\"",
     "dev:web": "npm -w @vidunpack/web run dev",
     "dev:orchestrator": "npm -w @vidunpack/orchestrator run dev",
     "dev:toolserver": "node scripts/run-toolserver.mjs",
     "build": "npm -w @vidunpack/web run build && npm -w @vidunpack/orchestrator run build && cargo build -p vidunpack-toolserver",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "test:e2e:dev": "playwright test --config playwright.dev.config.ts"
   },
   "devDependencies": {
     "@playwright/test": "^1.50.1",

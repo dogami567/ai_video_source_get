@@ -80,7 +80,7 @@ echo [vidunpack] Toolserver health:   http://127.0.0.1:%TOOLSERVER_PORT%/health
 echo [vidunpack] NOTE: This script starts backend only. For full app (web+backend), run: npm run dev
 
 REM Run orchestrator + toolserver together
-call npx concurrently --kill-others-on-fail -n orchestrator,toolserver -c blue,magenta "npm -w @vidunpack/orchestrator run dev" "node scripts/run-toolserver.mjs"
+call npx concurrently --kill-others-on-fail -n orchestrator,toolserver -c blue,magenta "npm -w @vidunpack/orchestrator run dev:serve" "node scripts/run-toolserver.mjs"
 if errorlevel 1 goto :err
 
 exit /b 0
