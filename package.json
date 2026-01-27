@@ -11,7 +11,7 @@
     "dev:toolserver": "node scripts/run-toolserver.mjs",
     "build": "npm -w @vidunpack/web run build && npm -w @vidunpack/orchestrator run build && cargo build -p vidunpack-toolserver",
     "test:e2e": "playwright test",
-    "test:e2e:dev": "playwright test --config playwright.dev.config.ts"
+    "test:e2e:dev": "node scripts/predev.mjs --all && playwright test --config playwright.dev.config.ts"
   },
   "devDependencies": {
     "@playwright/test": "^1.50.1",
