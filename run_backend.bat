@@ -5,6 +5,12 @@ cd /d "%~dp0"
 
 title VidUnpack Backend
 
+REM Log file (helps when the window flashes and closes)
+set "LOG_DIR=data\_logs"
+set "LOG_FILE=%LOG_DIR%\run_backend.log"
+if not exist "%LOG_DIR%\" mkdir "%LOG_DIR%" >nul 2>nul
+echo ==== %DATE% %TIME% ==== > "%LOG_FILE%" 2>nul
+
 REM Create .env if missing (edit keys if needed)
 if not exist ".env" (
   if exist ".env.example" (
@@ -78,9 +84,11 @@ echo [vidunpack] Starting backend (orchestrator=%ORCHESTRATOR_PORT% toolserver=%
 echo [vidunpack] Orchestrator health: http://127.0.0.1:%ORCHESTRATOR_PORT%/api/health
 echo [vidunpack] Toolserver health:   http://127.0.0.1:%TOOLSERVER_PORT%/health
 echo [vidunpack] NOTE: This script starts backend only. For full app (web+backend), run: npm run dev
+echo [vidunpack] Log: %LOG_FILE%
 
 REM Run orchestrator + toolserver together
-call npx concurrently --kill-others-on-fail -n orchestrator,toolserver -c blue,magenta "npm -w @vidunpack/orchestrator run dev:serve" "node scripts/run-toolserver.mjs"
+REM Use PowerShell Tee-Object to show logs AND write to file, preserving exit code.
+powershell -NoProfile -Command "& { npx concurrently --kill-others-on-fail -n orchestrator,toolserver -c blue,magenta 'npm -w @vidunpack/orchestrator run dev:serve' 'node scripts/run-toolserver.mjs' 2>&1 | Tee-Object -FilePath '%LOG_FILE%' -Append; exit $LASTEXITCODE }"
 if errorlevel 1 goto :err
 
 exit /b 0
