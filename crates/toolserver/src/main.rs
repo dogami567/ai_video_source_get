@@ -1984,6 +1984,22 @@ fn clean_one_line(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ").trim().to_string()
 }
 
+fn is_cookie_db_copy_error(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("could not copy") && lower.contains("cookie database")
+}
+
+fn cookie_db_copy_help(browser: &str) -> String {
+    format!(
+        "yt-dlp failed to read cookies from browser ({browser}).\n\n\
+Common cause on Windows: the browser is running and yt-dlp cannot copy the cookies database.\n\n\
+Fix:\n\
+1) Fully close the browser ({browser}) and retry (including background processes).\n\
+2) Or switch to another browser in Settings (edge/firefox).\n\n\
+Ref: yt-dlp issue 7271"
+    )
+}
+
 fn truncate_chars(s: &str, max_chars: usize) -> String {
     let trimmed = s.trim();
     if trimmed.chars().count() <= max_chars {
@@ -2091,17 +2107,38 @@ async fn import_remote_media(
             ));
         }
 
-        // Resolve URL to yt-dlp info JSON (works for bilibili + other supported sites).
-        let mut cmd = Command::new(&ytdlp_cmd);
-        cmd.args(["--dump-single-json", "--skip-download", "--no-playlist", "--no-warnings"]);
-        if let Some(c) = cookies_from_browser.as_ref() {
-            cmd.args(["--cookies-from-browser", c]);
-        }
-        cmd.arg(&url);
+        let resolve_once = |cookies: Option<&str>| -> anyhow::Result<serde_json::Value> {
+            let mut cmd = Command::new(&ytdlp_cmd);
+            cmd.args(["--dump-single-json", "--skip-download", "--no-playlist", "--no-warnings"]);
+            if let Some(c) = cookies {
+                cmd.args(["--cookies-from-browser", c]);
+            }
+            cmd.arg(&url);
+            let output = run_cmd_output(&mut cmd)?;
+            let stdout = String::from_utf8(output.stdout)?;
+            Ok(serde_json::from_str(stdout.trim())?)
+        };
 
-        let output = run_cmd_output(&mut cmd)?;
-        let stdout = String::from_utf8(output.stdout)?;
-        let info_json: serde_json::Value = serde_json::from_str(stdout.trim())?;
+        // Resolve URL to yt-dlp info JSON (works for bilibili + other supported sites).
+        //
+        // Important: Do NOT force `--cookies-from-browser` for resolve. On Windows, Chrome/Edge
+        // frequently fail with "Could not copy ... cookie database" when the browser is running.
+        // We first try without cookies (public metadata), then retry with cookies only if needed.
+        let info_json: serde_json::Value = match resolve_once(None) {
+            Ok(v) => v,
+            Err(no_cookie_err) => match cookies_from_browser.as_ref() {
+                Some(c) => match resolve_once(Some(c)) {
+                    Ok(v) => v,
+                    Err(cookie_err) => {
+                        if is_cookie_db_copy_error(&cookie_err.to_string()) {
+                            return Ok(ImportRemoteMediaOutcome::PreconditionFailed(cookie_db_copy_help(c)));
+                        }
+                        return Err(cookie_err).context(format!("yt-dlp resolve failed without cookies: {no_cookie_err}"));
+                    }
+                },
+                None => return Err(no_cookie_err),
+            },
+        };
 
         let created_at_ms = now_ms();
         let safe_out_path = sanitize_out_path(&format!("ytdlp/info-{created_at_ms}.json"))
@@ -2154,8 +2191,7 @@ async fn import_remote_media(
             let out_template = out_dir_abs.join(format!("{file_base}.%(ext)s"));
             let out_template_str = out_template.display().to_string();
 
-            let mut dl = Command::new(&ytdlp_cmd);
-            dl.args([
+            let base_args = [
                 "--no-playlist",
                 "--restrict-filenames",
                 "--no-warnings",
@@ -2164,12 +2200,35 @@ async fn import_remote_media(
                 "mp4",
                 "-o",
                 &out_template_str,
-            ]);
+            ];
+
+            let run_download = |cookies: Option<&str>| -> anyhow::Result<()> {
+                let mut dl = Command::new(&ytdlp_cmd);
+                dl.args(base_args);
+                if let Some(c) = cookies {
+                    dl.args(["--cookies-from-browser", c]);
+                }
+                dl.arg(&url);
+                run_cmd(&mut dl)
+            };
+
             if let Some(c) = cookies_from_browser.as_ref() {
-                dl.args(["--cookies-from-browser", c]);
+                match run_download(Some(c)) {
+                    Ok(()) => {}
+                    Err(err) => {
+                        if is_cookie_db_copy_error(&err.to_string()) {
+                            // Best-effort fallback: public videos might still download without cookies.
+                            if run_download(None).is_err() {
+                                return Ok(ImportRemoteMediaOutcome::PreconditionFailed(cookie_db_copy_help(c)));
+                            }
+                        } else {
+                            return Err(err);
+                        }
+                    }
+                }
+            } else {
+                run_download(None)?;
             }
-            dl.arg(&url);
-            run_cmd(&mut dl)?;
 
             let expected = out_dir_abs.join(format!("{file_base}.mp4"));
             let downloaded_abs = if expected.exists() {
