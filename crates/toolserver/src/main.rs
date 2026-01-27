@@ -345,6 +345,9 @@ fn update_profile_after_export(
     include_original_video: bool,
     include_report: bool,
     include_manifest: bool,
+    include_clips: bool,
+    include_audio: bool,
+    include_thumbnails: bool,
 ) -> anyhow::Result<()> {
     let kind_counts: Vec<ProfileMemoryCount> = {
         let mut stmt = conn.prepare(
@@ -381,6 +384,9 @@ fn update_profile_after_export(
     parts.push(format!("include_original_video={include_original_video}"));
     parts.push(format!("include_report={include_report}"));
     parts.push(format!("include_manifest={include_manifest}"));
+    parts.push(format!("include_clips={include_clips}"));
+    parts.push(format!("include_audio={include_audio}"));
+    parts.push(format!("include_thumbnails={include_thumbnails}"));
 
     let session_summary = truncate_with_ellipsis(&format!("Exported; {}", parts.join("; ")), 400);
 
@@ -2873,6 +2879,9 @@ struct ExportZipRequest {
     include_original_video: Option<bool>,
     include_report: Option<bool>,
     include_manifest: Option<bool>,
+    include_clips: Option<bool>,
+    include_audio: Option<bool>,
+    include_thumbnails: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -2899,6 +2908,12 @@ async fn estimate_export_zip(
     let include_original_video = req.include_original_video.unwrap_or(true);
     let include_report = req.include_report.unwrap_or(true);
     let include_manifest = req.include_manifest.unwrap_or(true);
+    let include_clips = req.include_clips.unwrap_or(false);
+    let include_audio = req.include_audio.unwrap_or(false);
+    let include_thumbnails = req.include_thumbnails.unwrap_or(false);
+    let include_clips = req.include_clips.unwrap_or(false);
+    let include_audio = req.include_audio.unwrap_or(false);
+    let include_thumbnails = req.include_thumbnails.unwrap_or(false);
 
     let data_dir = state.data_dir.clone();
     let db_path = state.db_path.clone();
@@ -3009,6 +3024,79 @@ async fn estimate_export_zip(
             }
         }
 
+        if include_clips {
+            for kind in ["clip_start", "clip_mid", "clip_end"] {
+                if let Some((path, _)) = conn
+                    .query_row(
+                        "SELECT path, created_at_ms FROM artifacts WHERE project_id = ?1 AND kind = ?2 ORDER BY created_at_ms DESC LIMIT 1",
+                        params![&project_id, kind],
+                        |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+                    )
+                    .optional()?
+                {
+                    let abs = data_dir.join(&path);
+                    if abs.exists() {
+                        let file_name = FsPath::new(&path)
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or(kind);
+                        files.push(ExportZipFileEstimate {
+                            name: format!("clips/{}", file_name),
+                            bytes: std::fs::metadata(abs)?.len(),
+                        });
+                    }
+                }
+            }
+        }
+
+        if include_audio {
+            if let Some((path, _)) = conn
+                .query_row(
+                    "SELECT path, created_at_ms FROM artifacts WHERE project_id = ?1 AND kind = 'audio_wav' ORDER BY created_at_ms DESC LIMIT 1",
+                    [&project_id],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+                )
+                .optional()?
+            {
+                let abs = data_dir.join(&path);
+                if abs.exists() {
+                    let file_name = FsPath::new(&path)
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("audio.wav");
+                    files.push(ExportZipFileEstimate {
+                        name: format!("audio/{}", file_name),
+                        bytes: std::fs::metadata(abs)?.len(),
+                    });
+                }
+            }
+        }
+
+        if include_thumbnails {
+            for kind in ["thumb_start", "thumb_mid", "thumb_end"] {
+                if let Some((path, _)) = conn
+                    .query_row(
+                        "SELECT path, created_at_ms FROM artifacts WHERE project_id = ?1 AND kind = ?2 ORDER BY created_at_ms DESC LIMIT 1",
+                        params![&project_id, kind],
+                        |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+                    )
+                    .optional()?
+                {
+                    let abs = data_dir.join(&path);
+                    if abs.exists() {
+                        let file_name = FsPath::new(&path)
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or(kind);
+                        files.push(ExportZipFileEstimate {
+                            name: format!("thumbnails/{}", file_name),
+                            bytes: std::fs::metadata(abs)?.len(),
+                        });
+                    }
+                }
+            }
+        }
+
         let total_bytes = files.iter().map(|f| f.bytes).sum();
         Ok(Some(ExportZipEstimateResponse { total_bytes, files }))
     })
@@ -3092,6 +3180,55 @@ async fn export_zip(
             None
         };
 
+        let clip_paths: Vec<String> = if include_clips {
+            let mut out: Vec<String> = Vec::new();
+            for kind in ["clip_start", "clip_mid", "clip_end"] {
+                if let Some(p) = conn
+                    .query_row(
+                        "SELECT path FROM artifacts WHERE project_id = ?1 AND kind = ?2 ORDER BY created_at_ms DESC LIMIT 1",
+                        params![&project_id, kind],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()?
+                {
+                    out.push(p);
+                }
+            }
+            out
+        } else {
+            Vec::new()
+        };
+
+        let audio_path: Option<String> = if include_audio {
+            conn.query_row(
+                "SELECT path FROM artifacts WHERE project_id = ?1 AND kind = 'audio_wav' ORDER BY created_at_ms DESC LIMIT 1",
+                [&project_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+        } else {
+            None
+        };
+
+        let thumbnail_paths: Vec<String> = if include_thumbnails {
+            let mut out: Vec<String> = Vec::new();
+            for kind in ["thumb_start", "thumb_mid", "thumb_end"] {
+                if let Some(p) = conn
+                    .query_row(
+                        "SELECT path FROM artifacts WHERE project_id = ?1 AND kind = ?2 ORDER BY created_at_ms DESC LIMIT 1",
+                        params![&project_id, kind],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()?
+                {
+                    out.push(p);
+                }
+            }
+            out
+        } else {
+            Vec::new()
+        };
+
         // selected_pool.json snapshot
         let selected_items: Vec<PoolItemResponse> = {
             let mut stmt = conn.prepare(
@@ -3173,6 +3310,46 @@ async fn export_zip(
             }
         }
 
+        // clips / audio / thumbnails (if present)
+        if !clip_paths.is_empty() {
+            for p in clip_paths {
+                let abs = data_dir.join(&p);
+                if !abs.exists() {
+                    continue;
+                }
+                let file_name = FsPath::new(&p)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("clip.mp4");
+                total_bytes = total_bytes.saturating_add(add_file(&mut zip, &abs, &format!("clips/{file_name}"))?);
+            }
+        }
+
+        if let Some(p) = audio_path {
+            let abs = data_dir.join(&p);
+            if abs.exists() {
+                let file_name = FsPath::new(&p)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("audio.wav");
+                total_bytes = total_bytes.saturating_add(add_file(&mut zip, &abs, &format!("audio/{file_name}"))?);
+            }
+        }
+
+        if !thumbnail_paths.is_empty() {
+            for p in thumbnail_paths {
+                let abs = data_dir.join(&p);
+                if !abs.exists() {
+                    continue;
+                }
+                let file_name = FsPath::new(&p)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("thumb.jpg");
+                total_bytes = total_bytes.saturating_add(add_file(&mut zip, &abs, &format!("thumbnails/{file_name}"))?);
+            }
+        }
+
         zip.finish()?;
 
         let zip_art = ensure_artifact(&conn, &project_id, "export_zip", &zip_rel, ts)?;
@@ -3186,7 +3363,18 @@ async fn export_zip(
             ],
         )?;
 
-        if let Err(err) = update_profile_after_export(&conn, &data_dir, &project_id, ts, include_original_video, include_report, include_manifest)
+        if let Err(err) = update_profile_after_export(
+            &conn,
+            &data_dir,
+            &project_id,
+            ts,
+            include_original_video,
+            include_report,
+            include_manifest,
+            include_clips,
+            include_audio,
+            include_thumbnails,
+        )
         {
             tracing::warn!("failed to update profile after export: {err:#}");
             let _ = conn.execute(

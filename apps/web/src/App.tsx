@@ -407,7 +407,12 @@ export default function App() {
   const [reportError, setReportError] = React.useState<string | null>(null);
   const [reportOut, setReportOut] = React.useState<{ report_html: Artifact; manifest_json: Artifact } | null>(null);
 
+  const [zipIncludeReport, setZipIncludeReport] = React.useState(true);
+  const [zipIncludeManifest, setZipIncludeManifest] = React.useState(true);
   const [zipIncludeVideo, setZipIncludeVideo] = React.useState(true);
+  const [zipIncludeClips, setZipIncludeClips] = React.useState(true);
+  const [zipIncludeAudio, setZipIncludeAudio] = React.useState(false);
+  const [zipIncludeThumbnails, setZipIncludeThumbnails] = React.useState(true);
   const [zipEstimateBusy, setZipEstimateBusy] = React.useState(false);
   const [zipEstimateError, setZipEstimateError] = React.useState<string | null>(null);
   const [zipEstimate, setZipEstimate] = React.useState<
@@ -1107,7 +1112,14 @@ export default function App() {
     try {
       const resp = await postJson<{ total_bytes: number; files: Array<{ name: string; bytes: number }> }>(
         `/tool/projects/${view.projectId}/exports/zip/estimate`,
-        { include_original_video: zipIncludeVideo, include_report: true, include_manifest: true },
+        {
+          include_report: zipIncludeReport,
+          include_manifest: zipIncludeManifest,
+          include_original_video: zipIncludeVideo,
+          include_clips: zipIncludeClips,
+          include_audio: zipIncludeAudio,
+          include_thumbnails: zipIncludeThumbnails,
+        },
       );
       setZipEstimate(resp);
     } catch (e) {
@@ -1123,9 +1135,29 @@ export default function App() {
     setZipExport(null);
     setZipExportBusy(true);
     try {
+      if (zipIncludeReport || zipIncludeManifest) {
+        const hasReport = artifacts.some((a) => a.kind === "report_html");
+        const hasManifest = artifacts.some((a) => a.kind === "manifest_json");
+        if (!hasReport || !hasManifest) {
+          const generated = await fetchJson<{ report_html: Artifact; manifest_json: Artifact }>(
+            `/tool/projects/${view.projectId}/exports/report`,
+            { method: "POST" },
+          );
+          setReportOut(generated);
+          await refreshProject(view.projectId);
+        }
+      }
+
       const resp = await postJson<{ zip: Artifact; total_bytes: number; download_url: string }>(
         `/tool/projects/${view.projectId}/exports/zip`,
-        { include_original_video: zipIncludeVideo, include_report: true, include_manifest: true },
+        {
+          include_report: zipIncludeReport,
+          include_manifest: zipIncludeManifest,
+          include_original_video: zipIncludeVideo,
+          include_clips: zipIncludeClips,
+          include_audio: zipIncludeAudio,
+          include_thumbnails: zipIncludeThumbnails,
+        },
       );
       setZipExport(resp);
     } catch (e) {
@@ -1550,10 +1582,77 @@ export default function App() {
                            <div className="panel-title">{tr("export")}</div>
                         </div>
                         
-                        <label className="flex items-center gap-2 mb-4 cursor-pointer select-none">
-                           <input type="checkbox" checked={zipIncludeVideo} onChange={e => setZipIncludeVideo(e.target.checked)} data-testid="include-original-video" />
-                           <span className="text-sm">{tr("includeOriginalVideo")}</span>
-                        </label>
+                        <div className="export-options mb-3">
+                          <label className={`export-option ${(zipIncludeReport || zipIncludeManifest) ? "on" : ""}`}>
+                            <input
+                              type="checkbox"
+                              checked={zipIncludeReport || zipIncludeManifest}
+                              onChange={(e) => {
+                                const v = e.target.checked;
+                                setZipIncludeReport(v);
+                                setZipIncludeManifest(v);
+                              }}
+                              data-testid="include-report-bundle"
+                            />
+                            <div className="export-option-body">
+                              <div className="export-option-title">{tr("exportReportBundle")}</div>
+                              <div className="export-option-desc">{tr("exportReportBundleDesc")}</div>
+                            </div>
+                          </label>
+
+                          <label className={`export-option ${zipIncludeVideo ? "on" : ""}`}>
+                            <input
+                              type="checkbox"
+                              checked={zipIncludeVideo}
+                              onChange={(e) => setZipIncludeVideo(e.target.checked)}
+                              data-testid="include-original-video"
+                            />
+                            <div className="export-option-body">
+                              <div className="export-option-title">{tr("includeOriginalVideo")}</div>
+                              <div className="export-option-desc">{tr("exportOriginalVideoDesc")}</div>
+                            </div>
+                          </label>
+
+                          <label className={`export-option ${zipIncludeClips ? "on" : ""}`}>
+                            <input
+                              type="checkbox"
+                              checked={zipIncludeClips}
+                              onChange={(e) => setZipIncludeClips(e.target.checked)}
+                              data-testid="include-clips"
+                            />
+                            <div className="export-option-body">
+                              <div className="export-option-title">{tr("exportClips")}</div>
+                              <div className="export-option-desc">{tr("exportClipsDesc")}</div>
+                            </div>
+                          </label>
+
+                          <label className={`export-option ${zipIncludeAudio ? "on" : ""}`}>
+                            <input
+                              type="checkbox"
+                              checked={zipIncludeAudio}
+                              onChange={(e) => setZipIncludeAudio(e.target.checked)}
+                              data-testid="include-audio"
+                            />
+                            <div className="export-option-body">
+                              <div className="export-option-title">{tr("exportAudio")}</div>
+                              <div className="export-option-desc">{tr("exportAudioDesc")}</div>
+                            </div>
+                          </label>
+
+                          <label className={`export-option ${zipIncludeThumbnails ? "on" : ""}`}>
+                            <input
+                              type="checkbox"
+                              checked={zipIncludeThumbnails}
+                              onChange={(e) => setZipIncludeThumbnails(e.target.checked)}
+                              data-testid="include-thumbnails"
+                            />
+                            <div className="export-option-body">
+                              <div className="export-option-title">{tr("exportThumbnails")}</div>
+                              <div className="export-option-desc">{tr("exportThumbnailsDesc")}</div>
+                            </div>
+                          </label>
+                        </div>
+                        <div className="text-xs text-dim mb-4">{tr("exportAlwaysIncluded")}</div>
 
                         <div className="flex flex-col gap-2">
                            <button className="btn btn-secondary w-full" onClick={() => void onGenerateReport()} disabled={reportBusy} data-testid="gen-report">
