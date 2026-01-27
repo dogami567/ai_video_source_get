@@ -44,10 +44,12 @@ test("chat: mock cards render and send behavior", async ({ page, request }) => {
 
   // Ensure there is at least one chat thread (auto-created).
   const threads = page.locator("button.chat-thread");
-  if ((await threads.count()) === 0) {
-    await page.getByTestId("chat-new-thread").click();
-    await expect(page.locator("button.chat-thread")).toHaveCount(1);
-  }
+  await expect.poll(async () => await threads.count()).toBeGreaterThan(0);
+
+  // New thread should increase count by 1.
+  const beforeCount = await threads.count();
+  await page.getByTestId("chat-new-thread").click();
+  await expect.poll(async () => await threads.count()).toBe(beforeCount + 1);
 
   // Upload a file (verifies upload path + chip rendering).
   await page.getByTestId("chat-file-input").setInputFiles("tests/fixtures/sample.mp4");
@@ -65,4 +67,3 @@ test("chat: mock cards render and send behavior", async ({ page, request }) => {
   await expect(page.getByText(/mock 模式/i)).toBeVisible({ timeout: 60_000 });
   await expect(page.getByTestId("chat-video-card")).toHaveCount(2);
 });
-

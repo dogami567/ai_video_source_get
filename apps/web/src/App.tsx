@@ -1301,20 +1301,57 @@ export default function App() {
                       <div className="panel-title">{tr("settingsDownloader")}</div>
                     </div>
 
-                    <div className="input-group">
-                      <label className="input-label">{tr("settingsCookiesFromBrowser")}</label>
-                      <input
-                        className="input-field"
-                        type="text"
-                        data-testid="settings-ytdlp-cookies-from-browser"
-                        placeholder="chrome | edge | firefox"
-                        value={settingsDraft.ytdlp_cookies_from_browser}
-                        onChange={(e) => setSettingsDraft((p) => ({ ...p, ytdlp_cookies_from_browser: e.target.value }))}
-                      />
-                      <div className="text-xs text-dim mt-1">{tr("settingsCookiesFromBrowserHint")}</div>
-                    </div>
-                  </div>
-                </div>
+	                    <div className="input-group">
+	                      <label className="input-label">{tr("settingsCookiesFromBrowser")}</label>
+	                      <input
+	                        className="input-field"
+	                        type="text"
+	                        data-testid="settings-ytdlp-cookies-from-browser"
+	                        placeholder="chrome | edge | firefox"
+	                        value={settingsDraft.ytdlp_cookies_from_browser}
+	                        onChange={(e) => setSettingsDraft((p) => ({ ...p, ytdlp_cookies_from_browser: e.target.value }))}
+	                      />
+	                      <div className="text-xs text-dim mt-1">{tr("settingsCookiesFromBrowserHint")}</div>
+
+	                      <div className="flex items-center gap-2 mt-2 flex-wrap">
+	                        <button
+	                          className="btn btn-secondary btn-sm"
+	                          type="button"
+	                          onClick={() => window.open("https://passport.bilibili.com/login", "_blank", "noopener,noreferrer")}
+	                          data-testid="open-bilibili-login"
+	                        >
+	                          {tr("openBilibiliLogin")}
+	                        </button>
+
+	                        <button
+	                          className="btn btn-ghost btn-sm"
+	                          type="button"
+	                          onClick={() => setSettingsDraft((p) => ({ ...p, ytdlp_cookies_from_browser: "edge" }))}
+	                          data-testid="set-cookies-edge"
+	                        >
+	                          Edge
+	                        </button>
+	                        <button
+	                          className="btn btn-ghost btn-sm"
+	                          type="button"
+	                          onClick={() => setSettingsDraft((p) => ({ ...p, ytdlp_cookies_from_browser: "chrome" }))}
+	                          data-testid="set-cookies-chrome"
+	                        >
+	                          Chrome
+	                        </button>
+	                        <button
+	                          className="btn btn-ghost btn-sm"
+	                          type="button"
+	                          onClick={() => setSettingsDraft((p) => ({ ...p, ytdlp_cookies_from_browser: "firefox" }))}
+	                          data-testid="set-cookies-firefox"
+	                        >
+	                          Firefox
+	                        </button>
+	                      </div>
+	                      <div className="text-xs text-dim mt-2">{tr("cookiesLoginWhat")}</div>
+	                    </div>
+	                  </div>
+	                </div>
 
                 <div className="flex items-center justify-between mt-6">
                   <button className="btn btn-ghost btn-sm" type="button" onClick={onClearSettings} data-testid="settings-clear">
