@@ -71,6 +71,7 @@ const en = {
   settingsCookiesFromBrowserHint:
     "Optional. If you are logged in in your browser, set e.g. 'chrome' or 'edge' to let yt-dlp reuse it. (This does not store cookies here.)",
   openBilibiliLogin: "Open Bilibili login",
+  detectedBrowsers: "Detected browsers",
   cookiesLoginWhat:
     "Login is for the target site (e.g. Bilibili) in the same browser profile you selected above (not incognito). This is not for Google/Gemini.",
   settingsKeyPlaceholder: "Paste your API key",
@@ -227,6 +228,7 @@ const zhCN: typeof en = {
   settingsCookiesFromBrowserHint:
     "可选：先在浏览器完成登录，再填 chrome/edge/firefox 让 yt-dlp 复用登录态（这里只保存浏览器名，不保存 cookie）。",
   openBilibiliLogin: "打开 B 站登录页",
+  detectedBrowsers: "检测到的浏览器",
   cookiesLoginWhat: "这里登录的是目标站点（例如 B 站），并且要在你上面选的浏览器“正常模式/默认档案”里登录（别用无痕）。这和 Google/Gemini 没关系。",
   settingsKeyPlaceholder: "粘贴你的 API Key",
   settingsEmptyUsesEnv: "留空则使用 .env",

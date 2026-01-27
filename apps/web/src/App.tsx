@@ -361,6 +361,8 @@ export default function App() {
     };
   });
   const [settingsSavedAt, setSettingsSavedAt] = React.useState<number | null>(null);
+  const [systemBrowsers, setSystemBrowsers] = React.useState<string[] | null>(null);
+  const [systemBrowsersError, setSystemBrowsersError] = React.useState<string | null>(null);
 
   const [project, setProject] = React.useState<Project | null>(null);
   const [consent, setConsent] = React.useState<Consent | null>(null);
@@ -589,6 +591,17 @@ export default function App() {
     setView({ kind: "project", projectId });
   };
 
+  const refreshSystemBrowsers = async () => {
+    setSystemBrowsersError(null);
+    setSystemBrowsers(null);
+    try {
+      const resp = await fetchJson<{ ok: boolean; browsers?: string[] }>(`/api/system/browsers`);
+      setSystemBrowsers(Array.isArray(resp.browsers) ? resp.browsers : []);
+    } catch (e) {
+      setSystemBrowsersError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
   const onOpenSettings = () => {
     returnFromSettings.current = view.kind === "settings" ? { kind: "list" } : view;
     setSettingsDraft({
@@ -599,6 +612,7 @@ export default function App() {
       ytdlp_cookies_from_browser: clientConfig.ytdlp_cookies_from_browser ?? "",
     });
     setSettingsSavedAt(null);
+    void refreshSystemBrowsers();
     setView({ kind: "settings" });
   };
 
@@ -1349,7 +1363,23 @@ export default function App() {
 	                        <button
 	                          className="btn btn-secondary btn-sm"
 	                          type="button"
-	                          onClick={() => window.open("https://passport.bilibili.com/login", "_blank", "noopener,noreferrer")}
+	                          onClick={() => {
+	                            const url = "https://passport.bilibili.com/login";
+	                            const browser = String(settingsDraft.ytdlp_cookies_from_browser || "").trim();
+	                            if (!browser) {
+	                              window.open(url, "_blank", "noopener,noreferrer");
+	                              return;
+	                            }
+	                            void (async () => {
+	                              try {
+	                                await postJson<{ ok: boolean }>(`/api/system/open-browser`, { browser, url });
+	                              } catch (e) {
+	                                const msg = e instanceof Error ? e.message : String(e);
+	                                alert(`${tr("openBilibiliLogin")} failed: ${msg}`);
+	                                window.open(url, "_blank", "noopener,noreferrer");
+	                              }
+	                            })();
+	                          }}
 	                          data-testid="open-bilibili-login"
 	                        >
 	                          {tr("openBilibiliLogin")}
@@ -1379,6 +1409,12 @@ export default function App() {
 	                        >
 	                          Firefox
 	                        </button>
+	                      </div>
+	                      <div className="text-xs text-dim mt-2">
+	                        {tr("detectedBrowsers")}:{" "}
+	                        <span className="mono">
+	                          {systemBrowsersError ? "n/a" : systemBrowsers ? (systemBrowsers.length > 0 ? systemBrowsers.join(", ") : "n/a") : "…"}
+	                        </span>
 	                      </div>
 	                      <div className="text-xs text-dim mt-2">{tr("cookiesLoginWhat")}</div>
 	                    </div>

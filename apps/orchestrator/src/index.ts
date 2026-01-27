@@ -1,5 +1,6 @@
 import path from "node:path";
 import process from "node:process";
+import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { Readable } from "node:stream";
@@ -167,6 +168,23 @@ app.get("/api/config", (_req, res) => {
   });
 });
 
+app.get("/api/system/browsers", (_req, res) => {
+  res.json({ ok: true, browsers: detectInstalledBrowsers() });
+});
+
+app.post("/api/system/open-browser", (req, res) => {
+  try {
+    const browser = str(req.body?.browser);
+    const url = str(req.body?.url);
+    const r = openUrlInBrowser({ browser, url });
+    if (!r.ok) return res.status(400).json({ ok: false, error: r.error || "failed to open browser" });
+    return res.json({ ok: true });
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    return res.status(500).json({ ok: false, error: message });
+  }
+});
+
 function str(v: unknown): string {
   return String(v ?? "").trim();
 }
@@ -186,6 +204,98 @@ function uniqStrings(xs: string[]): string[] {
 
 function escapeDataUrlSvg(svg: string): string {
   return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
+}
+
+function extractHttpUrls(text: string, max: number): string[] {
+  const t = String(text || "");
+  if (!t) return [];
+
+  const urls: string[] = [];
+  const re = /\bhttps?:\/\/[^\s<>"'`]+/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(t)) && urls.length < max) {
+    const raw = String(m[0] || "");
+    const cleaned = raw.replace(/[)\],.。！？]+$/g, "");
+    if (cleaned.startsWith("http://") || cleaned.startsWith("https://")) urls.push(cleaned);
+  }
+  return uniqStrings(urls).slice(0, max);
+}
+
+function findBrowserExeWindows(browser: string): string | null {
+  const b = String(browser || "").trim().toLowerCase();
+  if (!b) return null;
+
+  const programFiles = process.env.ProgramFiles || "C:\\Program Files";
+  const programFilesX86 = process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)";
+  const localAppData = process.env.LOCALAPPDATA || "";
+
+  const candidates: string[] = [];
+  if (b === "chrome") {
+    candidates.push(
+      path.join(programFiles, "Google", "Chrome", "Application", "chrome.exe"),
+      path.join(programFilesX86, "Google", "Chrome", "Application", "chrome.exe"),
+      localAppData ? path.join(localAppData, "Google", "Chrome", "Application", "chrome.exe") : "",
+    );
+  } else if (b === "edge" || b === "msedge") {
+    candidates.push(
+      path.join(programFiles, "Microsoft", "Edge", "Application", "msedge.exe"),
+      path.join(programFilesX86, "Microsoft", "Edge", "Application", "msedge.exe"),
+      localAppData ? path.join(localAppData, "Microsoft", "Edge", "Application", "msedge.exe") : "",
+    );
+  } else if (b === "firefox") {
+    candidates.push(
+      path.join(programFiles, "Mozilla Firefox", "firefox.exe"),
+      path.join(programFilesX86, "Mozilla Firefox", "firefox.exe"),
+    );
+  } else {
+    return null;
+  }
+
+  for (const c of candidates) {
+    const p = String(c || "").trim();
+    if (!p) continue;
+    if (existsSync(p)) return p;
+  }
+  return null;
+}
+
+function detectInstalledBrowsers(): string[] {
+  if (process.platform !== "win32") return [];
+  const out: string[] = [];
+  for (const b of ["edge", "chrome", "firefox"]) {
+    if (findBrowserExeWindows(b)) out.push(b);
+  }
+  return out;
+}
+
+function openUrlInBrowser(opts: { browser: string; url: string }): { ok: boolean; error?: string } {
+  const url = String(opts.url || "").trim();
+  if (!(url.startsWith("http://") || url.startsWith("https://"))) {
+    return { ok: false, error: "url must start with http:// or https://" };
+  }
+
+  const browser = String(opts.browser || "").trim().toLowerCase();
+  if (!browser) return { ok: false, error: "missing browser" };
+
+  if (process.platform !== "win32") {
+    return { ok: false, error: "open-browser is only implemented on Windows for now" };
+  }
+
+  const exe = findBrowserExeWindows(browser);
+  if (!exe) return { ok: false, error: `browser not found: ${browser}` };
+
+  const args: string[] = [];
+  if (browser === "chrome" || browser === "edge" || browser === "msedge") {
+    args.push("--new-window", url);
+  } else if (browser === "firefox") {
+    args.push("-new-window", url);
+  } else {
+    args.push(url);
+  }
+
+  const child = spawn(exe, args, { detached: true, stdio: "ignore", windowsHide: true });
+  child.unref();
+  return { ok: true };
 }
 
 type OpenAIChatMessage =
@@ -502,27 +612,14 @@ app.post("/api/projects/:projectId/chat/turn", async (req, res) => {
     let videos: ChatVideoCard[] = [];
     let needsConsent = false;
 
-    const shouldSearch = agentPlan.should_search && agentPlan.search_queries && agentPlan.search_queries.length > 0;
-    if (shouldSearch) {
+    const directUrls = extractHttpUrls(userText, 4);
+    if (directUrls.length > 0) {
       const consent = await getConsent(projectId);
       if (!consent?.consented) {
-        agentPlan.reply = `${agentPlan.reply}\n\n要开始联网搜索/解析链接前，请先在本项目完成一次「授权确认」（外部内容提示）。`;
+        agentPlan.reply = `${agentPlan.reply}\n\n要解析你提供的链接前，请先在本项目完成一次「授权确认」（外部内容提示）。`;
         needsConsent = true;
-      } else if (!exaApiKey) {
-        agentPlan.reply = `${agentPlan.reply}\n\nEXA_API_KEY 未设置：暂时没法联网搜索。你可以先在设置里填 Exa API Key，或直接把候选链接贴给我。`;
       } else {
-        const exa = new Exa(exaApiKey);
-        const q0 = str(agentPlan.search_queries[0]);
-        const query = q0.includes("bilibili.com") ? q0 : `${q0} site:bilibili.com`;
-        const raw = await withTimeout(exa.search(query, { numResults: 6 }), 20_000);
-        const results = Array.isArray((raw as any)?.results) ? ((raw as any).results as any[]) : [];
-        const urls = uniqStrings(
-          results
-            .map((r) => (typeof r?.url === "string" ? r.url : ""))
-            .filter((u) => u.startsWith("http")),
-        ).slice(0, 6);
-
-        for (const u of urls) {
+        for (const u of directUrls) {
           try {
             const r = await resolveRemoteInfo(projectId, u, cookiesFromBrowser);
             videos.push({
@@ -535,8 +632,68 @@ app.post("/api/projects/:projectId/chat/turn", async (req, res) => {
               id: r.info.id,
             });
           } catch {
-            // ignore
+            videos.push({ url: u, title: u, description: null, thumbnail: null, duration_s: null, extractor: "unknown", id: "" });
           }
+        }
+      }
+    }
+
+    const shouldSearch = agentPlan.should_search && agentPlan.search_queries && agentPlan.search_queries.length > 0;
+    if (shouldSearch && !needsConsent) {
+      const consent = await getConsent(projectId);
+      if (!consent?.consented) {
+        agentPlan.reply = `${agentPlan.reply}\n\n要开始联网搜索/解析链接前，请先在本项目完成一次「授权确认」（外部内容提示）。`;
+        needsConsent = true;
+      } else if (!exaApiKey) {
+        agentPlan.reply = `${agentPlan.reply}\n\nEXA_API_KEY 未设置：暂时没法联网搜索。你可以先在设置里填 Exa API Key，或直接把候选链接贴给我。`;
+      } else {
+        const exa = new Exa(exaApiKey);
+        const q0 = str(agentPlan.search_queries[0]);
+        const query = q0.includes("bilibili.com") ? q0 : `${q0} site:bilibili.com`;
+        const raw = await withTimeout(exa.search(query, { numResults: 6 }), 20_000);
+        const results = Array.isArray((raw as any)?.results) ? ((raw as any).results as any[]) : [];
+
+        const titleByUrl = new Map<string, string>();
+        for (const r0 of results) {
+          const u = typeof r0?.url === "string" ? r0.url : "";
+          const t = typeof r0?.title === "string" ? r0.title : "";
+          if (!u.startsWith("http")) continue;
+          if (!t.trim()) continue;
+          if (!titleByUrl.has(u)) titleByUrl.set(u, t.trim());
+        }
+
+        const urls = uniqStrings(
+          results
+            .map((r0) => (typeof r0?.url === "string" ? r0.url : ""))
+            .filter((u) => u.startsWith("http")),
+        ).slice(0, 6);
+
+        const existing = new Set(videos.map((v) => v.url));
+        let unresolved = 0;
+        for (const u of urls) {
+          if (existing.has(u)) continue;
+          existing.add(u);
+
+          const fallbackTitle = titleByUrl.get(u) || u;
+          try {
+            const r = await resolveRemoteInfo(projectId, u, cookiesFromBrowser);
+            videos.push({
+              url: r.info.webpage_url || u,
+              title: r.info.title || fallbackTitle,
+              description: r.info.description || null,
+              thumbnail: r.info.thumbnail || null,
+              duration_s: r.info.duration_s ?? null,
+              extractor: r.info.extractor,
+              id: r.info.id,
+            });
+          } catch {
+            unresolved += 1;
+            videos.push({ url: u, title: fallbackTitle, description: null, thumbnail: null, duration_s: null, extractor: "unknown", id: "" });
+          }
+        }
+
+        if (unresolved > 0) {
+          agentPlan.reply = `${agentPlan.reply}\n\n注：部分链接暂时无法解析封面/标题（可能需要登录态）。可以在卡片上点「解析/下载」重试，或在 Settings 配置 Cookies from browser 后再试。`;
         }
 
         if (videos.length > 0) {
@@ -545,6 +702,10 @@ app.post("/api/projects/:projectId/chat/turn", async (req, res) => {
           agentPlan.reply = `${agentPlan.reply}\n\n我搜到了候选链接，但解析标题/封面失败（可能需要登录态或链接不可用）。你也可以直接把 BV 号/链接贴出来，我再帮你解析。`;
         }
       }
+    }
+
+    if (videos.length > 0 && !blocks.some((b) => (b && typeof b === "object" ? (b as any).type === "videos" : false))) {
+      blocks.push({ type: "videos", videos });
     }
 
     const debugArtifact = await toolserverJson<ToolserverArtifact>(`/projects/${projectId}/artifacts/text`, {
