@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import process from "node:process";
@@ -9,18 +9,67 @@ const repoRoot = path.resolve(here, "..");
 const exeName = process.platform === "win32" ? "vidunpack-toolserver.exe" : "vidunpack-toolserver";
 const binPath = path.join(repoRoot, "target", "debug", exeName);
 
+function killChildProcess(child, signal) {
+  if (!child) return;
+  if (typeof child.exitCode === "number") return;
+  const pid = typeof child.pid === "number" ? child.pid : null;
+  try {
+    child.kill(signal);
+  } catch {
+    // ignore
+  }
+
+  if (process.platform === "win32" && pid) {
+    // Best-effort: ensure the child is not left behind when parent is terminated by a supervisor.
+    try {
+      spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore" });
+    } catch {
+      // ignore
+    }
+  }
+}
+
 function spawnOnce(cmd, args) {
   return new Promise((resolve, reject) => {
     const startedAt = Date.now();
     const child = spawn(cmd, args, { stdio: "inherit", env: process.env });
+
+    let killed = false;
+    const kill = (signal) => {
+      if (killed) return;
+      killed = true;
+      killChildProcess(child, signal);
+    };
+
+    const onSigint = () => kill("SIGINT");
+    const onSigterm = () => kill("SIGTERM");
+    const onSigbreak = () => kill("SIGTERM");
+    const onExit = () => kill("SIGTERM");
+
+    process.once("SIGINT", onSigint);
+    process.once("SIGTERM", onSigterm);
+    if (process.platform === "win32") process.once("SIGBREAK", onSigbreak);
+    process.once("exit", onExit);
+
+    const cleanup = () => {
+      process.off("SIGINT", onSigint);
+      process.off("SIGTERM", onSigterm);
+      if (process.platform === "win32") process.off("SIGBREAK", onSigbreak);
+      process.off("exit", onExit);
+    };
+
     child.on("exit", (code, signal) => {
+      cleanup();
       resolve({
         code: typeof code === "number" ? code : 1,
         signal: signal ?? null,
         durationMs: Date.now() - startedAt,
       });
     });
-    child.on("error", (err) => reject(err));
+    child.on("error", (err) => {
+      cleanup();
+      reject(err);
+    });
   });
 }
 
