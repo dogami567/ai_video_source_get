@@ -2069,7 +2069,7 @@ async fn import_remote_media(
     let download = req.download.unwrap_or(false);
     if download && !state.ffmpeg {
         return Err(AppError::PreconditionFailed(
-            "ffmpeg not found on PATH; install ffmpeg to enable URL downloads (mp4 merge)".to_string(),
+            "ffmpeg not found on PATH.\n\nRemote downloads often require ffmpeg to merge video+audio into a single mp4.\n\nInstall ffmpeg and restart toolserver.\n\nWindows (winget): winget install Gyan.FFmpeg\nmacOS (brew):    brew install ffmpeg\nUbuntu/Debian:   sudo apt-get install ffmpeg".to_string(),
         ));
     }
 
