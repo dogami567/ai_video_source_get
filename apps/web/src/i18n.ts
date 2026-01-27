@@ -84,6 +84,10 @@ const en = {
   pending: "Pending",
   enableReasoning: "Enable Reasoning",
   latestPlan: "Latest Plan",
+  toolDeps: "Tool dependencies",
+  toolDepsHint: "Resolve uses yt-dlp. Downloads often require ffmpeg/ffprobe. Restart after installing.",
+  toolDepOk: "ok",
+  toolDepMissing: "missing",
 
   backendOfflineTitle: "Backend is offline",
   backendOfflineDesc: "Start the local dev servers before using this app.",
@@ -155,6 +159,7 @@ const en = {
 
   errEnterUrl: "Please enter a URL",
   errEnterMessage: "Please enter a message",
+  errFfmpegRequiredForDownload: "ffmpeg is required for URL downloads. Install ffmpeg and restart toolserver.",
   errEnterModel: "Please enter a model",
   errPickLocalVideo: "Please select a local video (input_video)",
   errEnterSearchQuery: "Please enter a search query",
@@ -230,6 +235,10 @@ const zhCN: typeof en = {
   openBilibiliLogin: "打开 B 站登录页",
   detectedBrowsers: "检测到的浏览器",
   cookiesLoginWhat: "这里登录的是目标站点（例如 B 站），并且要在你上面选的浏览器“正常模式/默认档案”里登录（别用无痕）。这和 Google/Gemini 没关系。",
+  toolDeps: "工具依赖",
+  toolDepsHint: "解析依赖 yt-dlp；下载通常需要 ffmpeg/ffprobe。安装后请重启后端。",
+  toolDepOk: "可用",
+  toolDepMissing: "缺失",
   settingsKeyPlaceholder: "粘贴你的 API Key",
   settingsEmptyUsesEnv: "留空则使用 .env",
   clear: "清除",
@@ -311,6 +320,7 @@ const zhCN: typeof en = {
 
   errEnterUrl: "请输入 URL",
   errEnterMessage: "请输入内容",
+  errFfmpegRequiredForDownload: "下载链接需要 ffmpeg（用于合并音视频为 mp4）。请安装 ffmpeg 并重启后端。",
   errEnterModel: "请输入 model",
   errPickLocalVideo: "请选择一个本地视频（input_video）",
   errEnterSearchQuery: "请输入 search query",

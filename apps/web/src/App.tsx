@@ -757,6 +757,12 @@ export default function App() {
   const onResolveOrDownloadRemote = async (u: Artifact, download: boolean) => {
     if (view.kind !== "project") return;
     setRemoteError(null);
+
+    if (download && toolHealth && !toolHealth.ffmpeg) {
+      setRemoteError(tr("errFfmpegRequiredForDownload"));
+      return;
+    }
+
     setRemoteBusyId(u.id);
     try {
       const resp = await postJson<ImportRemoteMediaResponse>(`/tool/projects/${view.projectId}/media/remote`, {
@@ -957,6 +963,11 @@ export default function App() {
   const onChatCardResolveOrDownload = async (url: string, download: boolean) => {
     if (view.kind !== "project") return;
     setChatCardError(null);
+
+    if (download && toolHealth && !toolHealth.ffmpeg) {
+      setChatCardError(tr("errFfmpegRequiredForDownload"));
+      return;
+    }
 
     if (!consent?.consented) {
       setConsentModalUrl(url);
@@ -1429,6 +1440,36 @@ export default function App() {
 	                        </span>
 	                      </div>
 	                      <div className="text-xs text-dim mt-2">{tr("cookiesLoginWhat")}</div>
+
+                        <div className="mt-3 border-t border-base pt-3">
+                          <div className="text-xs text-dim mb-1">{tr("toolDeps")}</div>
+                          <div className="text-xs text-muted flex flex-wrap gap-3">
+                            <span>
+                              yt-dlp:{" "}
+                              <span className={toolHealth?.ytdlp ? "text-success" : "text-error"}>
+                                {toolHealth?.ytdlp ? tr("toolDepOk") : tr("toolDepMissing")}
+                              </span>
+                            </span>
+                            <span>
+                              ffmpeg:{" "}
+                              <span className={toolHealth?.ffmpeg ? "text-success" : "text-error"}>
+                                {toolHealth?.ffmpeg ? tr("toolDepOk") : tr("toolDepMissing")}
+                              </span>
+                            </span>
+                            <span>
+                              ffprobe:{" "}
+                              <span className={toolHealth?.ffprobe ? "text-success" : "text-error"}>
+                                {toolHealth?.ffprobe ? tr("toolDepOk") : tr("toolDepMissing")}
+                              </span>
+                            </span>
+                          </div>
+                          <div className="text-xs text-dim mt-2">{tr("toolDepsHint")}</div>
+                          {toolHealth && !toolHealth.ffmpeg ? (
+                            <div className="text-xs text-dim mt-2">
+                              Windows: <span className="mono">winget install Gyan.FFmpeg</span>
+                            </div>
+                          ) : null}
+                        </div>
 	                    </div>
 	                  </div>
 	                </div>
@@ -1571,14 +1612,15 @@ export default function App() {
                                       >
                                         {busy ? "…" : tr("resolve")}
                                       </button>
-                                      <button
-                                        className="btn btn-secondary btn-sm"
-                                        type="button"
-                                        onClick={() => void onResolveOrDownloadRemote(u, true)}
-                                        disabled={busy}
-                                      >
-                                        {busy ? "…" : tr("downloadNow")}
-                                      </button>
+                                       <button
+                                         className="btn btn-secondary btn-sm"
+                                         type="button"
+                                         onClick={() => void onResolveOrDownloadRemote(u, true)}
+                                         disabled={busy || (toolHealth ? !toolHealth.ffmpeg : false)}
+                                         title={toolHealth && !toolHealth.ffmpeg ? tr("errFfmpegRequiredForDownload") : undefined}
+                                       >
+                                         {busy ? "…" : tr("downloadNow")}
+                                       </button>
                                     </div>
                                   </div>
                                 );
@@ -1911,7 +1953,8 @@ export default function App() {
 	                                                                className="btn btn-secondary btn-sm"
 	                                                                type="button"
 	                                                                onClick={() => void onChatCardResolveOrDownload(url, true)}
-	                                                                disabled={!url || busy}
+	                                                                disabled={!url || busy || (toolHealth ? !toolHealth.ffmpeg : false)}
+	                                                                title={toolHealth && !toolHealth.ffmpeg ? tr("errFfmpegRequiredForDownload") : undefined}
 	                                                              >
 	                                                                {busy ? "…" : tr("downloadNow")}
 	                                                              </button>
