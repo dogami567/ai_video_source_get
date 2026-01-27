@@ -2911,9 +2911,6 @@ async fn estimate_export_zip(
     let include_clips = req.include_clips.unwrap_or(false);
     let include_audio = req.include_audio.unwrap_or(false);
     let include_thumbnails = req.include_thumbnails.unwrap_or(false);
-    let include_clips = req.include_clips.unwrap_or(false);
-    let include_audio = req.include_audio.unwrap_or(false);
-    let include_thumbnails = req.include_thumbnails.unwrap_or(false);
 
     let data_dir = state.data_dir.clone();
     let db_path = state.db_path.clone();
@@ -3128,6 +3125,9 @@ async fn export_zip(
     let include_original_video = req.include_original_video.unwrap_or(true);
     let include_report = req.include_report.unwrap_or(true);
     let include_manifest = req.include_manifest.unwrap_or(true);
+    let include_clips = req.include_clips.unwrap_or(false);
+    let include_audio = req.include_audio.unwrap_or(false);
+    let include_thumbnails = req.include_thumbnails.unwrap_or(false);
 
     let data_dir = state.data_dir.clone();
     let db_path = state.db_path.clone();
