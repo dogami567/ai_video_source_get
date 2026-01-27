@@ -12,7 +12,8 @@ npm run dev
 
 打开 `http://127.0.0.1:6785`。
 
-（Windows 一键测试启动）也可以直接双击运行 `run_test.bat`（默认不自动打开浏览器；需要的话可在命令行设置 `AUTO_OPEN=1`）。
+（Windows 一键启动 Web+后端）也可以直接双击运行 `run_test.bat`（默认会自动打开浏览器；如不需要可设置 `AUTO_OPEN=0`；日志在 `data/_logs/run_test.log`）。
+（Windows 端到端验收）可双击运行 `run_e2e.bat`（会启动前后端并跑 Playwright；报告在 `playwright-report/index.html`）。
 （仅启动后端：orchestrator + toolserver）可以运行 `run_backend.bat`。
 
 ## 设置（可选）
