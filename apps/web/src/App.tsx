@@ -124,15 +124,27 @@ function saveClientConfig(cfg: ClientConfig) {
 async function fetchJson<T>(input: string, init?: RequestInit): Promise<T> {
   const res = await fetch(input, init);
   const text = await res.text();
+  const cleaned = text.replace(/^\uFEFF/, "");
+  let parsed: unknown = null;
+  try {
+    parsed = cleaned ? (JSON.parse(cleaned) as unknown) : null;
+  } catch {
+    parsed = null;
+  }
   if (!res.ok) {
-    try {
-      const parsed = JSON.parse(text) as { error?: string };
-      throw new Error(parsed.error || `HTTP ${res.status}`);
-    } catch {
-      throw new Error(text || `HTTP ${res.status}`);
+    if (parsed && typeof parsed === "object") {
+      const obj = parsed as { error?: unknown };
+      if (typeof obj.error === "string" && obj.error.trim()) throw new Error(obj.error);
+    }
+    throw new Error(cleaned || `HTTP ${res.status}`);
+  }
+  if (parsed && typeof parsed === "object") {
+    const obj = parsed as { ok?: unknown; error?: unknown };
+    if (obj.ok === false && typeof obj.error === "string" && obj.error.trim()) {
+      throw new Error(obj.error);
     }
   }
-  return JSON.parse(text) as T;
+  return (parsed === null ? (JSON.parse(cleaned) as T) : (parsed as T));
 }
 
 async function postJson<T>(input: string, body: unknown): Promise<T> {
