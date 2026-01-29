@@ -70,6 +70,10 @@ const en = {
   settingsExa: "Exa",
   settingsExaKey: "Exa API Key",
   settingsExaHint: "Used for search and fetch tools.",
+  settingsGoogle: "Google",
+  settingsGoogleKey: "Google CSE API Key",
+  settingsGoogleCx: "Google CSE CX",
+  settingsGoogleHint: "Optional. If set, Chat will prefer Google Custom Search for web search.",
   settingsDownloader: "Downloader",
   settingsCookiesFromBrowser: "Cookies from browser",
   settingsCookiesFromBrowserHint:
@@ -239,6 +243,10 @@ const zhCN: typeof en = {
   settingsExa: "Exa",
   settingsExaKey: "Exa API Key",
   settingsExaHint: "用于联网搜索与抓取。",
+  settingsGoogle: "Google 搜索",
+  settingsGoogleKey: "Google CSE API Key",
+  settingsGoogleCx: "Google CSE CX",
+  settingsGoogleHint: "可选：填写后，Chat 会优先用 Google 自定义搜索做联网搜索（否则继续用 Exa）。",
   settingsDownloader: "下载/解析",
   settingsCookiesFromBrowser: "从浏览器读取登录态",
   settingsCookiesFromBrowserHint:

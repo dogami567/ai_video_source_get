@@ -18,6 +18,8 @@ type ClientConfig = {
   base_url?: string;
   gemini_api_key?: string;
   exa_api_key?: string;
+  google_cse_api_key?: string;
+  google_cse_cx?: string;
   default_model?: string;
   ytdlp_cookies_from_browser?: string;
 };
@@ -80,12 +82,16 @@ function normalizeClientConfig(cfg: ClientConfig): ClientConfig {
   const baseUrl = cfg.base_url?.trim();
   const geminiKey = cfg.gemini_api_key?.trim();
   const exaKey = cfg.exa_api_key?.trim();
+  const googleKey = cfg.google_cse_api_key?.trim();
+  const googleCx = cfg.google_cse_cx?.trim();
   const defaultModel = cfg.default_model?.trim();
   const ytdlpCookiesFromBrowser = cfg.ytdlp_cookies_from_browser?.trim();
 
   if (baseUrl) out.base_url = baseUrl;
   if (geminiKey) out.gemini_api_key = geminiKey;
   if (exaKey) out.exa_api_key = exaKey;
+  if (googleKey) out.google_cse_api_key = googleKey;
+  if (googleCx) out.google_cse_cx = googleCx;
   if (defaultModel) out.default_model = defaultModel;
   if (ytdlpCookiesFromBrowser) out.ytdlp_cookies_from_browser = ytdlpCookiesFromBrowser;
 
@@ -103,6 +109,8 @@ function loadClientConfig(): ClientConfig {
       base_url: typeof obj.base_url === "string" ? obj.base_url : undefined,
       gemini_api_key: typeof obj.gemini_api_key === "string" ? obj.gemini_api_key : undefined,
       exa_api_key: typeof obj.exa_api_key === "string" ? obj.exa_api_key : undefined,
+      google_cse_api_key: typeof obj.google_cse_api_key === "string" ? obj.google_cse_api_key : undefined,
+      google_cse_cx: typeof obj.google_cse_cx === "string" ? obj.google_cse_cx : undefined,
       default_model: typeof obj.default_model === "string" ? obj.default_model : undefined,
       ytdlp_cookies_from_browser:
         typeof obj.ytdlp_cookies_from_browser === "string" ? obj.ytdlp_cookies_from_browser : undefined,
@@ -435,6 +443,8 @@ export default function App() {
       base_url: cfg.base_url ?? "",
       gemini_api_key: cfg.gemini_api_key ?? "",
       exa_api_key: cfg.exa_api_key ?? "",
+      google_cse_api_key: cfg.google_cse_api_key ?? "",
+      google_cse_cx: cfg.google_cse_cx ?? "",
       default_model: cfg.default_model ?? "",
       ytdlp_cookies_from_browser: cfg.ytdlp_cookies_from_browser ?? "",
     };
@@ -767,6 +777,8 @@ export default function App() {
       base_url: clientConfig.base_url ?? "",
       gemini_api_key: clientConfig.gemini_api_key ?? "",
       exa_api_key: clientConfig.exa_api_key ?? "",
+      google_cse_api_key: clientConfig.google_cse_api_key ?? "",
+      google_cse_cx: clientConfig.google_cse_cx ?? "",
       default_model: clientConfig.default_model ?? "",
       ytdlp_cookies_from_browser: clientConfig.ytdlp_cookies_from_browser ?? "",
     });
@@ -785,6 +797,8 @@ export default function App() {
       base_url: settingsDraft.base_url,
       gemini_api_key: settingsDraft.gemini_api_key,
       exa_api_key: settingsDraft.exa_api_key,
+      google_cse_api_key: settingsDraft.google_cse_api_key,
+      google_cse_cx: settingsDraft.google_cse_cx,
       default_model: settingsDraft.default_model,
       ytdlp_cookies_from_browser: settingsDraft.ytdlp_cookies_from_browser,
     });
@@ -797,7 +811,15 @@ export default function App() {
   const onClearSettings = () => {
     saveClientConfig({});
     setClientConfig({});
-    setSettingsDraft({ base_url: "", gemini_api_key: "", exa_api_key: "", default_model: "", ytdlp_cookies_from_browser: "" });
+    setSettingsDraft({
+      base_url: "",
+      gemini_api_key: "",
+      exa_api_key: "",
+      google_cse_api_key: "",
+      google_cse_cx: "",
+      default_model: "",
+      ytdlp_cookies_from_browser: "",
+    });
     setSettingsSavedAt(Date.now());
     setAnalysisModel(orchConfig?.default_model ?? "gemini-3-preview");
   };
@@ -1089,6 +1111,8 @@ export default function App() {
         base_url: clientConfig.base_url,
         gemini_api_key: clientConfig.gemini_api_key,
         exa_api_key: clientConfig.exa_api_key,
+        google_cse_api_key: clientConfig.google_cse_api_key,
+        google_cse_cx: clientConfig.google_cse_cx,
         default_model: clientConfig.default_model,
         ytdlp_cookies_from_browser: clientConfig.ytdlp_cookies_from_browser,
         attachments: chatAttachments.map((a) => ({
@@ -1127,8 +1151,9 @@ export default function App() {
       });
       setRemoteInfoByUrl((prev) => ({ ...prev, [url]: resp.info }));
       setRemoteInfoArtifactByUrl((prev) => ({ ...prev, [url]: resp.info_artifact }));
-      if (download && resp.input_video) {
-        setRemoteDownloadByUrl((prev) => ({ ...prev, [url]: resp.input_video }));
+      const inputVideo = resp.input_video ?? null;
+      if (download && inputVideo) {
+        setRemoteDownloadByUrl((prev) => ({ ...prev, [url]: inputVideo }));
       }
       await refreshProject(view.projectId);
     } catch (e) {
@@ -1541,6 +1566,40 @@ export default function App() {
                     </div>
 
                     <div className="text-sm text-muted">{tr("settingsExaHint")}</div>
+                  </div>
+
+                  <div className="panel">
+                    <div className="panel-header">
+                      <div className="panel-title">{tr("settingsGoogle")}</div>
+                    </div>
+
+                    <div className="input-group">
+                      <label className="input-label">{tr("settingsGoogleKey")}</label>
+                      <input
+                        className="input-field"
+                        type="password"
+                        data-testid="settings-google-key"
+                        placeholder={tr("settingsKeyPlaceholder")}
+                        value={settingsDraft.google_cse_api_key}
+                        onChange={(e) => setSettingsDraft((p) => ({ ...p, google_cse_api_key: e.target.value }))}
+                      />
+                      <div className="text-xs text-dim mt-1">{tr("settingsEmptyUsesEnv")}</div>
+                    </div>
+
+                    <div className="input-group">
+                      <label className="input-label">{tr("settingsGoogleCx")}</label>
+                      <input
+                        className="input-field"
+                        type="text"
+                        data-testid="settings-google-cx"
+                        placeholder="cx"
+                        value={settingsDraft.google_cse_cx}
+                        onChange={(e) => setSettingsDraft((p) => ({ ...p, google_cse_cx: e.target.value }))}
+                      />
+                      <div className="text-xs text-dim mt-1">{tr("settingsEmptyUsesEnv")}</div>
+                    </div>
+
+                    <div className="text-sm text-muted">{tr("settingsGoogleHint")}</div>
                   </div>
 
                   <div className="panel">

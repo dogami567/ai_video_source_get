@@ -715,6 +715,8 @@ const ChatTurnStateAnnotation = Annotation.Root({
   thinkEnabled: Annotation<boolean>(),
   geminiApiKey: Annotation<string>(),
   exaApiKey: Annotation<string>(),
+  googleCseApiKey: Annotation<string>(),
+  googleCseCx: Annotation<string>(),
   baseUrl: Annotation<string>(),
   model: Annotation<string>(),
   cookiesFromBrowser: Annotation<string>(),
@@ -862,11 +864,135 @@ function scoreByTokens(haystack: string, primary: string[], fallback: string[]):
   return score;
 }
 
+type WebSearchResult = { title: string; url: string; snippet?: string | null };
+
+type WebSearchProvider = "google_cse" | "exa";
+
+async function googleCseSearch(opts: { apiKey: string; cx: string; query: string; numResults: number }): Promise<WebSearchResult[]> {
+  const apiKey = str(opts.apiKey);
+  const cx = str(opts.cx);
+  const query = str(opts.query);
+  const numResults = Math.max(1, Math.min(10, Math.floor(opts.numResults || 5)));
+  if (!apiKey || !cx || !query) return [];
+
+  const url = new URL("https://www.googleapis.com/customsearch/v1");
+  url.searchParams.set("key", apiKey);
+  url.searchParams.set("cx", cx);
+  url.searchParams.set("q", query);
+  url.searchParams.set("num", String(numResults));
+
+  const raw = await fetchJson<any>(url.toString());
+  const items = Array.isArray(raw?.items) ? (raw.items as any[]) : [];
+  const out: WebSearchResult[] = [];
+  for (const it of items) {
+    const u = typeof it?.link === "string" ? it.link : "";
+    const t = typeof it?.title === "string" ? it.title : "";
+    const sn = typeof it?.snippet === "string" ? it.snippet : null;
+    if (!u.startsWith("http")) continue;
+    out.push({ url: u, title: t.trim() || u, snippet: sn });
+  }
+  return out;
+}
+
+async function exaSearch(opts: { apiKey: string; query: string; numResults: number }): Promise<WebSearchResult[]> {
+  const apiKey = str(opts.apiKey);
+  const query = str(opts.query);
+  const numResults = Math.max(1, Math.min(20, Math.floor(opts.numResults || 6)));
+  if (!apiKey || !query) return [];
+
+  const exa = new Exa(apiKey);
+  const raw = await withTimeout(exa.search(query, { numResults }), 20_000);
+  const results = Array.isArray((raw as any)?.results) ? ((raw as any).results as any[]) : [];
+  const out: WebSearchResult[] = [];
+  for (const r0 of results) {
+    const u = typeof r0?.url === "string" ? r0.url : "";
+    const t = typeof r0?.title === "string" ? r0.title : "";
+    if (!u.startsWith("http")) continue;
+    out.push({ url: u, title: t.trim() || u, snippet: null });
+  }
+  return out;
+}
+
+async function webSearch(opts: {
+  query: string;
+  numResults: number;
+  googleApiKey?: string;
+  googleCx?: string;
+  exaApiKey?: string;
+  prefer?: WebSearchProvider;
+}): Promise<{ provider: WebSearchProvider; results: WebSearchResult[] }> {
+  const query = str(opts.query);
+  const numResults = Math.max(1, Math.min(20, Math.floor(opts.numResults || 8)));
+  const hasGoogle = !!str(opts.googleApiKey) && !!str(opts.googleCx);
+  const hasExa = !!str(opts.exaApiKey);
+
+  const prefer: WebSearchProvider = opts.prefer || (hasGoogle ? "google_cse" : "exa");
+  const order: WebSearchProvider[] =
+    prefer === "google_cse" ? ["google_cse", "exa"] : ["exa", "google_cse"];
+
+  for (const provider of order) {
+    if (provider === "google_cse") {
+      if (!hasGoogle) continue;
+      try {
+        const results = await withTimeout(
+          googleCseSearch({
+            apiKey: str(opts.googleApiKey),
+            cx: str(opts.googleCx),
+            query,
+            numResults: Math.min(numResults, 10),
+          }),
+          20_000,
+        );
+        if (results.length > 0) return { provider, results };
+      } catch {
+        // ignore and fallback
+      }
+      continue;
+    }
+
+    // exa
+    if (!hasExa) continue;
+    try {
+      const results = await withTimeout(exaSearch({ apiKey: str(opts.exaApiKey), query, numResults }), 20_000);
+      if (results.length > 0) return { provider, results };
+    } catch {
+      // ignore and fallback
+    }
+  }
+
+  return { provider: prefer, results: [] };
+}
+
 function isLikelyVideoUrl(url: string): boolean {
-  const u = String(url || "").toLowerCase();
+  const raw = String(url || "").trim();
+  const u = raw.toLowerCase();
   if (!u.startsWith("http")) return false;
+
+  // Direct media files.
+  if (/\.(mp4|webm|mkv|mov)(\?|#|$)/i.test(raw)) return true;
+
+  let host = "";
+  try {
+    host = new URL(raw).hostname.toLowerCase();
+  } catch {
+    host = "";
+  }
+
   if (u.includes("bilibili.com/video/")) return true;
-  if (u.includes("b23.tv/")) return true;
+  if (host === "b23.tv") return true;
+
+  if (host.endsWith("youtube.com") && u.includes("watch")) return true;
+  if (host === "youtu.be") return true;
+
+  if (host.endsWith("tiktok.com")) return true;
+  if (host.endsWith("douyin.com")) return true;
+  if (host.endsWith("kuaishou.com")) return true;
+  if (host.endsWith("vimeo.com")) return true;
+  if (host.endsWith("dailymotion.com")) return true;
+
+  if (host.endsWith("twitter.com") || host.endsWith("x.com")) return true;
+  if (host.endsWith("instagram.com")) return true;
+
   return false;
 }
 
@@ -903,12 +1029,13 @@ async function chatTurnPlanNode(state: ChatTurnGraphState) {
 
   const systemPrompt = [
     "You are VidUnpack Chat (视频拆解箱对话助手).",
-    "Goal: chat with the user to clarify their intent, then search for candidate source videos (prefer bilibili) and present them as cards.",
+    "Goal: chat with the user to clarify their intent, then search for candidate source videos and present them as cards.",
     "Rules:",
     "- Ask 1-3 clarifying questions if needed.",
     "- If user pasted exactly one video URL, treat it as the primary reference. If multiple URLs are present, ask which one should be the primary reference before searching.",
     "- Only set should_search=true when you are confident about the topic keywords. Avoid overly broad queries; ensure each search_query contains the main topic keyword(s) from the user message.",
     "- Prefer 2-3 topic-consistent search_queries (do not mix unrelated intents like BGM/tutorial unless the user explicitly asked).",
+    "- Prefer bilibili for Chinese content by default, but if the user asks for external/off-site sources (e.g. YouTube/TikTok), do NOT restrict to bilibili only.",
     "- When ready, output JSON ONLY (no markdown).",
     "- JSON schema:",
     `  { "reply": string, "prompt_draft"?: string, "should_search"?: boolean, "search_queries"?: string[] }`,
@@ -1048,7 +1175,7 @@ async function chatTurnDoResolveDirectUrlsNode(state: ChatTurnGraphState) {
 }
 
 async function chatTurnDoSearchAndResolveNode(state: ChatTurnGraphState) {
-  const { projectId, cookiesFromBrowser, exaApiKey, userText } = state;
+  const { projectId, cookiesFromBrowser, exaApiKey, googleCseApiKey, googleCseCx, userText } = state;
 
   const agentPlan: ChatAgentPlan = state.agentPlan || {
     reply: ensureUserFacingReplyText(""),
@@ -1072,12 +1199,12 @@ async function chatTurnDoSearchAndResolveNode(state: ChatTurnGraphState) {
     return { agentPlan, blocks, videos, needsConsent: true, directResolveCache };
   }
 
-  if (!exaApiKey) {
-    agentPlan.reply = `${ensureUserFacingReplyText(agentPlan.reply)}\n\nEXA_API_KEY 未设置：暂时没法联网搜索。你可以先在设置里填 Exa API Key，或直接把候选链接贴给我。`;
+  const hasGoogle = !!str(googleCseApiKey) && !!str(googleCseCx);
+  const hasExa = !!str(exaApiKey);
+  if (!hasGoogle && !hasExa) {
+    agentPlan.reply = `${ensureUserFacingReplyText(agentPlan.reply)}\n\n联网搜索未配置：请在设置里填 Exa API Key（或 Google CSE API Key + CX），然后再试；也可以直接把候选链接贴给我。`;
     return { agentPlan, blocks, videos, directResolveCache };
   }
-
-  const exa = new Exa(exaApiKey);
   const primaryFocus = expandFocusTokens(focusTokensFromText(userText));
   const fallbackFocus = expandFocusTokens(focusTokensFromText(agentPlan.search_queries.join(" ")));
   const focusForQueryPick = primaryFocus.length > 0 ? primaryFocus : fallbackFocus;
@@ -1089,27 +1216,82 @@ async function chatTurnDoSearchAndResolveNode(state: ChatTurnGraphState) {
   type SearchCandidate = { url: string; title: string; score: number };
   const candidateByUrl = new Map<string, SearchCandidate>();
 
-  for (const q of queries) {
-    const q0 = str(q);
-    if (!q0) continue;
+  const hintText = `${userText} ${rawQueries.join(" ")} ${(state.directUrls || []).join(" ")}`.toLowerCase();
+  const wantsExternal = /外站|站外|youtube|youtu|tiktok|douyin|instagram|twitter|x\\.com/i.test(hintText);
+  const wantsBilibili = /b站|bilibili|b23\\.tv|bilibili\\.com|\\bbv[0-9a-z]{6,}/i.test(hintText);
+  const wantsYoutube = /youtube|youtu|油管/i.test(hintText);
 
-    const q1 = q0.includes("bilibili.com") || /\bsite:/i.test(q0) ? q0 : `${q0} site:bilibili.com`;
+  const preferBilibili = wantsBilibili && !wantsExternal;
+  const preferYoutube = wantsYoutube || wantsExternal;
 
-    let raw: any;
-    try {
-      raw = await withTimeout(exa.search(q1, { numResults: 12 }), 20_000);
-    } catch {
-      continue;
+  const platformBoost = (url: string): number => {
+    const u = String(url || "").toLowerCase();
+    const isBili = u.includes("bilibili.com") || u.includes("b23.tv");
+    const isYt = u.includes("youtube.com") || u.includes("youtu.be");
+
+    if (preferBilibili) {
+      if (isBili) return 2;
+      if (isYt) return -1;
+      return 0;
+    }
+    if (preferYoutube) {
+      if (isYt) return 2;
+      if (isBili) return -1;
+      return 0;
     }
 
-    const results = Array.isArray(raw?.results) ? (raw.results as any[]) : [];
-    for (const r0 of results) {
-      const u = typeof r0?.url === "string" ? r0.url : "";
-      const t = typeof r0?.title === "string" ? r0.title : "";
+    if (isBili || isYt) return 1;
+    return 0;
+  };
+
+  const mainQuery = str(queries[0]);
+  const hasExplicitSiteFilter = /\bsite:/i.test(mainQuery) || /(bilibili\.com|b23\.tv|youtube\.com|youtu\.be)/i.test(mainQuery);
+  const canApplySiteLayer = !!mainQuery && !hasExplicitSiteFilter;
+  const order: Array<"broad" | "bilibili" | "youtube"> = preferBilibili
+    ? ["bilibili", "broad", "youtube"]
+    : preferYoutube
+      ? ["youtube", "broad", "bilibili"]
+      : ["broad", "bilibili", "youtube"];
+
+  const rounds: Array<{ label: string; query: string }> = [];
+  const seenRound = new Set<string>();
+  const pushRound = (label: string, q: string) => {
+    const q0 = str(q);
+    if (!q0) return;
+    if (seenRound.has(q0)) return;
+    seenRound.add(q0);
+    rounds.push({ label, query: q0 });
+  };
+
+  const queryByKind = {
+    broad: mainQuery,
+    bilibili: canApplySiteLayer ? `${mainQuery} site:bilibili.com` : "",
+    youtube: canApplySiteLayer ? `${mainQuery} site:youtube.com` : "",
+  };
+
+  for (const k of order) pushRound(k, queryByKind[k]);
+  for (const q of queries.slice(1)) {
+    if (rounds.length >= 3) break;
+    pushRound("alt", q);
+  }
+
+  for (const { query } of rounds.slice(0, 3)) {
+    const { results } = await webSearch({
+      query,
+      numResults: 12,
+      googleApiKey: googleCseApiKey,
+      googleCx: googleCseCx,
+      exaApiKey,
+    });
+    if (results.length === 0) continue;
+
+    for (const r of results) {
+      const u = str(r.url);
+      const t = str(r.title) || u;
       if (!isLikelyVideoUrl(u)) continue;
 
-      const hay = `${t} ${u}`;
-      const score = scoreByTokens(hay, primaryFocus, fallbackFocus);
+      const hay = `${t} ${u} ${str(r.snippet)}`;
+      const score = scoreByTokens(hay, primaryFocus, fallbackFocus) + platformBoost(u);
       if (score <= 0) continue;
 
       const prev = candidateByUrl.get(u);
@@ -1118,7 +1300,7 @@ async function chatTurnDoSearchAndResolveNode(state: ChatTurnGraphState) {
       }
     }
 
-    // Enough candidates; avoid excess Exa calls
+    // Enough candidates; avoid extra web search calls.
     if (candidateByUrl.size >= 18) break;
   }
 
@@ -1286,6 +1468,8 @@ app.post("/api/projects/:projectId/chat/turn", async (req, res) => {
 
     const geminiApiKey = str(req.body?.gemini_api_key) || str(req.body?.api_key) || str(process.env.GEMINI_API_KEY);
     const exaApiKey = str(req.body?.exa_api_key) || str(req.body?.api_key) || str(process.env.EXA_API_KEY);
+    const googleCseApiKey = str(req.body?.google_cse_api_key) || str(process.env.GOOGLE_CSE_API_KEY);
+    const googleCseCx = str(req.body?.google_cse_cx) || str(process.env.GOOGLE_CSE_CX);
     const baseUrl = str(req.body?.base_url) || str(process.env.BASE_URL) || "https://generativelanguage.googleapis.com";
     const model =
       str(req.body?.model) ||
@@ -1498,6 +1682,8 @@ app.post("/api/projects/:projectId/chat/turn", async (req, res) => {
       thinkEnabled,
       geminiApiKey,
       exaApiKey,
+      googleCseApiKey,
+      googleCseCx,
       baseUrl,
       model,
       cookiesFromBrowser,
