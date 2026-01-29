@@ -764,6 +764,112 @@ function buildAgentPlanFromLlm(text: string, parsed: unknown | null): ChatAgentP
   };
 }
 
+const GENERIC_SEARCH_TOKENS = new Set(
+  [
+    "资源",
+    "素材",
+    "视频",
+    "教程",
+    "合集",
+    "剪辑",
+    "配音",
+    "文案",
+    "模板",
+    "bgm",
+    "音乐",
+    "加速",
+    "高清",
+    "下载",
+    "表情包",
+    "动图",
+    "gif",
+    "png",
+    "jpg",
+    "jpeg",
+    "webp",
+    "mp4",
+    "素材包",
+    "网盘",
+    "链接",
+    "链接解析",
+    "解析",
+    "b站",
+    "bilibili",
+    "site",
+  ].map((s) => s.toLowerCase()),
+);
+
+function normalizeSearchText(text: string): string {
+  return String(text || "")
+    .replace(/\uFEFF/g, "")
+    .replace(/dorof/gi, "doro");
+}
+
+function extractKeywordTokens(text: string): string[] {
+  const t = normalizeSearchText(text);
+  const out: string[] = [];
+
+  // ASCII-ish tokens (doro, nikke, etc)
+  for (const m of t.matchAll(/[A-Za-z0-9]{2,}/g)) {
+    out.push(String(m[0]).toLowerCase());
+  }
+
+  // CJK tokens (连续汉字)
+  for (const m of t.matchAll(/[\p{Script=Han}]{2,}/gu)) {
+    out.push(String(m[0]).toLowerCase());
+  }
+
+  return uniqStrings(out).filter(Boolean);
+}
+
+function focusTokensFromText(text: string): string[] {
+  return extractKeywordTokens(text).filter((tok) => !GENERIC_SEARCH_TOKENS.has(tok));
+}
+
+function expandFocusTokens(tokens: string[]): string[] {
+  const set = new Set(tokens.map((t) => String(t || "").toLowerCase()).filter(Boolean));
+
+  if (set.has("doro")) {
+    for (const s of ["dorothy", "桃乐丝", "多萝", "妮姬", "nikke"]) set.add(s.toLowerCase());
+  }
+
+  return Array.from(set);
+}
+
+function containsAnyToken(haystack: string, tokens: string[]): boolean {
+  const h = String(haystack || "").toLowerCase();
+  return tokens.some((t) => {
+    const tok = String(t || "").toLowerCase();
+    return tok && h.includes(tok);
+  });
+}
+
+function scoreByTokens(haystack: string, primary: string[], fallback: string[]): number {
+  const h = String(haystack || "").toLowerCase();
+  let score = 0;
+
+  const primarySet = new Set(primary.map((t) => String(t || "").toLowerCase()).filter(Boolean));
+  for (const tok of primarySet) {
+    if (h.includes(tok)) score += 3;
+  }
+
+  const fallbackSet = new Set(fallback.map((t) => String(t || "").toLowerCase()).filter(Boolean));
+  for (const tok of fallbackSet) {
+    if (primarySet.has(tok)) continue;
+    if (h.includes(tok)) score += 1;
+  }
+
+  return score;
+}
+
+function isLikelyVideoUrl(url: string): boolean {
+  const u = String(url || "").toLowerCase();
+  if (!u.startsWith("http")) return false;
+  if (u.includes("bilibili.com/video/")) return true;
+  if (u.includes("b23.tv/")) return true;
+  return false;
+}
+
 async function chatTurnPlanNode(state: ChatTurnGraphState) {
   const { projectId, directUrls, cookiesFromBrowser, recent, thinkEnabled, useGeminiNative, baseUrl, model, geminiApiKey } = state;
 
@@ -801,6 +907,8 @@ async function chatTurnPlanNode(state: ChatTurnGraphState) {
     "Rules:",
     "- Ask 1-3 clarifying questions if needed.",
     "- If user pasted exactly one video URL, treat it as the primary reference. If multiple URLs are present, ask which one should be the primary reference before searching.",
+    "- Only set should_search=true when you are confident about the topic keywords. Avoid overly broad queries; ensure each search_query contains the main topic keyword(s) from the user message.",
+    "- Prefer 2-3 topic-consistent search_queries (do not mix unrelated intents like BGM/tutorial unless the user explicitly asked).",
     "- When ready, output JSON ONLY (no markdown).",
     "- JSON schema:",
     `  { "reply": string, "prompt_draft"?: string, "should_search"?: boolean, "search_queries"?: string[] }`,
@@ -842,24 +950,24 @@ async function chatTurnPlanNode(state: ChatTurnGraphState) {
   if (useGeminiNative) {
     const url = new URL(`/v1beta/models/${encodeURIComponent(model)}:generateContent`, baseUrl);
     url.searchParams.set("key", geminiApiKey);
-    llmPayload = await fetchJson<any>(url.toString(), {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        contents,
-        generationConfig: { temperature: 0.4, maxOutputTokens: 1024 },
-      }),
-    });
-  } else {
-    llmPayload = await callChatCompletions({
-      baseUrl,
-      apiKey: geminiApiKey,
-      model,
-      messages: openAiMessages,
-      temperature: 0.4,
-      maxTokens: 1024,
-    });
-  }
+      llmPayload = await fetchJson<any>(url.toString(), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          contents,
+          generationConfig: { temperature: 0.2, maxOutputTokens: 1024 },
+        }),
+      });
+    } else {
+      llmPayload = await callChatCompletions({
+        baseUrl,
+        apiKey: geminiApiKey,
+        model,
+        messages: openAiMessages,
+        temperature: 0.2,
+        maxTokens: 1024,
+      });
+    }
 
   const llmText = useGeminiNative ? extractGeminiText(llmPayload) : extractChatCompletionsText(llmPayload);
   const llmParsed = tryParseJson(llmText);
@@ -940,7 +1048,7 @@ async function chatTurnDoResolveDirectUrlsNode(state: ChatTurnGraphState) {
 }
 
 async function chatTurnDoSearchAndResolveNode(state: ChatTurnGraphState) {
-  const { projectId, cookiesFromBrowser, exaApiKey } = state;
+  const { projectId, cookiesFromBrowser, exaApiKey, userText } = state;
 
   const agentPlan: ChatAgentPlan = state.agentPlan || {
     reply: ensureUserFacingReplyText(""),
@@ -970,35 +1078,63 @@ async function chatTurnDoSearchAndResolveNode(state: ChatTurnGraphState) {
   }
 
   const exa = new Exa(exaApiKey);
-  const q0 = str(agentPlan.search_queries[0]);
-  const query = q0.includes("bilibili.com") ? q0 : `${q0} site:bilibili.com`;
-  const raw = await withTimeout(exa.search(query, { numResults: 6 }), 20_000);
-  const results = Array.isArray((raw as any)?.results) ? ((raw as any).results as any[]) : [];
+  const primaryFocus = expandFocusTokens(focusTokensFromText(userText));
+  const fallbackFocus = expandFocusTokens(focusTokensFromText(agentPlan.search_queries.join(" ")));
+  const focusForQueryPick = primaryFocus.length > 0 ? primaryFocus : fallbackFocus;
 
-  const titleByUrl = new Map<string, string>();
-  for (const r0 of results) {
-    const u = typeof r0?.url === "string" ? r0.url : "";
-    const t = typeof r0?.title === "string" ? r0.title : "";
-    if (!u.startsWith("http")) continue;
-    if (!t.trim()) continue;
-    if (!titleByUrl.has(u)) titleByUrl.set(u, t.trim());
+  const rawQueries = agentPlan.search_queries.map((q) => str(q)).filter(Boolean);
+  const pickedQueries = rawQueries.filter((q) => containsAnyToken(q, focusForQueryPick));
+  const queries = (pickedQueries.length > 0 ? pickedQueries : rawQueries).slice(0, 3);
+
+  type SearchCandidate = { url: string; title: string; score: number };
+  const candidateByUrl = new Map<string, SearchCandidate>();
+
+  for (const q of queries) {
+    const q0 = str(q);
+    if (!q0) continue;
+
+    const q1 = q0.includes("bilibili.com") || /\bsite:/i.test(q0) ? q0 : `${q0} site:bilibili.com`;
+
+    let raw: any;
+    try {
+      raw = await withTimeout(exa.search(q1, { numResults: 12 }), 20_000);
+    } catch {
+      continue;
+    }
+
+    const results = Array.isArray(raw?.results) ? (raw.results as any[]) : [];
+    for (const r0 of results) {
+      const u = typeof r0?.url === "string" ? r0.url : "";
+      const t = typeof r0?.title === "string" ? r0.title : "";
+      if (!isLikelyVideoUrl(u)) continue;
+
+      const hay = `${t} ${u}`;
+      const score = scoreByTokens(hay, primaryFocus, fallbackFocus);
+      if (score <= 0) continue;
+
+      const prev = candidateByUrl.get(u);
+      if (!prev || prev.score < score) {
+        candidateByUrl.set(u, { url: u, title: t.trim() || u, score });
+      }
+    }
+
+    // Enough candidates; avoid excess Exa calls
+    if (candidateByUrl.size >= 18) break;
   }
 
-  const urls = uniqStrings(
-    results
-      .map((r0) => (typeof r0?.url === "string" ? r0.url : ""))
-      .filter((u) => u.startsWith("http")),
-  ).slice(0, 6);
+  const ranked = Array.from(candidateByUrl.values()).sort((a, b) => b.score - a.score);
+  const selected = ranked.slice(0, 6);
 
   const existing = new Set(videos.map((v) => v.url));
   let unresolved = 0;
-  for (const u of urls) {
-    if (existing.has(u)) continue;
-    existing.add(u);
+  for (const cand of selected) {
+    if (existing.has(cand.url)) continue;
+    existing.add(cand.url);
 
-    const fallbackTitle = titleByUrl.get(u) || u;
+    const u = cand.url;
+    const fallbackTitle = cand.title || u;
     try {
-      const r = await resolveRemoteInfo(projectId, u, cookiesFromBrowser);
+      const r = await withTimeout(resolveRemoteInfo(projectId, u, cookiesFromBrowser), 12_000);
       directResolveCache[u] = r;
       videos.push({
         url: r.info.webpage_url || u,
@@ -1013,6 +1149,11 @@ async function chatTurnDoSearchAndResolveNode(state: ChatTurnGraphState) {
       unresolved += 1;
       videos.push({ url: u, title: fallbackTitle, description: null, thumbnail: null, duration_s: null, extractor: "unknown", id: "" });
     }
+  }
+
+  if (videos.length === 0) {
+    agentPlan.reply = `${ensureUserFacingReplyText(agentPlan.reply)}\n\n我搜到了一些结果，但相关度不高，所以先不乱贴链接。你能补充 1 句话吗：你要的是“表情包/图片/GIF 资源包”，还是“相关的视频素材”？也可以直接给一个示例链接/BV 号，我会按它找同类。`;
+    return { agentPlan, blocks, videos, directResolveCache };
   }
 
   if (unresolved > 0) {
