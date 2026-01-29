@@ -41,6 +41,30 @@ if exist "%USERPROFILE%\.cargo\bin\cargo.exe" (
   set "PATH=%USERPROFILE%\.cargo\bin;%PATH%"
 )
 
+REM Project-local tools: ffmpeg + yt-dlp (no system PATH changes)
+set "TOOLS_FFMPEG_BIN=%~dp0tools\ffmpeg\bin"
+set "TOOLS_YTDLP=%~dp0tools\yt-dlp\yt-dlp.exe"
+set "_NEED_TOOLS="
+if not exist "%TOOLS_FFMPEG_BIN%\ffmpeg.exe" (
+  where ffmpeg >nul 2>nul
+  if errorlevel 1 set "_NEED_TOOLS=1"
+)
+if not exist "%TOOLS_YTDLP%" (
+  where yt-dlp >nul 2>nul
+  if errorlevel 1 set "_NEED_TOOLS=1"
+)
+if defined _NEED_TOOLS (
+  echo [vidunpack] Tools missing (ffmpeg/yt-dlp); installing project-local tools...
+  powershell -NoProfile -ExecutionPolicy Bypass -File "scripts\setup_tools.ps1"
+  if errorlevel 1 goto :err
+)
+if exist "%TOOLS_FFMPEG_BIN%\ffmpeg.exe" (
+  set "PATH=%TOOLS_FFMPEG_BIN%;%PATH%"
+)
+if exist "%TOOLS_YTDLP%" (
+  set "YTDLP_PATH=%TOOLS_YTDLP%"
+)
+
 REM Resolve config (env > .env > defaults) and export to child processes.
 set "_ORCH_PORT=%ORCHESTRATOR_PORT%"
 set "_TOOL_PORT=%TOOLSERVER_PORT%"

@@ -31,6 +31,9 @@ data/
 playwright-report/
 test-results/
 
+# Project-local tools (downloaded binaries)
+tools/
+
 # Python (legacy)
 __pycache__/
 *.py[cod]
