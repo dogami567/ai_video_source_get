@@ -9,7 +9,7 @@ REM Log file (helps when the window flashes and closes)
 set "LOG_DIR=data\_logs"
 set "LOG_FILE=%LOG_DIR%\run_e2e.log"
 if not exist "%LOG_DIR%\" mkdir "%LOG_DIR%" >nul 2>nul
-echo ==== %DATE% %TIME% ==== > "%LOG_FILE%" 2>nul
+type nul > "%LOG_FILE%" 2>nul
 
 REM Create .env if missing (edit keys if needed)
 if not exist ".env" (
