@@ -140,20 +140,44 @@ function tryParseJson(text: string): unknown | null {
   const trimmed = text.trim();
   if (!trimmed) return null;
 
-  try {
-    return JSON.parse(trimmed);
-  } catch {
-    // Try ```json ... ```
-    const m = trimmed.match(/```json\\s*([\\s\\S]*?)\\s*```/i);
-    if (m?.[1]) {
-      try {
-        return JSON.parse(m[1].trim());
-      } catch {
-        return null;
-      }
+  const tryParse = (s: string): unknown | null => {
+    const t = String(s || "").trim();
+    if (!t) return null;
+    try {
+      return JSON.parse(t);
+    } catch {
+      return null;
     }
-    return null;
+  };
+
+  // 1) Direct parse (already valid JSON).
+  const direct = tryParse(trimmed);
+  if (direct != null) return direct;
+
+  // 2) Fenced blocks: ```json ...```, ``` ...```, or ``` json ...```
+  const fence = trimmed.match(/```(?:\s*json)?\s*([\s\S]*?)\s*```/i);
+  if (fence?.[1]) {
+    const parsed = tryParse(fence[1]);
+    if (parsed != null) return parsed;
   }
+
+  // 3) Best-effort substring extraction from the first "{" to last "}".
+  const i0 = trimmed.indexOf("{");
+  const i1 = trimmed.lastIndexOf("}");
+  if (i0 >= 0 && i1 > i0) {
+    const parsed = tryParse(trimmed.slice(i0, i1 + 1));
+    if (parsed != null) return parsed;
+  }
+
+  // 4) Arrays too.
+  const a0 = trimmed.indexOf("[");
+  const a1 = trimmed.lastIndexOf("]");
+  if (a0 >= 0 && a1 > a0) {
+    const parsed = tryParse(trimmed.slice(a0, a1 + 1));
+    if (parsed != null) return parsed;
+  }
+
+  return null;
 }
 
 app.get("/api/health", (_req, res) => {
@@ -502,6 +526,166 @@ async function resolveRemoteInfo(
   });
 }
 
+async function downloadRemoteMedia(
+  projectId: string,
+  url: string,
+  cookiesFromBrowser?: string,
+): Promise<ToolserverImportRemoteMediaResponse> {
+  return toolserverJson<ToolserverImportRemoteMediaResponse>(`/projects/${projectId}/media/remote`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      url,
+      download: true,
+      cookies_from_browser: cookiesFromBrowser || undefined,
+    }),
+  });
+}
+
+function wantsVideoAnalysis(text: string): boolean {
+  const t = String(text || "");
+  return /分析|拆解|创作|制作|怎么做|镜头|剪辑|节奏|结构|脚本|配音/i.test(t);
+}
+
+function formatAnalysisForChat(parsed: unknown, fallbackText: string): string {
+  const isObj = (v: unknown): v is Record<string, any> => typeof v === "object" && v !== null && !Array.isArray(v);
+  const toStrList = (v: unknown): string[] =>
+    Array.isArray(v) ? v.map((x) => String(x ?? "").trim()).filter(Boolean) : [];
+
+  if (!isObj(parsed)) {
+    // Avoid dumping raw JSON back to the user.
+    const t = String(fallbackText || "").trim();
+    if (!t || t.startsWith("{") || t.startsWith("[") || t.startsWith("```")) {
+      return "我已经完成视频切片分析，但模型返回格式不规范（已保存原始结果到项目产物）。你可以在 Workspace → Artifacts 里打开最新的 analysis_gemini 查看。";
+    }
+    return t;
+  }
+
+  const summary = typeof parsed.summary === "string" ? parsed.summary.trim() : "";
+  const voiceOver = typeof parsed.voice_over === "string" ? parsed.voice_over.trim() : "";
+  const editingSteps = toStrList(parsed.editing_steps);
+  const likelyAssets = toStrList(parsed.likely_assets);
+  const searchQueries = toStrList(parsed.search_queries);
+  const extraClips = Array.isArray(parsed.extra_clips_needed) ? parsed.extra_clips_needed : [];
+
+  const lines: string[] = [];
+  lines.push("我已对视频做了切片分析（开头/中段/结尾）。");
+  if (summary) {
+    lines.push("", "【概览】", summary);
+  }
+  if (editingSteps.length > 0) {
+    lines.push("", "【剪辑结构】", ...editingSteps.map((s, i) => `${i + 1}. ${s}`));
+  }
+  if (likelyAssets.length > 0) {
+    lines.push("", "【关键素材/元素】", ...likelyAssets.map((s) => `- ${s}`));
+  }
+  if (voiceOver) {
+    lines.push("", "【配音/字幕】", voiceOver);
+  }
+  if (searchQueries.length > 0) {
+    lines.push("", "【可用于找同类素材的关键词】", ...searchQueries.map((q) => `- ${q}`));
+  }
+  if (extraClips.length > 0) {
+    lines.push("", "【还想补采的片段】", "我建议再补几个更精准的片段（已在分析结果里列出原因）。");
+  }
+  return lines.join("\n");
+}
+
+async function runGeminiVideoAnalysis(opts: {
+  projectId: string;
+  apiKey: string;
+  baseUrl: string;
+  model: string;
+  useGeminiNative: boolean;
+  inputVideoArtifactId: string;
+}): Promise<{ artifact: ToolserverArtifact; text: string; parsed: unknown | null; clips: ToolserverArtifact[] }> {
+  const pipeline = await toolserverJson<ToolserverFfmpegPipeline>(`/projects/${opts.projectId}/pipeline/ffmpeg`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ input_video_artifact_id: opts.inputVideoArtifactId }),
+  });
+
+  const clips = pipeline.clips.slice(0, 3);
+  if (clips.length === 0) throw new Error("ffmpeg pipeline returned no clips");
+
+  const profilePrompt = await getProfilePrompt();
+  const promptText = [
+    "You are VidUnpack (视频拆解箱).",
+    "Analyze the provided video clips (start/mid/end) and infer how this video was made.",
+    "Return JSON only (no markdown) with keys:",
+    "- summary",
+    "- likely_assets (array)",
+    "- voice_over (how it was made; platform guesses)",
+    "- editing_steps (short steps)",
+    "- search_queries (array, for finding assets)",
+    "- extra_clips_needed (array of {start_s,duration_s,reason})",
+    ...(profilePrompt ? ["", "User profile (cross-project preferences):", profilePrompt] : []),
+  ].join("\n");
+
+  const parts: any[] = [{ text: promptText }];
+  const openAiContent: any[] = [{ type: "text", text: promptText }];
+
+  for (const clip of clips) {
+    const abs = path.join(dataDir, clip.path);
+    const buf = await readFile(abs);
+    const b64 = buf.toString("base64");
+    parts.push({ inline_data: { mime_type: "video/mp4", data: b64 } });
+    openAiContent.push({ type: "image_url", image_url: { url: `data:video/mp4;base64,${b64}` } });
+  }
+
+  let llmPayload: any;
+  if (opts.useGeminiNative) {
+    const url = new URL(`/v1beta/models/${encodeURIComponent(opts.model)}:generateContent`, opts.baseUrl);
+    url.searchParams.set("key", opts.apiKey);
+    llmPayload = await fetchJson<any>(url.toString(), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts }],
+        generationConfig: { temperature: 0.2, maxOutputTokens: 2048 },
+      }),
+    });
+  } else {
+    llmPayload = await callChatCompletions({
+      baseUrl: opts.baseUrl,
+      apiKey: opts.apiKey,
+      model: opts.model,
+      messages: [{ role: "user", content: openAiContent }],
+      temperature: 0.2,
+      maxTokens: 2048,
+    });
+  }
+
+  const text = opts.useGeminiNative ? extractGeminiText(llmPayload) : extractChatCompletionsText(llmPayload);
+  const parsed = tryParseJson(text);
+
+  const outPath = `analysis/gemini-${Date.now()}.json`;
+  const artifact = await toolserverJson<ToolserverArtifact>(`/projects/${opts.projectId}/artifacts/text`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      kind: "analysis_gemini",
+      out_path: outPath,
+      content: JSON.stringify(
+        {
+          provider: opts.useGeminiNative ? "gemini_native" : "openai_compat",
+          base_url: opts.baseUrl,
+          model: opts.model,
+          input_video_artifact_id: opts.inputVideoArtifactId,
+          clips,
+          llm: llmPayload,
+          text,
+          parsed,
+        },
+        null,
+        2,
+      ),
+    }),
+  });
+
+  return { artifact, text, parsed, clips };
+}
+
 type ChatVideoCard = {
   url: string;
   title: string;
@@ -529,6 +713,9 @@ app.post("/api/projects/:projectId/chat/turn", async (req, res) => {
 
     const userText = String(req.body?.message || "").trimEnd();
     if (!userText.trim()) return res.status(400).json({ ok: false, error: "missing message" });
+
+    const directUrls = extractHttpUrls(userText, 4);
+    const wantsAnalysis = wantsVideoAnalysis(userText);
 
     const attachmentsRaw = Array.isArray(req.body?.attachments) ? req.body.attachments : [];
     const attachments = attachmentsRaw
@@ -606,6 +793,141 @@ app.post("/api/projects/:projectId/chat/turn", async (req, res) => {
         "API key is not set. Open Settings and set the API Key first, then try again.",
       );
       return res.json({ ok: true, user_message: userMessage, assistant_message: assistantMessage });
+    }
+
+    if (wantsAnalysis) {
+      // If the user asks to analyze "this video", try to run the local clip pipeline + Gemini analysis.
+      // We prefer an already-downloaded/ imported input_video; if none exists, we can download from the first URL (when auto_confirm is enabled).
+      let inputVideoArtifactId = "";
+      try {
+        const artifacts = await toolserverJson<ToolserverArtifact[]>(`/projects/${projectId}/artifacts`);
+        const inputs = artifacts
+          .filter((a) => a.kind === "input_video")
+          .sort((a, b) => (b.created_at_ms || 0) - (a.created_at_ms || 0));
+        if (inputs[0]?.id) inputVideoArtifactId = inputs[0].id;
+      } catch {
+        // ignore
+      }
+
+      const blocks: any[] = [];
+      let cards: ChatVideoCard[] = [];
+
+      if (!inputVideoArtifactId && directUrls.length > 0) {
+        const consent = await getConsent(projectId);
+        if (!consent?.consented) {
+          const assistantMessage = await createChatMessage(
+            projectId,
+            chatId,
+            "assistant",
+            "我可以通过“切片 → Gemini”来分析你发的视频链接，但需要你先完成一次「授权确认」。请先在页面弹窗里确认授权，然后再发一句“开始分析”。",
+          );
+          return res.json({ ok: true, needs_consent: true, user_message: userMessage, assistant_message: assistantMessage });
+        }
+
+        // Best-effort: still render a card for what the user pasted.
+        try {
+          const r = await resolveRemoteInfo(projectId, directUrls[0], cookiesFromBrowser);
+          cards.push({
+            url: r.info.webpage_url || directUrls[0],
+            title: r.info.title || directUrls[0],
+            description: r.info.description || null,
+            thumbnail: r.info.thumbnail || null,
+            duration_s: r.info.duration_s ?? null,
+            extractor: r.info.extractor,
+            id: r.info.id,
+          });
+        } catch {
+          // ignore card failure
+        }
+
+        if (cards.length > 0) blocks.push({ type: "videos", videos: cards });
+
+        if (consent?.auto_confirm === false) {
+          const assistantMessage = await createChatMessage(
+            projectId,
+            chatId,
+            "assistant",
+            "我可以做切片分析，但你已关闭“自动确认下载”。请在卡片上点「下载」把视频保存到项目里，然后再发一句“开始分析”。",
+            blocks.length > 0 ? { blocks } : undefined,
+          );
+          return res.json({ ok: true, user_message: userMessage, assistant_message: assistantMessage });
+        }
+
+        // Auto-download for analysis (user asked to analyze and auto_confirm is enabled).
+        try {
+          const dl = await downloadRemoteMedia(projectId, directUrls[0], cookiesFromBrowser);
+          if (dl.input_video?.id) inputVideoArtifactId = dl.input_video.id;
+          if (cards.length === 0) {
+            cards.push({
+              url: dl.info.webpage_url || directUrls[0],
+              title: dl.info.title || directUrls[0],
+              description: dl.info.description || null,
+              thumbnail: dl.info.thumbnail || null,
+              duration_s: dl.info.duration_s ?? null,
+              extractor: dl.info.extractor,
+              id: dl.info.id,
+            });
+            blocks.push({ type: "videos", videos: cards });
+          }
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          const assistantMessage = await createChatMessage(
+            projectId,
+            chatId,
+            "assistant",
+            `下载失败：${msg}\n\n你可以先在卡片上点「下载」重试（或在 Settings 配置 Cookies from browser），下载成功后再发一句“开始分析”。`,
+            blocks.length > 0 ? { blocks } : undefined,
+          );
+          return res.json({ ok: true, user_message: userMessage, assistant_message: assistantMessage });
+        }
+      }
+
+      if (!inputVideoArtifactId) {
+        const assistantMessage = await createChatMessage(
+          projectId,
+          chatId,
+          "assistant",
+          directUrls.length > 0
+            ? "我可以做切片分析，但目前项目里还没有可用的视频文件。请先在卡片上点「下载」（或在 Workspace 上传本地视频），然后再发一句“开始分析”。"
+            : "我可以做切片分析，但你还没导入视频。请先上传/下载一个视频到项目里，然后再说“分析这个视频”。",
+          blocks.length > 0 ? { blocks } : undefined,
+        );
+        return res.json({ ok: true, user_message: userMessage, assistant_message: assistantMessage });
+      }
+
+      try {
+        const analysis = await runGeminiVideoAnalysis({
+          projectId,
+          apiKey: geminiApiKey,
+          baseUrl,
+          model,
+          useGeminiNative,
+          inputVideoArtifactId,
+        });
+
+        const reply = formatAnalysisForChat(analysis.parsed, analysis.text);
+        const assistantMessage = await createChatMessage(projectId, chatId, "assistant", reply, {
+          blocks,
+          analysis_artifact: analysis.artifact,
+        });
+
+        return res.json({
+          ok: true,
+          user_message: userMessage,
+          assistant_message: assistantMessage,
+          analysis_artifact: analysis.artifact,
+        });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        const assistantMessage = await createChatMessage(
+          projectId,
+          chatId,
+          "assistant",
+          `切片分析失败：${msg}\n\n常见原因：未安装 ffmpeg、视频未下载完成、或 Gemini/代理不支持视频输入。你可以先确认 Workspace 里有 input_video，然后在 Workspace → Analysis 手动跑一次。`,
+          blocks.length > 0 ? { blocks } : undefined,
+        );
+        return res.json({ ok: true, user_message: userMessage, assistant_message: assistantMessage });
+      }
     }
 
     const history = await getChatMessages(projectId, chatId);
@@ -692,7 +1014,6 @@ app.post("/api/projects/:projectId/chat/turn", async (req, res) => {
     let videos: ChatVideoCard[] = [];
     let needsConsent = false;
 
-    const directUrls = extractHttpUrls(userText, 4);
     if (directUrls.length > 0) {
       const consent = await getConsent(projectId);
       if (!consent?.consented) {
