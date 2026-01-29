@@ -9,7 +9,7 @@ use axum::{
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::{
     io::ErrorKind,
     net::SocketAddr,
@@ -75,7 +75,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/profile", get(get_profile))
         .route("/profile/reset", post(reset_profile))
         .route("/projects", post(create_project).get(list_projects))
-        .route("/projects/{id}", get(get_project))
+        .route("/projects/batch_delete", post(batch_delete_projects))
+        .route("/projects/{id}", get(get_project).delete(delete_project))
         .route("/projects/{id}/consent", get(get_consent).post(upsert_consent))
         .route("/projects/{id}/settings", get(get_project_settings).post(update_project_settings))
         .route("/projects/{id}/artifacts", get(list_artifacts))
@@ -578,6 +579,13 @@ struct ProjectResponse {
     created_at_ms: i64,
 }
 
+fn is_safe_project_id_for_fs(id: &str) -> bool {
+    !id.trim().is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 async fn create_project(State(state): State<AppState>, Json(req): Json<CreateProjectRequest>) -> AppResult<Json<ProjectResponse>> {
     let title = req.title.unwrap_or_default();
     let project_id = Uuid::new_v4().to_string();
@@ -671,6 +679,166 @@ async fn get_project(State(state): State<AppState>, Path(id): Path<String>) -> A
         Some(p) => Ok(Json(p)),
         None => Err(AppError::NotFound("project not found".to_string())),
     }
+}
+
+#[derive(Serialize)]
+struct DeleteProjectResponse {
+    ok: bool,
+    project_id: String,
+    removed_dir: bool,
+}
+
+async fn delete_project(State(state): State<AppState>, Path(project_id): Path<String>) -> AppResult<Json<DeleteProjectResponse>> {
+    if project_id.trim().is_empty() {
+        return Err(AppError::BadRequest("missing project id".to_string()));
+    }
+    if !is_safe_project_id_for_fs(&project_id) {
+        return Err(AppError::BadRequest("invalid project id".to_string()));
+    }
+
+    let data_dir = state.data_dir.clone();
+    let db_path = state.db_path.clone();
+    let project_id_for_res = project_id.clone();
+
+    let removed_dir = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<bool>> {
+        let mut conn = Connection::open(&db_path)?;
+        let exists: bool = conn
+            .query_row("SELECT 1 FROM projects WHERE id = ?1", [&project_id], |_row| Ok(()))
+            .optional()?
+            .is_some();
+        if !exists {
+            return Ok(None);
+        }
+
+        let tx = conn.transaction()?;
+
+        tx.execute("DELETE FROM chat_messages WHERE project_id = ?1", [&project_id])?;
+        tx.execute("DELETE FROM chats WHERE project_id = ?1", [&project_id])?;
+        tx.execute("DELETE FROM pool_items WHERE project_id = ?1", [&project_id])?;
+        tx.execute("DELETE FROM artifacts WHERE project_id = ?1", [&project_id])?;
+        tx.execute("DELETE FROM runs WHERE project_id = ?1", [&project_id])?;
+        tx.execute("DELETE FROM consents WHERE project_id = ?1", [&project_id])?;
+        tx.execute("DELETE FROM project_settings WHERE project_id = ?1", [&project_id])?;
+        tx.execute("DELETE FROM events WHERE project_id = ?1", [&project_id])?;
+        tx.execute("DELETE FROM projects WHERE id = ?1", [&project_id])?;
+
+        tx.commit()?;
+
+        let project_dir = data_dir.join("projects").join(&project_id);
+        let removed_dir = if project_dir.exists() {
+            std::fs::remove_dir_all(&project_dir).is_ok()
+        } else {
+            false
+        };
+
+        Ok(Some(removed_dir))
+    })
+    .await
+    .context("delete_project task failed")??;
+
+    match removed_dir {
+        Some(removed) => Ok(Json(DeleteProjectResponse {
+            ok: true,
+            project_id: project_id_for_res,
+            removed_dir: removed,
+        })),
+        None => Err(AppError::NotFound("project not found".to_string())),
+    }
+}
+
+#[derive(Deserialize)]
+struct BatchDeleteProjectsRequest {
+    ids: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct BatchDeleteProjectsResponse {
+    ok: bool,
+    deleted_ids: Vec<String>,
+    missing_ids: Vec<String>,
+    removed_dirs: Vec<String>,
+}
+
+async fn batch_delete_projects(
+    State(state): State<AppState>,
+    Json(req): Json<BatchDeleteProjectsRequest>,
+) -> AppResult<Json<BatchDeleteProjectsResponse>> {
+    if req.ids.is_empty() {
+        return Err(AppError::BadRequest("missing ids".to_string()));
+    }
+
+    let mut ids: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for raw in req.ids {
+        let id = raw.trim().to_string();
+        if id.is_empty() {
+            continue;
+        }
+        if !is_safe_project_id_for_fs(&id) {
+            return Err(AppError::BadRequest("invalid project id".to_string()));
+        }
+        if seen.insert(id.clone()) {
+            ids.push(id);
+        }
+    }
+    if ids.is_empty() {
+        return Err(AppError::BadRequest("missing ids".to_string()));
+    }
+
+    let data_dir = state.data_dir.clone();
+    let db_path = state.db_path.clone();
+
+    let (deleted_ids, missing_ids, removed_dirs) =
+        tokio::task::spawn_blocking(move || -> anyhow::Result<(Vec<String>, Vec<String>, Vec<String>)> {
+            let mut conn = Connection::open(&db_path)?;
+            let tx = conn.transaction()?;
+
+            let mut deleted_ids: Vec<String> = Vec::new();
+            let mut missing_ids: Vec<String> = Vec::new();
+
+            for project_id in &ids {
+                let exists: bool = tx
+                    .query_row("SELECT 1 FROM projects WHERE id = ?1", [project_id], |_row| Ok(()))
+                    .optional()?
+                    .is_some();
+                if !exists {
+                    missing_ids.push(project_id.clone());
+                    continue;
+                }
+
+                tx.execute("DELETE FROM chat_messages WHERE project_id = ?1", [project_id])?;
+                tx.execute("DELETE FROM chats WHERE project_id = ?1", [project_id])?;
+                tx.execute("DELETE FROM pool_items WHERE project_id = ?1", [project_id])?;
+                tx.execute("DELETE FROM artifacts WHERE project_id = ?1", [project_id])?;
+                tx.execute("DELETE FROM runs WHERE project_id = ?1", [project_id])?;
+                tx.execute("DELETE FROM consents WHERE project_id = ?1", [project_id])?;
+                tx.execute("DELETE FROM project_settings WHERE project_id = ?1", [project_id])?;
+                tx.execute("DELETE FROM events WHERE project_id = ?1", [project_id])?;
+                tx.execute("DELETE FROM projects WHERE id = ?1", [project_id])?;
+                deleted_ids.push(project_id.clone());
+            }
+
+            tx.commit()?;
+
+            let mut removed_dirs: Vec<String> = Vec::new();
+            for project_id in &deleted_ids {
+                let project_dir = data_dir.join("projects").join(project_id);
+                if project_dir.exists() && std::fs::remove_dir_all(&project_dir).is_ok() {
+                    removed_dirs.push(project_id.clone());
+                }
+            }
+
+            Ok((deleted_ids, missing_ids, removed_dirs))
+        })
+        .await
+        .context("batch_delete_projects task failed")??;
+
+    Ok(Json(BatchDeleteProjectsResponse {
+        ok: true,
+        deleted_ids,
+        missing_ids,
+        removed_dirs,
+    }))
 }
 
 #[derive(Serialize)]
