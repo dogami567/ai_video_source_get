@@ -33,6 +33,10 @@ const en = {
   created: "Created",
   action: "Action",
   open: "Open",
+  delete: "Delete",
+  deleteSelected: "Delete Selected ({count})",
+  confirmDeleteProject: "Delete project \"{title}\"? This cannot be undone.",
+  confirmDeleteSelected: "Delete {count} selected projects? This cannot be undone.",
   untitled: "Untitled",
 
   backToProjects: "Projects",
@@ -195,6 +199,10 @@ const zhCN: typeof en = {
   created: "创建时间",
   action: "操作",
   open: "打开",
+  delete: "删除",
+  deleteSelected: "批量删除（{count}）",
+  confirmDeleteProject: "确定删除项目「{title}」吗？此操作不可撤销。",
+  confirmDeleteSelected: "确定删除已选的 {count} 个项目吗？此操作不可撤销。",
   untitled: "未命名",
 
   backToProjects: "项目",

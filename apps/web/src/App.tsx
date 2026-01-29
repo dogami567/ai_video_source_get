@@ -225,11 +225,17 @@ const ProjectList = ({
   projects,
   loading,
   error,
+  deleteBusy,
+  selectedProjectIds,
   createBusy,
   createTitle,
   setCreateTitle,
   onCreate,
   onOpen,
+  onDelete,
+  onToggleSelectProject,
+  onToggleSelectAll,
+  onDeleteSelected,
   onRefresh,
   onOpenSettings,
   tr,
@@ -237,21 +243,40 @@ const ProjectList = ({
   projects: Project[];
   loading: boolean;
   error: string | null;
+  deleteBusy: boolean;
+  selectedProjectIds: Set<string>;
   createBusy: boolean;
   createTitle: string;
   setCreateTitle: (s: string) => void;
   onCreate: () => void;
   onOpen: (id: string) => void;
+  onDelete: (id: string, title: string) => void;
+  onToggleSelectProject: (id: string) => void;
+  onToggleSelectAll: () => void;
+  onDeleteSelected: () => void;
   onRefresh: () => void;
   onOpenSettings: () => void;
-  tr: (k: MessageKey) => string;
-}) => (
-  <div className="panel animate-enter">
+  tr: (k: MessageKey, vars?: I18nVars) => string;
+}) => {
+  const allSelected = projects.length > 0 && projects.every((p) => selectedProjectIds.has(p.id));
+  const selectedCount = selectedProjectIds.size;
+  return (
+    <div className="panel animate-enter">
     <div className="panel-header">
       <div className="panel-title">{tr("projects")}</div>
-      <button className="btn btn-ghost btn-sm" onClick={onRefresh} disabled={loading} data-testid="refresh-projects">
-        {tr("refresh")}
-      </button>
+      <div className="flex gap-2 items-center">
+        <button
+          className="btn btn-ghost btn-sm"
+          onClick={onDeleteSelected}
+          disabled={loading || deleteBusy || selectedCount === 0}
+          data-testid="delete-selected-projects"
+        >
+          {tr("deleteSelected", { count: selectedCount })}
+        </button>
+        <button className="btn btn-ghost btn-sm" onClick={onRefresh} disabled={loading} data-testid="refresh-projects">
+          {tr("refresh")}
+        </button>
+      </div>
     </div>
 
     <div className="flex gap-2 mb-6">
@@ -296,6 +321,15 @@ const ProjectList = ({
         <table className="data-table">
           <thead>
             <tr>
+              <th className="text-center" style={{ width: 44 }}>
+                <input
+                  type="checkbox"
+                  checked={allSelected}
+                  onChange={onToggleSelectAll}
+                  aria-label="Select all projects"
+                  data-testid="select-all-projects"
+                />
+              </th>
               <th>{tr("title")}</th>
               <th>{tr("created")}</th>
               <th className="text-right">{tr("action")}</th>
@@ -304,16 +338,35 @@ const ProjectList = ({
           <tbody>
             {projects.map((p) => (
               <tr key={p.id}>
+                <td className="text-center">
+                  <input
+                    type="checkbox"
+                    checked={selectedProjectIds.has(p.id)}
+                    onChange={() => onToggleSelectProject(p.id)}
+                    aria-label={`Select ${p.title || tr("untitled")}`}
+                    data-testid={`select-project-${p.id}`}
+                  />
+                </td>
                 <td className="font-medium text-main">{p.title || tr("untitled")}</td>
                 <td className="mono text-xs text-muted">{formatTs(p.created_at_ms)}</td>
                 <td className="text-right">
-                  <button
-                    className="btn btn-secondary btn-sm"
-                    onClick={() => onOpen(p.id)}
-                    data-testid={`open-project-${p.id}`}
-                  >
-                    {tr("open")}
-                  </button>
+                  <div className="flex gap-2 items-center" style={{ justifyContent: "flex-end" }}>
+                    <button
+                      className="btn btn-secondary btn-sm"
+                      onClick={() => onOpen(p.id)}
+                      data-testid={`open-project-${p.id}`}
+                    >
+                      {tr("open")}
+                    </button>
+                    <button
+                      className="btn btn-ghost btn-sm text-error"
+                      onClick={() => onDelete(p.id, p.title || tr("untitled"))}
+                      disabled={deleteBusy}
+                      data-testid={`delete-project-${p.id}`}
+                    >
+                      {tr("delete")}
+                    </button>
+                  </div>
                 </td>
               </tr>
             ))}
@@ -322,7 +375,8 @@ const ProjectList = ({
       </div>
     )}
   </div>
-);
+  );
+};
 
 // --- Main App ---
 
@@ -351,6 +405,8 @@ export default function App() {
   const [projects, setProjects] = React.useState<Project[]>([]);
   const [projectsError, setProjectsError] = React.useState<string | null>(null);
   const [projectsLoading, setProjectsLoading] = React.useState(false);
+  const [projectsDeleteBusy, setProjectsDeleteBusy] = React.useState(false);
+  const [selectedProjectIds, setSelectedProjectIds] = React.useState<Set<string>>(() => new Set());
 
   const [createTitle, setCreateTitle] = React.useState("");
   const [createBusy, setCreateBusy] = React.useState(false);
@@ -492,6 +548,14 @@ export default function App() {
     try {
       const list = await fetchJson<Project[]>("/tool/projects");
       setProjects(list);
+      setSelectedProjectIds((prev) => {
+        const existing = new Set(list.map((p) => p.id));
+        const next = new Set<string>();
+        for (const id of prev) {
+          if (existing.has(id)) next.add(id);
+        }
+        return next;
+      });
     } catch (e) {
       setProjectsError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -526,6 +590,66 @@ export default function App() {
     void refreshHealth();
     void refreshProjects();
   }, [refreshHealth, refreshProjects]);
+
+  const toggleSelectProject = React.useCallback((id: string) => {
+    setSelectedProjectIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const toggleSelectAllProjects = React.useCallback(() => {
+    setSelectedProjectIds((prev) => {
+      const allIds = projects.map((p) => p.id);
+      const allSelected = allIds.length > 0 && allIds.every((id) => prev.has(id));
+      return allSelected ? new Set() : new Set(allIds);
+    });
+  }, [projects]);
+
+  const deleteProject = React.useCallback(
+    async (id: string, title: string) => {
+      if (projectsDeleteBusy) return;
+      const ok = window.confirm(tr("confirmDeleteProject", { title }));
+      if (!ok) return;
+      setProjectsDeleteBusy(true);
+      setProjectsError(null);
+      try {
+        await fetchJson<{ ok: boolean }>(`/tool/projects/${id}`, { method: "DELETE" });
+        setSelectedProjectIds((prev) => {
+          const next = new Set(prev);
+          next.delete(id);
+          return next;
+        });
+        await refreshProjects();
+      } catch (e) {
+        setProjectsError(e instanceof Error ? e.message : String(e));
+      } finally {
+        setProjectsDeleteBusy(false);
+      }
+    },
+    [projectsDeleteBusy, refreshProjects, tr],
+  );
+
+  const deleteSelectedProjects = React.useCallback(async () => {
+    if (projectsDeleteBusy) return;
+    const ids = Array.from(selectedProjectIds);
+    if (ids.length === 0) return;
+    const ok = window.confirm(tr("confirmDeleteSelected", { count: ids.length }));
+    if (!ok) return;
+    setProjectsDeleteBusy(true);
+    setProjectsError(null);
+    try {
+      await postJson<{ ok: boolean }>(`/tool/projects/batch_delete`, { ids });
+      setSelectedProjectIds(new Set());
+      await refreshProjects();
+    } catch (e) {
+      setProjectsError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setProjectsDeleteBusy(false);
+    }
+  }, [projectsDeleteBusy, refreshProjects, selectedProjectIds, tr]);
 
   // Dev UX: orchestrator may start a bit later than Vite; keep retrying health until both services are up.
   React.useEffect(() => {
@@ -1272,11 +1396,17 @@ export default function App() {
               projects={projects}
               loading={projectsLoading}
               error={projectsError}
+              deleteBusy={projectsDeleteBusy}
+              selectedProjectIds={selectedProjectIds}
               createBusy={createBusy}
               createTitle={createTitle}
               setCreateTitle={setCreateTitle}
               onCreate={onCreateProject}
               onOpen={onOpenProject}
+              onDelete={deleteProject}
+              onToggleSelectProject={toggleSelectProject}
+              onToggleSelectAll={toggleSelectAllProjects}
+              onDeleteSelected={deleteSelectedProjects}
               onRefresh={refreshProjects}
               onOpenSettings={onOpenSettings}
               tr={tr}

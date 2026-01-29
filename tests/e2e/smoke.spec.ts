@@ -62,7 +62,8 @@ test("smoke: non-API flows (settings, project, import, export)", async ({ page, 
   const placeholderAfter = await createInput.getAttribute("placeholder");
   expect(placeholderAfter).not.toBe(placeholderBefore);
 
-  await createInput.fill(`e2e-${Date.now()}`);
+  const projectTitle = `e2e-${Date.now()}`;
+  await createInput.fill(projectTitle);
   await page.getByTestId("create-project-btn").click();
   await expect(page.getByTestId("back-to-list")).toBeVisible();
 
@@ -110,4 +111,9 @@ test("smoke: non-API flows (settings, project, import, export)", async ({ page, 
   // Back to project list should still work.
   await page.getByTestId("back-to-list").click();
   await expect(page.getByTestId("create-project-input")).toBeVisible();
+
+  // Delete the created project (single delete).
+  page.once("dialog", (d) => d.accept());
+  await page.locator("tr", { hasText: projectTitle }).locator('button[data-testid^="delete-project-"]').click();
+  await expect(page.getByText(projectTitle)).toHaveCount(0);
 });
