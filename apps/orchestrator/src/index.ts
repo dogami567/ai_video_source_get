@@ -544,7 +544,7 @@ async function downloadRemoteMedia(
 
 function wantsVideoAnalysis(text: string): boolean {
   const t = String(text || "");
-  return /分析|拆解|创作|制作|怎么做|镜头|剪辑|节奏|结构|脚本|配音/i.test(t);
+  return /分析|拆解|创作|制作|怎么做|镜头|剪辑|节奏|结构|脚本|配音|想做(这类|这种|同款|类似)/i.test(t);
 }
 
 function formatAnalysisForChat(parsed: unknown, fallbackText: string): string {
@@ -933,23 +933,52 @@ app.post("/api/projects/:projectId/chat/turn", async (req, res) => {
     const history = await getChatMessages(projectId, chatId);
     const recent = history.slice(Math.max(0, history.length - 12));
 
+    const directResolveCache = new Map<string, ToolserverImportRemoteMediaResponse>();
+    let referenceForPrompt = "";
+    if (directUrls.length > 0) {
+      const refUrl = directUrls[0];
+      const consent = await getConsent(projectId);
+      if (consent?.consented) {
+        try {
+          const r = await withTimeout(resolveRemoteInfo(projectId, refUrl, cookiesFromBrowser), 12_000);
+          directResolveCache.set(refUrl, r);
+          referenceForPrompt = [
+            "User provided a reference video URL (treat as primary reference; do NOT guess topic beyond metadata):",
+            `- title: ${r.info.title}`,
+            `- url: ${r.info.webpage_url || refUrl}`,
+            r.info.description ? `- description: ${r.info.description}` : "",
+            r.info.duration_s != null ? `- duration_s: ${r.info.duration_s}` : "",
+            r.info.extractor ? `- extractor: ${r.info.extractor}` : "",
+          ]
+            .filter(Boolean)
+            .join("\n");
+        } catch {
+          referenceForPrompt = `User provided a reference URL: ${refUrl} (title/cover may require clicking Resolve/Download or browser cookies). Do NOT guess its topic.`;
+        }
+      } else {
+        referenceForPrompt = `User provided a reference URL: ${refUrl} (cannot fetch metadata before consent). Do NOT guess its topic.`;
+      }
+    }
+
     const systemPrompt = [
       "You are VidUnpack Chat (视频拆解箱对话助手).",
       "Goal: chat with the user to clarify their intent, then search for candidate source videos (prefer bilibili) and present them as cards.",
       "Rules:",
       "- Ask 1-3 clarifying questions if needed.",
+      "- If user pasted video URL(s), the FIRST URL is the primary reference. Base your reply on it and do NOT speculate about its topic unless provided in metadata.",
       "- When ready, output JSON ONLY (no markdown).",
       "- JSON schema:",
       `  { "reply": string, "prompt_draft"?: string, "should_search"?: boolean, "search_queries"?: string[] }`,
       "- Use Chinese in reply when user is Chinese.",
       "- search_queries should be short and actionable; include platform hints if relevant.",
+      ...(referenceForPrompt ? ["", referenceForPrompt] : []),
     ].join("\n");
 
     const contents = [
       { role: "user", parts: [{ text: systemPrompt }] },
       ...recent.map((m) => ({
         role: m.role === "assistant" ? "model" : "user",
-        parts: [{ text: `${m.role}: ${m.content}` }],
+        parts: [{ text: m.content || "" }],
       })),
     ];
 
@@ -1006,6 +1035,19 @@ app.post("/api/projects/:projectId/chat/turn", async (req, res) => {
       search_queries: Array.isArray(parsedObj?.search_queries) ? parsedObj.search_queries.map((s: any) => String(s)) : [],
     };
 
+    // Always anchor the assistant reply on the user's first pasted URL (avoid hallucinated topic labels).
+    if (directUrls.length > 0) {
+      const refUrl = directUrls[0];
+      const cached = directResolveCache.get(refUrl);
+      const refTitle = cached?.info?.title ? String(cached.info.title).trim() : "";
+      const prefix = refTitle ? `收到：你给的参考视频是「${refTitle}」。` : `收到：你给的参考链接是 ${refUrl}。`;
+      const hasRef =
+        (refTitle && agentPlan.reply.includes(refTitle)) || agentPlan.reply.includes(refUrl) || agentPlan.reply.includes(refUrl.replace(/^https?:\/\//, ""));
+      if (!hasRef) {
+        agentPlan.reply = `${prefix}\n\n${agentPlan.reply || "我先确认下你的目标，然后帮你找同类素材。"}\n`;
+      }
+    }
+
     const blocks: any[] = [];
     if (agentPlan.prompt_draft && agentPlan.prompt_draft.trim()) {
       blocks.push({ type: "prompt", title: "Prompt", text: agentPlan.prompt_draft.trim() });
@@ -1022,7 +1064,8 @@ app.post("/api/projects/:projectId/chat/turn", async (req, res) => {
       } else {
         for (const u of directUrls) {
           try {
-            const r = await resolveRemoteInfo(projectId, u, cookiesFromBrowser);
+            const r = directResolveCache.get(u) || (await resolveRemoteInfo(projectId, u, cookiesFromBrowser));
+            if (!directResolveCache.has(u)) directResolveCache.set(u, r);
             videos.push({
               url: r.info.webpage_url || u,
               title: r.info.title || u,
