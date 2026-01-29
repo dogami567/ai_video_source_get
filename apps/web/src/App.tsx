@@ -174,6 +174,17 @@ function bytesToSize(bytes: number) {
   return `${n.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
 }
 
+function proxyImageUrl(url: string, referer: string): string {
+  const u = String(url || "").trim();
+  if (!u) return "";
+  if (u.startsWith("data:") || u.startsWith("blob:")) return u;
+  if (u.startsWith("http://") || u.startsWith("https://")) {
+    const qs = new URLSearchParams({ url: u, referer: String(referer || "").trim() }).toString();
+    return `/api/proxy/image?${qs}`;
+  }
+  return u;
+}
+
 // --- Components ---
 
 const Header = ({
@@ -450,6 +461,7 @@ export default function App() {
   const [remoteBusyId, setRemoteBusyId] = React.useState<string | null>(null);
   const [remoteError, setRemoteError] = React.useState<string | null>(null);
   const [remoteInfoByUrl, setRemoteInfoByUrl] = React.useState<Record<string, RemoteMediaInfoSummary>>({});
+  const [remoteDownloadByUrl, setRemoteDownloadByUrl] = React.useState<Record<string, Artifact>>({});
 
   const [analysisModel, setAnalysisModel] = React.useState(() => clientConfig.default_model ?? "gemini-3-preview");
   const [analysisVideoArtifactId, setAnalysisVideoArtifactId] = React.useState<string>("");
@@ -500,6 +512,14 @@ export default function App() {
   const [consentModalOpen, setConsentModalOpen] = React.useState(false);
   const [consentModalAutoConfirm, setConsentModalAutoConfirm] = React.useState(true);
   const [consentModalUrl, setConsentModalUrl] = React.useState<string | null>(null);
+  const [consentModalNextAction, setConsentModalNextAction] = React.useState<
+    | {
+        kind: "chatCardRemote";
+        url: string;
+        download: boolean;
+      }
+    | null
+  >(null);
   const [consentModalBusy, setConsentModalBusy] = React.useState(false);
   const [consentModalError, setConsentModalError] = React.useState<string | null>(null);
 
@@ -1084,6 +1104,32 @@ export default function App() {
     }
   };
 
+  const runChatCardRemote = async (url: string, download: boolean) => {
+    if (view.kind !== "project") return;
+    setChatCardBusyUrl(url);
+    try {
+      // Save URL into project inputs for traceability (avoid duplicating if already saved).
+      if (!artifacts.some((a) => a.kind === "input_url" && a.path === url)) {
+        await postJson<Artifact>(`/tool/projects/${view.projectId}/inputs/url`, { url });
+      }
+
+      const resp = await postJson<ImportRemoteMediaResponse>(`/tool/projects/${view.projectId}/media/remote`, {
+        url,
+        download,
+        cookies_from_browser: clientConfig.ytdlp_cookies_from_browser,
+      });
+      setRemoteInfoByUrl((prev) => ({ ...prev, [url]: resp.info }));
+      if (download && resp.input_video) {
+        setRemoteDownloadByUrl((prev) => ({ ...prev, [url]: resp.input_video }));
+      }
+      await refreshProject(view.projectId);
+    } catch (e) {
+      setChatCardError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setChatCardBusyUrl(null);
+    }
+  };
+
   const onChatCardResolveOrDownload = async (url: string, download: boolean) => {
     if (view.kind !== "project") return;
     setChatCardError(null);
@@ -1095,24 +1141,12 @@ export default function App() {
 
     if (!consent?.consented) {
       setConsentModalUrl(url);
+      setConsentModalNextAction({ kind: "chatCardRemote", url, download });
       setConsentModalOpen(true);
       return;
     }
 
-    setChatCardBusyUrl(url);
-    try {
-      const resp = await postJson<ImportRemoteMediaResponse>(`/tool/projects/${view.projectId}/media/remote`, {
-        url,
-        download,
-        cookies_from_browser: clientConfig.ytdlp_cookies_from_browser,
-      });
-      setRemoteInfoByUrl((prev) => ({ ...prev, [url]: resp.info }));
-      await refreshProject(view.projectId);
-    } catch (e) {
-      setChatCardError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setChatCardBusyUrl(null);
-    }
+    await runChatCardRemote(url, download);
   };
 
   const onRunAnalysis = async () => {
@@ -1332,6 +1366,7 @@ export default function App() {
     if (view.kind !== "project") return;
     if (!consentModalUrl) return;
 
+    const next = consentModalNextAction;
     setConsentModalBusy(true);
     setConsentModalError(null);
     try {
@@ -1344,7 +1379,12 @@ export default function App() {
       setInputUrl("");
       setConsentModalOpen(false);
       setConsentModalUrl(null);
+      setConsentModalNextAction(null);
       await refreshProject(view.projectId);
+
+      if (next?.kind === "chatCardRemote") {
+        await runChatCardRemote(next.url, next.download);
+      }
     } catch (e) {
       setConsentModalError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -2053,17 +2093,21 @@ export default function App() {
 	                                                  <div className="video-cards">
 	                                                    {videos.map((v, vi) => {
 	                                                      const url = typeof v?.url === "string" ? v.url : "";
-	                                                      const title = typeof v?.title === "string" ? v.title : url;
-	                                                      const desc = typeof v?.description === "string" ? v.description : null;
-	                                                      const thumb = typeof v?.thumbnail === "string" ? v.thumbnail : null;
+	                                                      const resolved = url ? remoteInfoByUrl[url] : undefined;
+	                                                      const downloaded = url ? remoteDownloadByUrl[url] : undefined;
+	                                                      const title = resolved?.title ?? (typeof v?.title === "string" ? v.title : url);
+	                                                      const desc =
+	                                                        resolved?.description ?? (typeof v?.description === "string" ? v.description : null);
+	                                                      const thumb = resolved?.thumbnail ?? (typeof v?.thumbnail === "string" ? v.thumbnail : null);
+	                                                      const thumbSrc = thumb && url ? proxyImageUrl(thumb, url) : "";
 	                                                      const busy = chatCardBusyUrl === url;
 	                                                      return (
 	                                                        <div key={`${url}-${vi}`} className="video-card" data-testid="chat-video-card">
-	                                                          {thumb ? (
-	                                                            <img className="video-thumb" src={thumb} alt="" />
-	                                                          ) : (
-	                                                            <div className="video-thumb placeholder" />
-	                                                          )}
+	                                                          <div
+	                                                            className={`video-thumb${thumbSrc ? "" : " placeholder"}`}
+	                                                            style={thumbSrc ? { backgroundImage: `url(${thumbSrc})` } : undefined}
+	                                                            data-testid={`chat-video-thumb-${vi}`}
+	                                                          />
 	                                                          <div className="video-info">
 	                                                            <a className="video-title" href={url} target="_blank" rel="noreferrer">
 	                                                              {title}
@@ -2076,6 +2120,7 @@ export default function App() {
 	                                                                type="button"
 	                                                                onClick={() => void onChatCardResolveOrDownload(url, false)}
 	                                                                disabled={!url || busy}
+	                                                                data-testid={`chat-video-resolve-${vi}`}
 	                                                              >
 	                                                                {busy ? "…" : tr("resolve")}
 	                                                              </button>
@@ -2085,10 +2130,34 @@ export default function App() {
 	                                                                onClick={() => void onChatCardResolveOrDownload(url, true)}
 	                                                                disabled={!url || busy || (toolHealth ? !toolHealth.ffmpeg : false)}
 	                                                                title={toolHealth && !toolHealth.ffmpeg ? tr("errFfmpegRequiredForDownload") : undefined}
+	                                                                data-testid={`chat-video-download-${vi}`}
 	                                                              >
 	                                                                {busy ? "…" : tr("downloadNow")}
 	                                                              </button>
 	                                                            </div>
+	                                                            {(resolved || downloaded) && (
+	                                                              <div className="text-xs text-muted">
+	                                                                {resolved ? (
+	                                                                  <span className="text-success" data-testid={`chat-video-resolved-${vi}`}>
+	                                                                    ✓ {tr("resolvedOk")}
+	                                                                  </span>
+	                                                                ) : null}
+	                                                                {downloaded ? (
+	                                                                  <>
+	                                                                    {resolved ? <span className="text-dim"> • </span> : null}
+	                                                                    <a
+	                                                                      className="text-primary"
+	                                                                      href={`/tool/projects/${view.projectId}/artifacts/${downloaded.id}/raw`}
+	                                                                      target="_blank"
+	                                                                      rel="noreferrer"
+	                                                                      data-testid={`chat-video-downloaded-${vi}`}
+	                                                                    >
+	                                                                      ✓ {tr("openDownloadedVideo")}
+	                                                                    </a>
+	                                                                  </>
+	                                                                ) : null}
+	                                                              </div>
+	                                                            )}
 	                                                          </div>
 	                                                        </div>
 	                                                      );
@@ -2379,12 +2448,16 @@ export default function App() {
               {consentModalError && <div className="alert mb-4">{consentModalError}</div>}
 
                <div className="flex justify-end gap-3">
-                 <button
-                   className="btn btn-ghost"
-                   onClick={() => setConsentModalOpen(false)}
-                   disabled={consentModalBusy}
-                   data-testid="consent-cancel"
-                 >
+                  <button
+                    className="btn btn-ghost"
+                    onClick={() => {
+                      setConsentModalOpen(false);
+                      setConsentModalUrl(null);
+                      setConsentModalNextAction(null);
+                    }}
+                    disabled={consentModalBusy}
+                    data-testid="consent-cancel"
+                  >
                      {tr("cancel")}
                   </button>
                  <button

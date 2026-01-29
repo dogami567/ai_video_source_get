@@ -580,7 +580,9 @@ table.data-table {
   width: 112px;
   height: 64px;
   border-radius: var(--radius-md);
-  object-fit: cover;
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
   background-color: var(--bg-input);
   flex-shrink: 0;
   border: 1px solid rgba(0, 0, 0, 0.04);
@@ -598,10 +600,12 @@ table.data-table {
 .video-title {
   font-weight: 600;
   color: var(--text-main);
-  display: block;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 .video-desc {
   font-size: 12px;
@@ -637,8 +641,8 @@ table.data-table {
 }
 .chat-textarea {
   resize: none;
-  min-height: 44px;
-  max-height: 160px;
+  min-height: 64px;
+  max-height: 260px;
 }
 
 .chat-attachments {

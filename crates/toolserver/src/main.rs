@@ -1947,6 +1947,24 @@ async fn add_input_url(
             return Ok(None);
         }
 
+        // Dedupe: avoid creating multiple identical input_url artifacts.
+        if let Some((existing_id, existing_created_at_ms)) = conn
+            .query_row(
+                "SELECT id, created_at_ms FROM artifacts WHERE project_id = ?1 AND kind = 'input_url' AND path = ?2 ORDER BY created_at_ms DESC LIMIT 1",
+                params![&project_id, &url],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .optional()?
+        {
+            return Ok(Some(ArtifactResponse {
+                id: existing_id,
+                project_id,
+                kind: "input_url".to_string(),
+                path: url,
+                created_at_ms: existing_created_at_ms,
+            }));
+        }
+
         let id = Uuid::new_v4().to_string();
         let created_at_ms = now_ms();
         conn.execute(

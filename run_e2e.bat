@@ -5,6 +5,9 @@ cd /d "%~dp0"
 
 title VidUnpack E2E
 
+REM Prefer UTF-8 output for clearer logs (best-effort).
+chcp 65001 >nul 2>nul
+
 REM Log file (helps when the window flashes and closes)
 set "LOG_DIR=data\_logs"
 set "LOG_FILE=%LOG_DIR%\run_e2e.log"
@@ -28,9 +31,9 @@ if errorlevel 1 (
   exit /b 1
 )
 
-where npm >nul 2>nul
+where npm.cmd >nul 2>nul
 if errorlevel 1 (
-  echo [vidunpack] ERROR: npm not found on PATH.
+  echo [vidunpack] ERROR: npm.cmd not found on PATH.
   echo [vidunpack] Reinstall Node.js ^(npm is included^) and try again.
   pause
   exit /b 1
@@ -44,26 +47,26 @@ if exist "%USERPROFILE%\.cargo\bin\cargo.exe" (
 REM Project-local tools: ffmpeg + yt-dlp (no system PATH changes)
 set "TOOLS_FFMPEG_BIN=%~dp0tools\ffmpeg\bin"
 set "TOOLS_YTDLP=%~dp0tools\yt-dlp\yt-dlp.exe"
-set "_NEED_TOOLS="
 if not exist "%TOOLS_FFMPEG_BIN%\ffmpeg.exe" (
   where ffmpeg >nul 2>nul
-  if errorlevel 1 set "_NEED_TOOLS=1"
+  if errorlevel 1 (
+    echo [vidunpack] ERROR: ffmpeg not found.
+    echo [vidunpack] Run setup_tools.bat to install project-local tools.
+    pause
+    exit /b 1
+  )
 )
 if not exist "%TOOLS_YTDLP%" (
   where yt-dlp >nul 2>nul
-  if errorlevel 1 set "_NEED_TOOLS=1"
+  if errorlevel 1 (
+    echo [vidunpack] ERROR: yt-dlp not found.
+    echo [vidunpack] Run setup_tools.bat to install project-local tools.
+    pause
+    exit /b 1
+  )
 )
-if defined _NEED_TOOLS (
-  echo [vidunpack] Tools missing: ffmpeg/yt-dlp; installing project-local tools...
-  powershell -NoProfile -ExecutionPolicy Bypass -File "scripts\setup_tools.ps1"
-  if errorlevel 1 goto :err
-)
-if exist "%TOOLS_FFMPEG_BIN%\ffmpeg.exe" (
-  set "PATH=%TOOLS_FFMPEG_BIN%;%PATH%"
-)
-if exist "%TOOLS_YTDLP%" (
-  set "YTDLP_PATH=%TOOLS_YTDLP%"
-)
+if exist "%TOOLS_FFMPEG_BIN%\ffmpeg.exe" set "PATH=%TOOLS_FFMPEG_BIN%;%PATH%"
+if exist "%TOOLS_YTDLP%" set "YTDLP_PATH=%TOOLS_YTDLP%"
 
 REM E2E defaults (isolated data dir)
 if "%DATA_DIR%"=="" set "DATA_DIR=data\_e2e_dev"
@@ -72,26 +75,31 @@ if "%ORCHESTRATOR_PORT%"=="" set "ORCHESTRATOR_PORT=6790"
 if "%TOOLSERVER_PORT%"=="" set "TOOLSERVER_PORT=6791"
 if "%E2E_MOCK_CHAT%"=="" set "E2E_MOCK_CHAT=1"
 
-REM Install deps if needed (playwright + dev tools required)
-set "_NEED_INSTALL="
-if not exist "node_modules\" set "_NEED_INSTALL=1"
-if not exist "node_modules\.bin\playwright.cmd" if not exist "node_modules\.bin\playwright" set "_NEED_INSTALL=1"
-if not exist "node_modules\.bin\concurrently.cmd" if not exist "node_modules\.bin\concurrently" set "_NEED_INSTALL=1"
-if not exist "node_modules\.bin\tsx.cmd" if not exist "node_modules\.bin\tsx" set "_NEED_INSTALL=1"
+REM Keep Playwright browsers inside this repo if installed via setup_tools.bat.
+if "%PLAYWRIGHT_BROWSERS_PATH%"=="" set "PLAYWRIGHT_BROWSERS_PATH=0"
 
-if defined _NEED_INSTALL (
-  echo [vidunpack] Installing npm dependencies ^(including dev^)...
-  call npm install --production=false
-  if errorlevel 1 goto :err
+REM No auto-install here. If deps are missing, instruct user to run setup_tools.bat.
+if not exist "node_modules\" (
+  echo [vidunpack] ERROR: node_modules not found.
+  echo [vidunpack] Run setup_tools.bat first.
+  pause
+  exit /b 1
+)
+if not exist "node_modules\\.bin\\playwright.cmd" (
+  echo [vidunpack] ERROR: Playwright not found in node_modules.
+  echo [vidunpack] Run setup_tools.bat first.
+  pause
+  exit /b 1
 )
 
 echo [vidunpack] Running Playwright E2E (dev config)
 echo [vidunpack] WEB_PORT=%WEB_PORT% ORCHESTRATOR_PORT=%ORCHESTRATOR_PORT% TOOLSERVER_PORT=%TOOLSERVER_PORT% DATA_DIR=%DATA_DIR%
 echo [vidunpack] Log: %LOG_FILE%
-echo [vidunpack] Tip: if Playwright browser is missing, run: npx playwright install chromium
+echo [vidunpack] Tip: if Playwright browser is missing, run: setup_tools.bat
 
 REM Use PowerShell Tee-Object to show logs AND write to file, preserving exit code.
-powershell -NoProfile -Command "& { npm run test:e2e:dev 2>&1 | Tee-Object -FilePath '%LOG_FILE%' -Append; exit $LASTEXITCODE }"
+REM Run npm.cmd to avoid PowerShell script-policy issues with npm.ps1 on some machines.
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& { cmd /c \"npm.cmd run test:e2e:dev\" 2>&1 | Tee-Object -FilePath '%LOG_FILE%' -Append; exit $LASTEXITCODE }"
 if errorlevel 1 goto :err
 
 echo.

@@ -185,6 +185,83 @@ app.post("/api/system/open-browser", (req, res) => {
   }
 });
 
+function isPrivateHostname(hostname: string): boolean {
+  const h = String(hostname || "").trim().toLowerCase();
+  if (!h) return true;
+  if (h === "localhost") return true;
+  if (h === "::1") return true;
+
+  // IPv4 private ranges
+  const m = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (m) {
+    const n = m.slice(1).map((s) => Number(s));
+    if (n.some((x) => !Number.isFinite(x) || x < 0 || x > 255)) return true;
+    const [a, b] = n;
+    if (a === 10) return true;
+    if (a === 127) return true;
+    if (a === 0) return true;
+    if (a === 169 && b === 254) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+  }
+
+  return false;
+}
+
+app.get("/api/proxy/image", async (req, res) => {
+  try {
+    const urlRaw = str((req.query as any)?.url);
+    const refererRaw = str((req.query as any)?.referer);
+    if (!urlRaw) return res.status(400).json({ ok: false, error: "missing url" });
+    if (!(urlRaw.startsWith("http://") || urlRaw.startsWith("https://"))) {
+      return res.status(400).json({ ok: false, error: "url must start with http:// or https://" });
+    }
+
+    let parsed: URL;
+    try {
+      parsed = new URL(urlRaw);
+    } catch {
+      return res.status(400).json({ ok: false, error: "invalid url" });
+    }
+    if (isPrivateHostname(parsed.hostname)) {
+      return res.status(400).json({ ok: false, error: "refusing to proxy private/local addresses" });
+    }
+
+    const headers: Record<string, string> = {
+      "user-agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+      accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    };
+    if (refererRaw && (refererRaw.startsWith("http://") || refererRaw.startsWith("https://"))) headers.Referer = refererRaw;
+
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 15_000);
+    const upstream = await fetch(urlRaw, { headers, signal: ctrl.signal });
+    clearTimeout(timer);
+
+    if (!upstream.ok) {
+      return res.status(502).json({ ok: false, error: `image proxy failed: HTTP ${upstream.status}` });
+    }
+
+    const contentType = upstream.headers.get("content-type") || "application/octet-stream";
+    const contentLength = upstream.headers.get("content-length");
+
+    res.status(200);
+    res.setHeader("content-type", contentType);
+    if (contentLength) res.setHeader("content-length", contentLength);
+    res.setHeader("cache-control", "public, max-age=3600");
+
+    if (upstream.body) {
+      Readable.fromWeb(upstream.body as any).pipe(res);
+    } else {
+      res.end();
+    }
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    return res.status(502).json({ ok: false, error: `image proxy failed: ${message}` });
+  }
+});
+
 function str(v: unknown): string {
   return String(v ?? "").trim();
 }
@@ -489,9 +566,12 @@ app.post("/api/projects/:projectId/chat/turn", async (req, res) => {
       const thumb = escapeDataUrlSvg(
         `<svg xmlns="http://www.w3.org/2000/svg" width="320" height="180"><rect width="100%" height="100%" fill="#F2F2F7"/><text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" font-family="Arial" font-size="20" fill="#1D1D1F">Video</text></svg>`,
       );
+      const detectedUrls = extractHttpUrls(userText, 2);
+      const url1 = detectedUrls[0] || "https://www.bilibili.com/video/BV1xx411c7mD";
+      const url2 = detectedUrls[1] || "https://www.bilibili.com/video/BV1yy411c7mE";
       const videos: ChatVideoCard[] = [
         {
-          url: "https://www.bilibili.com/video/BV1xx411c7mD",
+          url: url1,
           title: "Mock: 猫咪搞笑素材合集",
           description: "（E2E mock）用于验证卡片渲染与按钮交互。",
           thumbnail: thumb,
@@ -500,7 +580,7 @@ app.post("/api/projects/:projectId/chat/turn", async (req, res) => {
           id: "BV1xx411c7mD",
         },
         {
-          url: "https://www.bilibili.com/video/BV1yy411c7mE",
+          url: url2,
           title: "Mock: 热门剪辑灵感参考",
           description: "（E2E mock）第二条卡片。",
           thumbnail: thumb,

@@ -25,7 +25,7 @@ const webPort = numEnv("WEB_PORT", 6785);
 const orchestratorPort = numEnv("ORCHESTRATOR_PORT", 6790);
 const toolserverPort = numEnv("TOOLSERVER_PORT", 6791);
 
-const npmCmd = "npm";
+const npmCmd = process.platform === "win32" ? "npm.cmd" : "npm";
 const nodeCmd = process.execPath;
 
 function buildChildEnv() {
@@ -33,18 +33,26 @@ function buildChildEnv() {
 
   if (!String(env.DATA_DIR || "").trim()) env.DATA_DIR = "data";
 
+  // Windows quirk: env key may be Path or PATH (or both). Normalize to env.PATH to avoid
+  // accidental "empty PATH" in child processes (which makes npm/vite/tsx undiscoverable).
   const pathKeys = Object.keys(env).filter((k) => k.toLowerCase() === "path");
-  const pathKey = pathKeys[0] || "PATH";
-  // Avoid duplicated PATH/Path variants on Windows that can clobber child PATH resolution.
+  let basePath = "";
   for (const k of pathKeys) {
-    if (k !== pathKey) delete env[k];
+    const v = String(env[k] || "");
+    if (v.length > basePath.length) basePath = v;
   }
-  const currentPath = String(env[pathKey] || "");
+  if (!basePath) basePath = String(env.PATH || env.Path || "");
+  env.PATH = basePath;
+  for (const k of pathKeys) {
+    if (k !== "PATH") delete env[k];
+  }
+
+  const currentPath = String(env.PATH || "");
 
   const ffmpegBin = path.join(repoRoot, "tools", "ffmpeg", "bin");
   const ffmpegExe = process.platform === "win32" ? "ffmpeg.exe" : "ffmpeg";
   if (existsSync(path.join(ffmpegBin, ffmpegExe))) {
-    env[pathKey] = `${ffmpegBin}${path.delimiter}${currentPath}`;
+    env.PATH = `${ffmpegBin}${path.delimiter}${currentPath}`;
   }
 
   const ytdlpExe = process.platform === "win32" ? "yt-dlp.exe" : "yt-dlp";
@@ -76,7 +84,8 @@ function prefixLines(prefix, stream, out) {
 }
 
 function spawnService(name, cmd, args) {
-  const useShell = process.platform === "win32" && (cmd === "npm" || cmd === "npx");
+  const useShell =
+    process.platform === "win32" && (cmd === "npm" || cmd === "npx" || cmd === "npm.cmd" || cmd === "npx.cmd");
   const child = spawn(cmd, args, { cwd: repoRoot, env: childEnv, shell: useShell, stdio: ["ignore", "pipe", "pipe"] });
 
   const rls = [];

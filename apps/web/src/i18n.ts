@@ -104,6 +104,8 @@ const en = {
   save: "Save",
   resolve: "Resolve",
   downloadNow: "Download",
+  resolvedOk: "Resolved",
+  openDownloadedVideo: "Open video",
   videosCount: "Videos ({count})",
   urlsCount: "URLs ({count})",
 
@@ -269,6 +271,8 @@ const zhCN: typeof en = {
   save: "保存",
   resolve: "解析",
   downloadNow: "下载",
+  resolvedOk: "已解析",
+  openDownloadedVideo: "打开视频",
   videosCount: "视频（{count}）",
   urlsCount: "链接（{count}）",
 
