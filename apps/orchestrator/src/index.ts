@@ -9,6 +9,7 @@ import "dotenv/config";
 import dotenv from "dotenv";
 import Exa from "exa-js";
 import express from "express";
+import { Annotation, END, START, StateGraph } from "@langchain/langgraph";
 
 dotenv.config({ path: path.resolve(process.cwd(), "../../.env") });
 
@@ -703,6 +704,419 @@ type ChatAgentPlan = {
   search_queries: string[];
 };
 
+const ChatTurnStateAnnotation = Annotation.Root({
+  projectId: Annotation<string>(),
+  chatId: Annotation<string>(),
+  userText: Annotation<string>(),
+  userMessage: Annotation<ToolserverChatMessage>(),
+  directUrls: Annotation<string[]>(),
+  recent: Annotation<ToolserverChatMessage[]>(),
+
+  thinkEnabled: Annotation<boolean>(),
+  geminiApiKey: Annotation<string>(),
+  exaApiKey: Annotation<string>(),
+  baseUrl: Annotation<string>(),
+  model: Annotation<string>(),
+  cookiesFromBrowser: Annotation<string>(),
+  useGeminiNative: Annotation<boolean>(),
+
+  directResolveCache: Annotation<Record<string, ToolserverImportRemoteMediaResponse>>(),
+
+  plan: Annotation<unknown | null>(),
+  planArtifact: Annotation<ToolserverArtifact | null>(),
+
+  llmPayload: Annotation<any>(),
+  llmText: Annotation<string>(),
+  llmParsed: Annotation<unknown | null>(),
+
+  agentPlan: Annotation<ChatAgentPlan | null>(),
+  videos: Annotation<ChatVideoCard[]>(),
+  blocks: Annotation<any[]>(),
+  needsConsent: Annotation<boolean>(),
+
+  debugArtifact: Annotation<ToolserverArtifact | null>(),
+  assistantMessage: Annotation<ToolserverChatMessage | null>(),
+});
+
+type ChatTurnGraphState = typeof ChatTurnStateAnnotation.State;
+
+function ensureUserFacingReplyText(text: unknown): string {
+  const t = String(text ?? "").trim();
+  if (!t) return "我收到你的消息。你想找什么类型的素材（主题/风格/时长/用途）？";
+  if (/^[{[]/.test(t)) return "我收到你的消息，但模型返回了结构化数据。你可以再描述下你想要的素材类型，我会继续。";
+  return t;
+}
+
+function buildAgentPlanFromLlm(text: string, parsed: unknown | null): ChatAgentPlan {
+  const parsedObj = parsed && typeof parsed === "object" ? (parsed as any) : null;
+  const reply = typeof parsedObj?.reply === "string" ? parsedObj.reply : "";
+  const promptDraft = typeof parsedObj?.prompt_draft === "string" ? parsedObj.prompt_draft : null;
+  const shouldSearch = !!parsedObj?.should_search;
+  const searchQueries = Array.isArray(parsedObj?.search_queries)
+    ? parsedObj.search_queries.map((s: any) => String(s)).filter(Boolean)
+    : [];
+
+  return {
+    reply: ensureUserFacingReplyText(reply || text),
+    prompt_draft: promptDraft,
+    should_search: shouldSearch,
+    search_queries: searchQueries,
+  };
+}
+
+async function chatTurnPlanNode(state: ChatTurnGraphState) {
+  const { projectId, directUrls, cookiesFromBrowser, recent, thinkEnabled, useGeminiNative, baseUrl, model, geminiApiKey } = state;
+
+  const directResolveCache = { ...(state.directResolveCache || {}) };
+
+  let referenceForPrompt = "";
+  if (directUrls.length === 1) {
+    const refUrl = directUrls[0];
+    const consent = await getConsent(projectId);
+    if (consent?.consented) {
+      try {
+        const r = await withTimeout(resolveRemoteInfo(projectId, refUrl, cookiesFromBrowser), 12_000);
+        directResolveCache[refUrl] = r;
+        referenceForPrompt = [
+          "User provided a reference video URL (treat as primary reference; do NOT guess topic beyond metadata):",
+          `- title: ${r.info.title}`,
+          `- url: ${r.info.webpage_url || refUrl}`,
+          r.info.description ? `- description: ${r.info.description}` : "",
+          r.info.duration_s != null ? `- duration_s: ${r.info.duration_s}` : "",
+          r.info.extractor ? `- extractor: ${r.info.extractor}` : "",
+        ]
+          .filter(Boolean)
+          .join("\n");
+      } catch {
+        referenceForPrompt = `User provided a reference URL: ${refUrl} (title/cover may require clicking Resolve/Download or browser cookies). Do NOT guess its topic.`;
+      }
+    } else {
+      referenceForPrompt = `User provided a reference URL: ${refUrl} (cannot fetch metadata before consent). Do NOT guess its topic.`;
+    }
+  }
+
+  const systemPrompt = [
+    "You are VidUnpack Chat (视频拆解箱对话助手).",
+    "Goal: chat with the user to clarify their intent, then search for candidate source videos (prefer bilibili) and present them as cards.",
+    "Rules:",
+    "- Ask 1-3 clarifying questions if needed.",
+    "- If user pasted exactly one video URL, treat it as the primary reference. If multiple URLs are present, ask which one should be the primary reference before searching.",
+    "- When ready, output JSON ONLY (no markdown).",
+    "- JSON schema:",
+    `  { "reply": string, "prompt_draft"?: string, "should_search"?: boolean, "search_queries"?: string[] }`,
+    "- Use Chinese in reply when user is Chinese.",
+    "- search_queries should be short and actionable; include platform hints if relevant.",
+    ...(referenceForPrompt ? ["", referenceForPrompt] : []),
+  ].join("\n");
+
+  const contents = [
+    { role: "user", parts: [{ text: systemPrompt }] },
+    ...recent.map((m) => ({
+      role: m.role === "assistant" ? "model" : "user",
+      parts: [{ text: m.content || "" }],
+    })),
+  ];
+
+  const openAiMessages: OpenAIChatMessage[] = [
+    { role: "system", content: systemPrompt },
+    ...recent.map((m) => ({
+      role: toOpenAiRole(m.role),
+      content: m.content || "",
+    })),
+  ];
+
+  const plan = thinkEnabled
+    ? {
+        action: "chat_turn_langgraph",
+        steps: [
+          { action: "langgraph.plan" },
+          useGeminiNative ? { action: "gemini.generateContent", model } : { action: "chat.completions", model, base_url: baseUrl },
+          { action: "langgraph.do", nodes: ["resolve_direct_urls", "exa_search_and_resolve"] },
+          { action: "langgraph.review" },
+        ],
+      }
+    : null;
+  const planArtifact = plan ? await maybeStorePlan(projectId, "chat-turn", plan) : null;
+
+  let llmPayload: any;
+  if (useGeminiNative) {
+    const url = new URL(`/v1beta/models/${encodeURIComponent(model)}:generateContent`, baseUrl);
+    url.searchParams.set("key", geminiApiKey);
+    llmPayload = await fetchJson<any>(url.toString(), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        contents,
+        generationConfig: { temperature: 0.4, maxOutputTokens: 1024 },
+      }),
+    });
+  } else {
+    llmPayload = await callChatCompletions({
+      baseUrl,
+      apiKey: geminiApiKey,
+      model,
+      messages: openAiMessages,
+      temperature: 0.4,
+      maxTokens: 1024,
+    });
+  }
+
+  const llmText = useGeminiNative ? extractGeminiText(llmPayload) : extractChatCompletionsText(llmPayload);
+  const llmParsed = tryParseJson(llmText);
+
+  return {
+    directResolveCache,
+    plan,
+    planArtifact,
+    llmPayload,
+    llmText,
+    llmParsed,
+    agentPlan: buildAgentPlanFromLlm(llmText, llmParsed),
+  };
+}
+
+async function chatTurnDoResolveDirectUrlsNode(state: ChatTurnGraphState) {
+  const { projectId, directUrls, cookiesFromBrowser } = state;
+
+  const agentPlan: ChatAgentPlan = state.agentPlan || {
+    reply: ensureUserFacingReplyText(""),
+    prompt_draft: null,
+    should_search: false,
+    search_queries: [],
+  };
+
+  const blocks: any[] = [];
+  if (agentPlan.prompt_draft && agentPlan.prompt_draft.trim()) {
+    blocks.push({ type: "prompt", title: "Prompt", text: agentPlan.prompt_draft.trim() });
+  }
+
+  const directResolveCache = { ...(state.directResolveCache || {}) };
+
+  let needsConsent = false;
+  const videos: ChatVideoCard[] = [];
+
+  if (directUrls.length > 1) {
+    agentPlan.should_search = false;
+    agentPlan.search_queries = [];
+    const list = directUrls.map((u) => `- ${u}`).join("\n");
+    agentPlan.reply = `${ensureUserFacingReplyText(agentPlan.reply)}\n\n你发了多个链接，请告诉我哪一个是“参考视频”（我会基于它找同类素材）：\n${list}`;
+  }
+
+  if (directUrls.length > 0) {
+    const consent = await getConsent(projectId);
+    if (!consent?.consented) {
+      needsConsent = true;
+      agentPlan.reply = `${ensureUserFacingReplyText(agentPlan.reply)}\n\n要解析/搜索外部链接前，请先在本项目完成一次「授权确认」。`;
+      for (const u of directUrls) {
+        videos.push({ url: u, title: u, description: null, thumbnail: null, duration_s: null, extractor: "unknown", id: "" });
+      }
+    } else {
+      for (const u of directUrls) {
+        try {
+          const cached = directResolveCache[u];
+          const r = cached || (await resolveRemoteInfo(projectId, u, cookiesFromBrowser));
+          directResolveCache[u] = r;
+          videos.push({
+            url: r.info.webpage_url || u,
+            title: r.info.title || u,
+            description: r.info.description || null,
+            thumbnail: r.info.thumbnail || null,
+            duration_s: r.info.duration_s ?? null,
+            extractor: r.info.extractor,
+            id: r.info.id,
+          });
+        } catch {
+          videos.push({ url: u, title: u, description: null, thumbnail: null, duration_s: null, extractor: "unknown", id: "" });
+        }
+      }
+    }
+  }
+
+  if (videos.length > 0) {
+    blocks.push({ type: "videos", videos });
+  }
+
+  return { agentPlan, videos, blocks, needsConsent, directResolveCache };
+}
+
+async function chatTurnDoSearchAndResolveNode(state: ChatTurnGraphState) {
+  const { projectId, cookiesFromBrowser, exaApiKey } = state;
+
+  const agentPlan: ChatAgentPlan = state.agentPlan || {
+    reply: ensureUserFacingReplyText(""),
+    prompt_draft: null,
+    should_search: false,
+    search_queries: [],
+  };
+
+  const blocks: any[] = Array.isArray(state.blocks) ? [...state.blocks] : [];
+  const videos: ChatVideoCard[] = Array.isArray(state.videos) ? [...state.videos] : [];
+  const directResolveCache = { ...(state.directResolveCache || {}) };
+
+  if (state.needsConsent) return { agentPlan, blocks, videos, directResolveCache };
+
+  const shouldSearch = agentPlan.should_search && agentPlan.search_queries && agentPlan.search_queries.length > 0;
+  if (!shouldSearch) return { agentPlan, blocks, videos, directResolveCache };
+
+  const consent = await getConsent(projectId);
+  if (!consent?.consented) {
+    agentPlan.reply = `${ensureUserFacingReplyText(agentPlan.reply)}\n\n要开始联网搜索/解析链接前，请先在本项目完成一次「授权确认」（外部内容提示）。`;
+    return { agentPlan, blocks, videos, needsConsent: true, directResolveCache };
+  }
+
+  if (!exaApiKey) {
+    agentPlan.reply = `${ensureUserFacingReplyText(agentPlan.reply)}\n\nEXA_API_KEY 未设置：暂时没法联网搜索。你可以先在设置里填 Exa API Key，或直接把候选链接贴给我。`;
+    return { agentPlan, blocks, videos, directResolveCache };
+  }
+
+  const exa = new Exa(exaApiKey);
+  const q0 = str(agentPlan.search_queries[0]);
+  const query = q0.includes("bilibili.com") ? q0 : `${q0} site:bilibili.com`;
+  const raw = await withTimeout(exa.search(query, { numResults: 6 }), 20_000);
+  const results = Array.isArray((raw as any)?.results) ? ((raw as any).results as any[]) : [];
+
+  const titleByUrl = new Map<string, string>();
+  for (const r0 of results) {
+    const u = typeof r0?.url === "string" ? r0.url : "";
+    const t = typeof r0?.title === "string" ? r0.title : "";
+    if (!u.startsWith("http")) continue;
+    if (!t.trim()) continue;
+    if (!titleByUrl.has(u)) titleByUrl.set(u, t.trim());
+  }
+
+  const urls = uniqStrings(
+    results
+      .map((r0) => (typeof r0?.url === "string" ? r0.url : ""))
+      .filter((u) => u.startsWith("http")),
+  ).slice(0, 6);
+
+  const existing = new Set(videos.map((v) => v.url));
+  let unresolved = 0;
+  for (const u of urls) {
+    if (existing.has(u)) continue;
+    existing.add(u);
+
+    const fallbackTitle = titleByUrl.get(u) || u;
+    try {
+      const r = await resolveRemoteInfo(projectId, u, cookiesFromBrowser);
+      directResolveCache[u] = r;
+      videos.push({
+        url: r.info.webpage_url || u,
+        title: r.info.title || fallbackTitle,
+        description: r.info.description || null,
+        thumbnail: r.info.thumbnail || null,
+        duration_s: r.info.duration_s ?? null,
+        extractor: r.info.extractor,
+        id: r.info.id,
+      });
+    } catch {
+      unresolved += 1;
+      videos.push({ url: u, title: fallbackTitle, description: null, thumbnail: null, duration_s: null, extractor: "unknown", id: "" });
+    }
+  }
+
+  if (unresolved > 0) {
+    agentPlan.reply = `${ensureUserFacingReplyText(agentPlan.reply)}\n\n注：部分链接暂时无法解析封面/标题（可能需要登录态）。可以在卡片上点「解析/下载」重试，或在 Settings 配置 Cookies from browser 后再试。`;
+  }
+
+  const hasVideos = blocks.some((b) => b && typeof b === "object" && (b as any).type === "videos");
+  if (videos.length > 0 && !hasVideos) blocks.push({ type: "videos", videos });
+  if (videos.length > 0 && hasVideos) {
+    for (const b of blocks) {
+      if (b && typeof b === "object" && (b as any).type === "videos") {
+        (b as any).videos = videos;
+        break;
+      }
+    }
+  }
+
+  return { agentPlan, blocks, videos, directResolveCache };
+}
+
+async function chatTurnReviewNode(state: ChatTurnGraphState) {
+  const agentPlan: ChatAgentPlan = state.agentPlan || {
+    reply: ensureUserFacingReplyText(""),
+    prompt_draft: null,
+    should_search: false,
+    search_queries: [],
+  };
+  agentPlan.reply = ensureUserFacingReplyText(agentPlan.reply);
+
+  if (state.directUrls.length === 1) {
+    const refUrl = state.directUrls[0];
+    const cached = (state.directResolveCache || {})[refUrl];
+    const refTitle = cached?.info?.title ? String(cached.info.title).trim() : "";
+    const prefix = refTitle ? `收到：你给的参考视频是「${refTitle}」。` : `收到：你给的参考链接是 ${refUrl}。`;
+    const hasRef =
+      (refTitle && agentPlan.reply.includes(refTitle)) ||
+      agentPlan.reply.includes(refUrl) ||
+      agentPlan.reply.includes(refUrl.replace(/^https?:\/\//, ""));
+    if (!hasRef) {
+      agentPlan.reply = `${prefix}\n\n${agentPlan.reply || "我先确认下你的目标，然后帮你找同类素材。"}\n`;
+    }
+  }
+
+  return { agentPlan };
+}
+
+async function chatTurnPersistNode(state: ChatTurnGraphState) {
+  const { projectId, baseUrl, model, useGeminiNative, userMessage, llmText, llmParsed, llmPayload } = state;
+  const agentPlan: ChatAgentPlan = state.agentPlan || {
+    reply: ensureUserFacingReplyText(""),
+    prompt_draft: null,
+    should_search: false,
+    search_queries: [],
+  };
+  const videos: ChatVideoCard[] = Array.isArray(state.videos) ? state.videos : [];
+  const blocks: any[] = Array.isArray(state.blocks) ? state.blocks : [];
+
+  const debugArtifact = await toolserverJson<ToolserverArtifact>(`/projects/${projectId}/artifacts/text`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      kind: "chat_turn",
+      out_path: `chat/turn-${Date.now()}.json`,
+      content: JSON.stringify(
+        {
+          provider: useGeminiNative ? "gemini_native" : "openai_compat",
+          base_url: baseUrl,
+          model,
+          user_message_id: userMessage.id,
+          assistant_reply: agentPlan.reply,
+          prompt_draft: agentPlan.prompt_draft,
+          should_search: agentPlan.should_search,
+          search_queries: agentPlan.search_queries,
+          videos,
+          llm: { text: llmText, parsed: llmParsed, payload: llmPayload },
+        },
+        null,
+        2,
+      ),
+    }),
+  });
+
+  const assistantMessage = await createChatMessage(projectId, state.chatId, "assistant", agentPlan.reply || "OK", {
+    blocks,
+    debug_artifact: debugArtifact,
+  });
+
+  return { debugArtifact, assistantMessage };
+}
+
+const chatTurnLangGraph = new StateGraph(ChatTurnStateAnnotation)
+  .addNode("llm_plan", chatTurnPlanNode)
+  .addNode("resolve_direct_urls", chatTurnDoResolveDirectUrlsNode)
+  .addNode("exa_search_and_resolve", chatTurnDoSearchAndResolveNode)
+  .addNode("review", chatTurnReviewNode)
+  .addNode("persist", chatTurnPersistNode)
+  .addEdge(START, "llm_plan")
+  .addEdge("llm_plan", "resolve_direct_urls")
+  .addEdge("resolve_direct_urls", "exa_search_and_resolve")
+  .addEdge("exa_search_and_resolve", "review")
+  .addEdge("review", "persist")
+  .addEdge("persist", END)
+  .compile();
+
 app.post("/api/projects/:projectId/chat/turn", async (req, res) => {
   try {
     const projectId = String(req.params.projectId || "").trim();
@@ -933,260 +1347,43 @@ app.post("/api/projects/:projectId/chat/turn", async (req, res) => {
     const history = await getChatMessages(projectId, chatId);
     const recent = history.slice(Math.max(0, history.length - 12));
 
-    const directResolveCache = new Map<string, ToolserverImportRemoteMediaResponse>();
-    let referenceForPrompt = "";
-    if (directUrls.length > 0) {
-      const refUrl = directUrls[0];
-      const consent = await getConsent(projectId);
-      if (consent?.consented) {
-        try {
-          const r = await withTimeout(resolveRemoteInfo(projectId, refUrl, cookiesFromBrowser), 12_000);
-          directResolveCache.set(refUrl, r);
-          referenceForPrompt = [
-            "User provided a reference video URL (treat as primary reference; do NOT guess topic beyond metadata):",
-            `- title: ${r.info.title}`,
-            `- url: ${r.info.webpage_url || refUrl}`,
-            r.info.description ? `- description: ${r.info.description}` : "",
-            r.info.duration_s != null ? `- duration_s: ${r.info.duration_s}` : "",
-            r.info.extractor ? `- extractor: ${r.info.extractor}` : "",
-          ]
-            .filter(Boolean)
-            .join("\n");
-        } catch {
-          referenceForPrompt = `User provided a reference URL: ${refUrl} (title/cover may require clicking Resolve/Download or browser cookies). Do NOT guess its topic.`;
-        }
-      } else {
-        referenceForPrompt = `User provided a reference URL: ${refUrl} (cannot fetch metadata before consent). Do NOT guess its topic.`;
-      }
-    }
-
-    const systemPrompt = [
-      "You are VidUnpack Chat (视频拆解箱对话助手).",
-      "Goal: chat with the user to clarify their intent, then search for candidate source videos (prefer bilibili) and present them as cards.",
-      "Rules:",
-      "- Ask 1-3 clarifying questions if needed.",
-      "- If user pasted video URL(s), the FIRST URL is the primary reference. Base your reply on it and do NOT speculate about its topic unless provided in metadata.",
-      "- When ready, output JSON ONLY (no markdown).",
-      "- JSON schema:",
-      `  { "reply": string, "prompt_draft"?: string, "should_search"?: boolean, "search_queries"?: string[] }`,
-      "- Use Chinese in reply when user is Chinese.",
-      "- search_queries should be short and actionable; include platform hints if relevant.",
-      ...(referenceForPrompt ? ["", referenceForPrompt] : []),
-    ].join("\n");
-
-    const contents = [
-      { role: "user", parts: [{ text: systemPrompt }] },
-      ...recent.map((m) => ({
-        role: m.role === "assistant" ? "model" : "user",
-        parts: [{ text: m.content || "" }],
-      })),
-    ];
-
-    const openAiMessages: OpenAIChatMessage[] = [
-      { role: "system", content: systemPrompt },
-      ...recent.map((m) => ({
-        role: toOpenAiRole(m.role),
-        content: m.content || "",
-      })),
-    ];
-
-    const plan = thinkEnabled
-      ? {
-          action: "chat_turn",
-          steps: [
-            useGeminiNative ? { action: "gemini.generateContent", model } : { action: "chat.completions", model, base_url: baseUrl },
-            { action: "maybe_search_and_resolve" },
-          ],
-        }
-      : null;
-    const planArtifact = plan ? await maybeStorePlan(projectId, "chat-turn", plan) : null;
-
-    let llmPayload: any;
-    if (useGeminiNative) {
-      const url = new URL(`/v1beta/models/${encodeURIComponent(model)}:generateContent`, baseUrl);
-      url.searchParams.set("key", geminiApiKey);
-      llmPayload = await fetchJson<any>(url.toString(), {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          contents,
-          generationConfig: { temperature: 0.4, maxOutputTokens: 1024 },
-        }),
-      });
-    } else {
-      llmPayload = await callChatCompletions({
-        baseUrl,
-        apiKey: geminiApiKey,
-        model,
-        messages: openAiMessages,
-        temperature: 0.4,
-        maxTokens: 1024,
-      });
-    }
-
-    const text = useGeminiNative ? extractGeminiText(llmPayload) : extractChatCompletionsText(llmPayload);
-    const parsed = tryParseJson(text);
-
-    const parsedObj = (parsed && typeof parsed === "object" ? (parsed as any) : null) as any;
-    const agentPlan: ChatAgentPlan = {
-      reply: typeof parsedObj?.reply === "string" ? parsedObj.reply : String(text || "").trim(),
-      prompt_draft: typeof parsedObj?.prompt_draft === "string" ? parsedObj.prompt_draft : null,
-      should_search: !!parsedObj?.should_search,
-      search_queries: Array.isArray(parsedObj?.search_queries) ? parsedObj.search_queries.map((s: any) => String(s)) : [],
-    };
-
-    // Always anchor the assistant reply on the user's first pasted URL (avoid hallucinated topic labels).
-    if (directUrls.length > 0) {
-      const refUrl = directUrls[0];
-      const cached = directResolveCache.get(refUrl);
-      const refTitle = cached?.info?.title ? String(cached.info.title).trim() : "";
-      const prefix = refTitle ? `收到：你给的参考视频是「${refTitle}」。` : `收到：你给的参考链接是 ${refUrl}。`;
-      const hasRef =
-        (refTitle && agentPlan.reply.includes(refTitle)) || agentPlan.reply.includes(refUrl) || agentPlan.reply.includes(refUrl.replace(/^https?:\/\//, ""));
-      if (!hasRef) {
-        agentPlan.reply = `${prefix}\n\n${agentPlan.reply || "我先确认下你的目标，然后帮你找同类素材。"}\n`;
-      }
-    }
-
-    const blocks: any[] = [];
-    if (agentPlan.prompt_draft && agentPlan.prompt_draft.trim()) {
-      blocks.push({ type: "prompt", title: "Prompt", text: agentPlan.prompt_draft.trim() });
-    }
-
-    let videos: ChatVideoCard[] = [];
-    let needsConsent = false;
-
-    if (directUrls.length > 0) {
-      const consent = await getConsent(projectId);
-      if (!consent?.consented) {
-        agentPlan.reply = `${agentPlan.reply}\n\n要解析你提供的链接前，请先在本项目完成一次「授权确认」（外部内容提示）。`;
-        needsConsent = true;
-      } else {
-        for (const u of directUrls) {
-          try {
-            const r = directResolveCache.get(u) || (await resolveRemoteInfo(projectId, u, cookiesFromBrowser));
-            if (!directResolveCache.has(u)) directResolveCache.set(u, r);
-            videos.push({
-              url: r.info.webpage_url || u,
-              title: r.info.title || u,
-              description: r.info.description || null,
-              thumbnail: r.info.thumbnail || null,
-              duration_s: r.info.duration_s ?? null,
-              extractor: r.info.extractor,
-              id: r.info.id,
-            });
-          } catch {
-            videos.push({ url: u, title: u, description: null, thumbnail: null, duration_s: null, extractor: "unknown", id: "" });
-          }
-        }
-      }
-    }
-
-    const shouldSearch = agentPlan.should_search && agentPlan.search_queries && agentPlan.search_queries.length > 0;
-    if (shouldSearch && !needsConsent) {
-      const consent = await getConsent(projectId);
-      if (!consent?.consented) {
-        agentPlan.reply = `${agentPlan.reply}\n\n要开始联网搜索/解析链接前，请先在本项目完成一次「授权确认」（外部内容提示）。`;
-        needsConsent = true;
-      } else if (!exaApiKey) {
-        agentPlan.reply = `${agentPlan.reply}\n\nEXA_API_KEY 未设置：暂时没法联网搜索。你可以先在设置里填 Exa API Key，或直接把候选链接贴给我。`;
-      } else {
-        const exa = new Exa(exaApiKey);
-        const q0 = str(agentPlan.search_queries[0]);
-        const query = q0.includes("bilibili.com") ? q0 : `${q0} site:bilibili.com`;
-        const raw = await withTimeout(exa.search(query, { numResults: 6 }), 20_000);
-        const results = Array.isArray((raw as any)?.results) ? ((raw as any).results as any[]) : [];
-
-        const titleByUrl = new Map<string, string>();
-        for (const r0 of results) {
-          const u = typeof r0?.url === "string" ? r0.url : "";
-          const t = typeof r0?.title === "string" ? r0.title : "";
-          if (!u.startsWith("http")) continue;
-          if (!t.trim()) continue;
-          if (!titleByUrl.has(u)) titleByUrl.set(u, t.trim());
-        }
-
-        const urls = uniqStrings(
-          results
-            .map((r0) => (typeof r0?.url === "string" ? r0.url : ""))
-            .filter((u) => u.startsWith("http")),
-        ).slice(0, 6);
-
-        const existing = new Set(videos.map((v) => v.url));
-        let unresolved = 0;
-        for (const u of urls) {
-          if (existing.has(u)) continue;
-          existing.add(u);
-
-          const fallbackTitle = titleByUrl.get(u) || u;
-          try {
-            const r = await resolveRemoteInfo(projectId, u, cookiesFromBrowser);
-            videos.push({
-              url: r.info.webpage_url || u,
-              title: r.info.title || fallbackTitle,
-              description: r.info.description || null,
-              thumbnail: r.info.thumbnail || null,
-              duration_s: r.info.duration_s ?? null,
-              extractor: r.info.extractor,
-              id: r.info.id,
-            });
-          } catch {
-            unresolved += 1;
-            videos.push({ url: u, title: fallbackTitle, description: null, thumbnail: null, duration_s: null, extractor: "unknown", id: "" });
-          }
-        }
-
-        if (unresolved > 0) {
-          agentPlan.reply = `${agentPlan.reply}\n\n注：部分链接暂时无法解析封面/标题（可能需要登录态）。可以在卡片上点「解析/下载」重试，或在 Settings 配置 Cookies from browser 后再试。`;
-        }
-
-        if (videos.length > 0) {
-          blocks.push({ type: "videos", videos });
-        } else {
-          agentPlan.reply = `${agentPlan.reply}\n\n我搜到了候选链接，但解析标题/封面失败（可能需要登录态或链接不可用）。你也可以直接把 BV 号/链接贴出来，我再帮你解析。`;
-        }
-      }
-    }
-
-    if (videos.length > 0 && !blocks.some((b) => (b && typeof b === "object" ? (b as any).type === "videos" : false))) {
-      blocks.push({ type: "videos", videos });
-    }
-
-    const debugArtifact = await toolserverJson<ToolserverArtifact>(`/projects/${projectId}/artifacts/text`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        kind: "chat_turn",
-        out_path: `chat/turn-${Date.now()}.json`,
-        content: JSON.stringify(
-          {
-            provider: useGeminiNative ? "gemini_native" : "openai_compat",
-            base_url: baseUrl,
-            model,
-            user_message_id: userMessage.id,
-            assistant_reply: agentPlan.reply,
-            prompt_draft: agentPlan.prompt_draft,
-            should_search: shouldSearch,
-            search_queries: agentPlan.search_queries,
-            videos,
-            llm: { text, parsed, payload: llmPayload },
-          },
-          null,
-          2,
-        ),
-      }),
+    const graphState = await chatTurnLangGraph.invoke({
+      projectId,
+      chatId,
+      userText,
+      userMessage,
+      directUrls,
+      recent,
+      thinkEnabled,
+      geminiApiKey,
+      exaApiKey,
+      baseUrl,
+      model,
+      cookiesFromBrowser,
+      useGeminiNative,
+      directResolveCache: {},
+      plan: null,
+      planArtifact: null,
+      llmPayload: null,
+      llmText: "",
+      llmParsed: null,
+      agentPlan: null,
+      videos: [],
+      blocks: [],
+      needsConsent: false,
+      debugArtifact: null,
+      assistantMessage: null,
     });
 
-    const assistantMessage = await createChatMessage(projectId, chatId, "assistant", agentPlan.reply || "OK", {
-      blocks,
-      debug_artifact: debugArtifact,
-    });
+    const assistantMessage = graphState.assistantMessage
+      ? graphState.assistantMessage
+      : await createChatMessage(projectId, chatId, "assistant", "OK");
 
     return res.json({
       ok: true,
-      needs_consent: needsConsent,
-      plan,
-      plan_artifact: planArtifact,
+      needs_consent: graphState.needsConsent,
+      plan: graphState.plan,
+      plan_artifact: graphState.planArtifact,
       user_message: userMessage,
       assistant_message: assistantMessage,
     });
