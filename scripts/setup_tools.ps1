@@ -61,7 +61,8 @@ function Install-Ffmpeg([string]$repoRoot) {
     }
     $foundBin = Split-Path -Parent $found.FullName
 
-    Copy-Item -LiteralPath (Join-Path $foundBin "*") -Destination $binDir -Force
+    # NOTE: -LiteralPath does not support wildcards; use -Path here.
+    Copy-Item -Path (Join-Path $foundBin "*") -Destination $binDir -Force
 
     # Best-effort: copy license/readme next to tools\ffmpeg
     $root = Split-Path -Parent (Split-Path -Parent $foundBin)
@@ -93,4 +94,3 @@ Install-Ffmpeg $repoRoot
 Install-YtDlp $repoRoot
 
 Write-Info "Done."
-
