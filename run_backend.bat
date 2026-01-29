@@ -54,7 +54,7 @@ if not exist "%TOOLS_YTDLP%" (
   if errorlevel 1 set "_NEED_TOOLS=1"
 )
 if defined _NEED_TOOLS (
-  echo [vidunpack] Tools missing (ffmpeg/yt-dlp); installing project-local tools...
+  echo [vidunpack] Tools missing: ffmpeg/yt-dlp; installing project-local tools...
   powershell -NoProfile -ExecutionPolicy Bypass -File "scripts\setup_tools.ps1"
   if errorlevel 1 goto :err
 )
