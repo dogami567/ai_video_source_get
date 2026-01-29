@@ -33,10 +33,18 @@ function buildChildEnv() {
 
   if (!String(env.DATA_DIR || "").trim()) env.DATA_DIR = "data";
 
+  const pathKeys = Object.keys(env).filter((k) => k.toLowerCase() === "path");
+  const pathKey = pathKeys[0] || "PATH";
+  // Avoid duplicated PATH/Path variants on Windows that can clobber child PATH resolution.
+  for (const k of pathKeys) {
+    if (k !== pathKey) delete env[k];
+  }
+  const currentPath = String(env[pathKey] || "");
+
   const ffmpegBin = path.join(repoRoot, "tools", "ffmpeg", "bin");
   const ffmpegExe = process.platform === "win32" ? "ffmpeg.exe" : "ffmpeg";
   if (existsSync(path.join(ffmpegBin, ffmpegExe))) {
-    env.PATH = `${ffmpegBin}${path.delimiter}${env.PATH || ""}`;
+    env[pathKey] = `${ffmpegBin}${path.delimiter}${currentPath}`;
   }
 
   const ytdlpExe = process.platform === "win32" ? "yt-dlp.exe" : "yt-dlp";
