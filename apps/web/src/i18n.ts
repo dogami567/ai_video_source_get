@@ -106,6 +106,7 @@ const en = {
   downloadNow: "Download",
   resolvedOk: "Resolved",
   openDownloadedVideo: "Open video",
+  openInfoJson: "Info JSON",
   videosCount: "Videos ({count})",
   urlsCount: "URLs ({count})",
 
@@ -273,6 +274,7 @@ const zhCN: typeof en = {
   downloadNow: "下载",
   resolvedOk: "已解析",
   openDownloadedVideo: "打开视频",
+  openInfoJson: "元信息 JSON",
   videosCount: "视频（{count}）",
   urlsCount: "链接（{count}）",
 

@@ -1850,6 +1850,16 @@ fn content_type_for_path(path: &FsPath) -> &'static str {
         .unwrap_or("")
         .to_ascii_lowercase();
     match ext.as_str() {
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "mkv" => "video/x-matroska",
+        "mov" => "video/quicktime",
+        "mp3" => "audio/mpeg",
+        "m4a" => "audio/mp4",
+        "wav" => "audio/wav",
+        "aac" => "audio/aac",
+        "flac" => "audio/flac",
+        "ogg" => "audio/ogg",
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
         "webp" => "image/webp",
@@ -1910,6 +1920,17 @@ async fn download_artifact_raw(
     res.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_str(content_type_for_path(&abs)).unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+    );
+
+    let file_name = abs
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file");
+    let safe_name = sanitize_file_name(file_name);
+    let disp = format!("inline; filename=\"{}\"", safe_name);
+    res.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&disp).unwrap_or_else(|_| HeaderValue::from_static("inline")),
     );
     Ok(res)
 }

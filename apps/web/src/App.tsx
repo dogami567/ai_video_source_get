@@ -462,6 +462,7 @@ export default function App() {
   const [remoteError, setRemoteError] = React.useState<string | null>(null);
   const [remoteInfoByUrl, setRemoteInfoByUrl] = React.useState<Record<string, RemoteMediaInfoSummary>>({});
   const [remoteDownloadByUrl, setRemoteDownloadByUrl] = React.useState<Record<string, Artifact>>({});
+  const [remoteInfoArtifactByUrl, setRemoteInfoArtifactByUrl] = React.useState<Record<string, Artifact>>({});
 
   const [analysisModel, setAnalysisModel] = React.useState(() => clientConfig.default_model ?? "gemini-3-preview");
   const [analysisVideoArtifactId, setAnalysisVideoArtifactId] = React.useState<string>("");
@@ -707,6 +708,8 @@ export default function App() {
     setRemoteBusyId(null);
     setRemoteError(null);
     setRemoteInfoByUrl({});
+    setRemoteDownloadByUrl({});
+    setRemoteInfoArtifactByUrl({});
     void refreshProject(view.projectId);
   }, [refreshProject, view]);
 
@@ -915,6 +918,10 @@ export default function App() {
         cookies_from_browser: clientConfig.ytdlp_cookies_from_browser,
       });
       setRemoteInfoByUrl((prev) => ({ ...prev, [u.path]: resp.info }));
+      setRemoteInfoArtifactByUrl((prev) => ({ ...prev, [u.path]: resp.info_artifact }));
+      if (download && resp.input_video) {
+        setRemoteDownloadByUrl((prev) => ({ ...prev, [u.path]: resp.input_video! }));
+      }
       await refreshProject(view.projectId);
     } catch (e) {
       setRemoteError(e instanceof Error ? e.message : String(e));
@@ -1119,6 +1126,7 @@ export default function App() {
         cookies_from_browser: clientConfig.ytdlp_cookies_from_browser,
       });
       setRemoteInfoByUrl((prev) => ({ ...prev, [url]: resp.info }));
+      setRemoteInfoArtifactByUrl((prev) => ({ ...prev, [url]: resp.info_artifact }));
       if (download && resp.input_video) {
         setRemoteDownloadByUrl((prev) => ({ ...prev, [url]: resp.input_video }));
       }
@@ -1758,25 +1766,51 @@ export default function App() {
                             <div className="text-xs text-muted">—</div>
                           ) : (
                             <div className="flex flex-col gap-2">
-                              {inputUrls.map((u) => {
-                                const info = remoteInfoByUrl[u.path];
-                                const busy = remoteBusyId === u.id;
-                                return (
-                                  <div key={u.id} className="flex gap-2 items-center">
-                                    <div className="flex-1 min-w-0">
-                                      <div className="text-xs mono truncate text-muted" title={u.path}>
-                                        • {u.path}
-                                      </div>
-                                      {info && (
-                                        <div className="text-xs truncate text-dim" title={info.title}>
-                                          {info.title} <span className="mono">({info.extractor})</span>
-                                        </div>
-                                      )}
-                                    </div>
-                                    <div className="flex gap-1 shrink-0">
-                                      <button
-                                        className="btn btn-secondary btn-sm"
-                                        type="button"
+                               {inputUrls.map((u) => {
+                                 const info = remoteInfoByUrl[u.path];
+                                 const infoArtifact = remoteInfoArtifactByUrl[u.path];
+                                 const downloaded = remoteDownloadByUrl[u.path];
+                                 const busy = remoteBusyId === u.id;
+                                 return (
+                                   <div key={u.id} className="flex gap-2 items-center">
+                                     <div className="flex-1 min-w-0">
+                                       <div className="text-xs mono truncate text-muted" title={u.path}>
+                                         • {u.path}
+                                       </div>
+                                       {info && (
+                                         <div className="text-xs truncate text-dim" title={info.title}>
+                                           {info.title} <span className="mono">({info.extractor})</span>
+                                         </div>
+                                       )}
+                                       {(infoArtifact || downloaded) && (
+                                         <div className="text-xs text-dim mt-1 flex gap-3 flex-wrap">
+                                           {infoArtifact ? (
+                                             <a
+                                               className="text-primary"
+                                               href={`/tool/projects/${view.projectId}/artifacts/${infoArtifact.id}/raw`}
+                                               target="_blank"
+                                               rel="noreferrer"
+                                             >
+                                               {tr("openInfoJson")}
+                                             </a>
+                                           ) : null}
+                                           {downloaded ? (
+                                             <a
+                                               className="text-primary"
+                                               href={`/tool/projects/${view.projectId}/artifacts/${downloaded.id}/raw`}
+                                               target="_blank"
+                                               rel="noreferrer"
+                                             >
+                                               {tr("openDownloadedVideo")}
+                                             </a>
+                                           ) : null}
+                                         </div>
+                                       )}
+                                     </div>
+                                     <div className="flex gap-1 shrink-0">
+                                       <button
+                                         className="btn btn-secondary btn-sm"
+                                         type="button"
                                         onClick={() => void onResolveOrDownloadRemote(u, false)}
                                         disabled={busy}
                                       >
@@ -2094,6 +2128,7 @@ export default function App() {
 	                                                    {videos.map((v, vi) => {
 	                                                      const url = typeof v?.url === "string" ? v.url : "";
 	                                                      const resolved = url ? remoteInfoByUrl[url] : undefined;
+	                                                      const infoArtifact = url ? remoteInfoArtifactByUrl[url] : undefined;
 	                                                      const downloaded = url ? remoteDownloadByUrl[url] : undefined;
 	                                                      const title = resolved?.title ?? (typeof v?.title === "string" ? v.title : url);
 	                                                      const desc =
@@ -2135,16 +2170,30 @@ export default function App() {
 	                                                                {busy ? "…" : tr("downloadNow")}
 	                                                              </button>
 	                                                            </div>
-	                                                            {(resolved || downloaded) && (
+	                                                            {(resolved || downloaded || infoArtifact) && (
 	                                                              <div className="text-xs text-muted">
 	                                                                {resolved ? (
 	                                                                  <span className="text-success" data-testid={`chat-video-resolved-${vi}`}>
 	                                                                    ✓ {tr("resolvedOk")}
 	                                                                  </span>
 	                                                                ) : null}
-	                                                                {downloaded ? (
+	                                                                {infoArtifact ? (
 	                                                                  <>
 	                                                                    {resolved ? <span className="text-dim"> • </span> : null}
+	                                                                    <a
+	                                                                      className="text-primary"
+	                                                                      href={`/tool/projects/${view.projectId}/artifacts/${infoArtifact.id}/raw`}
+	                                                                      target="_blank"
+	                                                                      rel="noreferrer"
+	                                                                      data-testid={`chat-video-info-${vi}`}
+	                                                                    >
+	                                                                      {tr("openInfoJson")}
+	                                                                    </a>
+	                                                                  </>
+	                                                                ) : null}
+	                                                                {downloaded ? (
+	                                                                  <>
+	                                                                    {resolved || infoArtifact ? <span className="text-dim"> • </span> : null}
 	                                                                    <a
 	                                                                      className="text-primary"
 	                                                                      href={`/tool/projects/${view.projectId}/artifacts/${downloaded.id}/raw`}
