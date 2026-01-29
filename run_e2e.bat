@@ -95,14 +95,15 @@ powershell -NoProfile -Command "& { npm run test:e2e:dev 2>&1 | Tee-Object -File
 if errorlevel 1 goto :err
 
 echo.
-echo [vidunpack] ✅ E2E PASSED
+echo.
+echo [vidunpack] E2E PASSED
 echo [vidunpack] Report: playwright-report\index.html
 pause
 exit /b 0
 
 :err
 echo.
-echo [vidunpack] ❌ E2E FAILED. See logs above.
+echo [vidunpack] E2E FAILED. See logs above.
 echo [vidunpack] Log: %LOG_FILE%
 echo [vidunpack] Report: playwright-report\index.html
 pause

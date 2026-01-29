@@ -13,7 +13,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "scripts\\setup_tools.ps1"
 if errorlevel 1 goto :err
 
 echo.
-echo [vidunpack] ✅ Done.
+echo [vidunpack] Done.
 echo [vidunpack] You can now run: run_test.bat
 pause
 exit /b 0
@@ -23,4 +23,3 @@ echo.
 echo [vidunpack] ❌ Setup failed.
 pause
 exit /b 1
-
