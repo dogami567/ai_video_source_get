@@ -2276,17 +2276,25 @@ export default function App() {
 	                                              );
 	                                            }
 	                                            if (type === "links") {
-	                                              const links = Array.isArray(b?.links) ? (b.links as any[]) : [];
+	                                              const linksRaw = Array.isArray(b?.links) ? (b.links as any[]) : [];
+	                                              const seen = new Set<string>();
+	                                              const links = linksRaw.filter((l) => {
+	                                                const url = typeof l?.url === "string" ? l.url.trim() : "";
+	                                                if (!url) return false;
+	                                                if (seen.has(url)) return false;
+	                                                seen.add(url);
+	                                                return true;
+	                                              });
 	                                              if (links.length === 0) return null;
 	                                              return (
 	                                                <div key={`b-${idx}`} className="chat-block">
 	                                                  <div className="link-cards">
 	                                                    {links.map((l, li) => {
-	                                                      const url = typeof l?.url === "string" ? l.url : "";
+	                                                      const url = typeof l?.url === "string" ? l.url.trim() : "";
 	                                                      const title = typeof l?.title === "string" ? l.title : url;
 	                                                      const snippet = typeof l?.snippet === "string" ? l.snippet : null;
 	                                                      return (
-	                                                        <div key={`${url}-${li}`} className="link-card" data-testid="chat-link-card">
+	                                                        <div key={url} className="link-card" data-testid="chat-link-card">
 	                                                          <div className="link-info">
 	                                                            <a className="link-title" href={url} target="_blank" rel="noreferrer">
 	                                                              {title}
@@ -2313,13 +2321,21 @@ export default function App() {
 	                                              );
 	                                            }
 	                                            if (type === "videos") {
-	                                              const videos = Array.isArray(b?.videos) ? (b.videos as any[]) : [];
+	                                              const videosRaw = Array.isArray(b?.videos) ? (b.videos as any[]) : [];
+	                                              const seen = new Set<string>();
+	                                              const videos = videosRaw.filter((v) => {
+	                                                const url = typeof v?.url === "string" ? v.url.trim() : "";
+	                                                if (!url) return false;
+	                                                if (seen.has(url)) return false;
+	                                                seen.add(url);
+	                                                return true;
+	                                              });
 	                                              if (videos.length === 0) return null;
 	                                              return (
 	                                                <div key={`b-${idx}`} className="chat-block">
 	                                                  <div className="video-cards">
 	                                                    {videos.map((v, vi) => {
-	                                                      const url = typeof v?.url === "string" ? v.url : "";
+	                                                      const url = typeof v?.url === "string" ? v.url.trim() : "";
 	                                                      const resolved = url ? remoteInfoByUrl[url] : undefined;
 	                                                      const infoArtifact = url ? remoteInfoArtifactByUrl[url] : undefined;
 	                                                      const downloaded = url ? remoteDownloadByUrl[url] : undefined;
@@ -2330,7 +2346,7 @@ export default function App() {
 	                                                      const thumbSrc = thumb && url ? proxyImageUrl(thumb, url) : "";
 	                                                      const busy = chatCardBusyUrl === url;
 	                                                      return (
-	                                                        <div key={`${url}-${vi}`} className="video-card" data-testid="chat-video-card">
+	                                                        <div key={url} className="video-card" data-testid="chat-video-card">
 	                                                          <div
 	                                                            className={`video-thumb${thumbSrc ? "" : " placeholder"}`}
 	                                                            style={thumbSrc ? { backgroundImage: `url(${thumbSrc})` } : undefined}

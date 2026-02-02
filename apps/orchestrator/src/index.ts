@@ -323,6 +323,83 @@ function extractHttpUrls(text: string, max: number): string[] {
   return uniqStrings(urls).slice(0, max);
 }
 
+function normalizeUrlForDedup(url: string): string {
+  const raw = str(url);
+  if (!raw) return "";
+  try {
+    const u = new URL(raw);
+    u.hash = "";
+
+    // Remove common tracking params while keeping meaningful query params.
+    for (const k of [
+      "utm_source",
+      "utm_medium",
+      "utm_campaign",
+      "utm_term",
+      "utm_content",
+      "spm_id_from",
+      "vd_source",
+      "from",
+      "share_source",
+      "share_medium",
+      "share_plat",
+      "share_session_id",
+    ]) {
+      u.searchParams.delete(k);
+    }
+
+    let out = u.toString();
+    if (out.endsWith("/") && u.pathname !== "/" && !u.search) out = out.slice(0, -1);
+    return out;
+  } catch {
+    return raw.replace(/#.*$/, "");
+  }
+}
+
+function recentSuggestedUrlKeys(recent: ToolserverChatMessage[]): Set<string> {
+  const out = new Set<string>();
+  for (const m of Array.isArray(recent) ? recent : []) {
+    if (!m) continue;
+    const role = str((m as any).role);
+    if (role && role !== "assistant") continue;
+
+    // Always include plain URLs found in assistant text.
+    for (const u of extractHttpUrls(str((m as any).content), 32)) {
+      const key = normalizeUrlForDedup(u);
+      if (key) out.add(key);
+    }
+
+    const dataRaw = (m as any).data;
+    let data: any = dataRaw;
+    if (typeof dataRaw === "string") {
+      try {
+        data = JSON.parse(dataRaw);
+      } catch {
+        data = null;
+      }
+    }
+    const blocks = Array.isArray(data?.blocks) ? (data.blocks as any[]) : [];
+    for (const b of blocks) {
+      const type = str(b?.type);
+      if (type === "links") {
+        const links = Array.isArray(b?.links) ? (b.links as any[]) : [];
+        for (const l of links) {
+          const key = normalizeUrlForDedup(str(l?.url));
+          if (key) out.add(key);
+        }
+      }
+      if (type === "videos") {
+        const vids = Array.isArray(b?.videos) ? (b.videos as any[]) : [];
+        for (const v of vids) {
+          const key = normalizeUrlForDedup(str(v?.url));
+          if (key) out.add(key);
+        }
+      }
+    }
+  }
+  return out;
+}
+
 function findBrowserExeWindows(browser: string): string | null {
   const b = String(browser || "").trim().toLowerCase();
   if (!b) return null;
@@ -1239,6 +1316,7 @@ async function chatTurnDoSearchAndResolveNode(state: ChatTurnGraphState) {
   const blocks: any[] = Array.isArray(state.blocks) ? [...state.blocks] : [];
   const videos: ChatVideoCard[] = Array.isArray(state.videos) ? [...state.videos] : [];
   const directResolveCache = { ...(state.directResolveCache || {}) };
+  const usedKeys = recentSuggestedUrlKeys(state.recent || []);
 
   if (state.needsConsent) return { agentPlan, blocks, videos, directResolveCache };
 
@@ -1372,7 +1450,27 @@ async function chatTurnDoSearchAndResolveNode(state: ChatTurnGraphState) {
   }
 
   const ranked = Array.from(candidateByUrl.values()).sort((a, b) => b.score - a.score);
-  const selected = ranked.slice(0, 6);
+  const selected: typeof ranked = [];
+  const selectedKeys = new Set<string>();
+  for (const cand of ranked) {
+    if (selected.length >= 6) break;
+    const key = normalizeUrlForDedup(cand.url);
+    if (!key) continue;
+    if (usedKeys.has(key)) continue;
+    if (selectedKeys.has(key)) continue;
+    selectedKeys.add(key);
+    selected.push(cand);
+  }
+  if (selected.length < 6) {
+    for (const cand of ranked) {
+      if (selected.length >= 6) break;
+      const key = normalizeUrlForDedup(cand.url);
+      if (!key) continue;
+      if (selectedKeys.has(key)) continue;
+      selectedKeys.add(key);
+      selected.push(cand);
+    }
+  }
 
   if (intent !== "video") {
     const links: ChatLinkCard[] = [];
@@ -1380,8 +1478,9 @@ async function chatTurnDoSearchAndResolveNode(state: ChatTurnGraphState) {
     for (const cand of selected) {
       if (links.length >= 6) break;
       const u = cand.url;
-      if (!u || seen.has(u)) continue;
-      seen.add(u);
+      const key = normalizeUrlForDedup(u);
+      if (!u || !key || seen.has(key)) continue;
+      seen.add(key);
       links.push({ url: u, title: cand.title || u, snippet: cand.snippet || null });
     }
 
@@ -1404,13 +1503,15 @@ async function chatTurnDoSearchAndResolveNode(state: ChatTurnGraphState) {
     return { agentPlan, blocks, videos, directResolveCache };
   }
 
-  const existing = new Set(videos.map((v) => v.url));
+  const existing = new Set(videos.map((v) => normalizeUrlForDedup(v.url)).filter(Boolean));
   let unresolved = 0;
   for (const cand of selected) {
-    if (existing.has(cand.url)) continue;
-    existing.add(cand.url);
-
     const u = cand.url;
+    const key = normalizeUrlForDedup(u);
+    if (!u || !key) continue;
+    if (existing.has(key)) continue;
+    existing.add(key);
+
     const fallbackTitle = cand.title || u;
     try {
       const r = await withTimeout(resolveRemoteInfo(projectId, u, cookiesFromBrowser), 12_000);
