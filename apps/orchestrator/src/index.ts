@@ -837,6 +837,13 @@ const ChatTurnStateAnnotation = Annotation.Root({
   llmText: Annotation<string>(),
   llmParsed: Annotation<unknown | null>(),
 
+  // Bounded plan→do→review loop (search may run multiple passes per turn).
+  searchPass: Annotation<number>(),
+  searchAgain: Annotation<boolean>(),
+  reviewPayload: Annotation<any>(),
+  reviewText: Annotation<string>(),
+  reviewParsed: Annotation<unknown | null>(),
+
   agentPlan: Annotation<ChatAgentPlan | null>(),
   videos: Annotation<ChatVideoCard[]>(),
   blocks: Annotation<any[]>(),
@@ -1183,7 +1190,8 @@ async function chatTurnPlanNode(state: ChatTurnGraphState) {
         steps: [
           { action: "langgraph.plan" },
           useGeminiNative ? { action: "gemini.generateContent", model } : { action: "chat.completions", model, base_url: baseUrl },
-          { action: "langgraph.do", nodes: ["resolve_direct_urls", "exa_search_and_resolve"] },
+          { action: "langgraph.do", nodes: ["resolve_direct_urls"] },
+          { action: "langgraph.loop", nodes: ["exa_search_and_resolve", "review_refine"], max_passes: 2 },
           { action: "langgraph.review" },
         ],
       }
@@ -1317,6 +1325,22 @@ async function chatTurnDoSearchAndResolveNode(state: ChatTurnGraphState) {
   const videos: ChatVideoCard[] = Array.isArray(state.videos) ? [...state.videos] : [];
   const directResolveCache = { ...(state.directResolveCache || {}) };
   const usedKeys = recentSuggestedUrlKeys(state.recent || []);
+  const addUsed = (url: string) => {
+    const key = normalizeUrlForDedup(url);
+    if (key) usedKeys.add(key);
+  };
+  for (const v of videos) addUsed(v.url);
+  for (const b of blocks) {
+    const type = str((b as any)?.type);
+    if (type === "links") {
+      const links = Array.isArray((b as any)?.links) ? ((b as any).links as any[]) : [];
+      for (const l of links) addUsed(str(l?.url));
+    }
+    if (type === "videos") {
+      const vids = Array.isArray((b as any)?.videos) ? ((b as any).videos as any[]) : [];
+      for (const v of vids) addUsed(str(v?.url));
+    }
+  }
 
   if (state.needsConsent) return { agentPlan, blocks, videos, directResolveCache };
 
@@ -1335,6 +1359,9 @@ async function chatTurnDoSearchAndResolveNode(state: ChatTurnGraphState) {
     agentPlan.reply = `${ensureUserFacingReplyText(agentPlan.reply)}\n\n联网搜索未配置：请在设置里填 Exa API Key（或 Google CSE API Key + CX），然后再试；也可以直接把候选链接贴给我。`;
     return { agentPlan, blocks, videos, directResolveCache };
   }
+  const currentPass = typeof state.searchPass === "number" && Number.isFinite(state.searchPass) ? state.searchPass : 0;
+  const maxRounds = currentPass <= 0 ? 3 : 2; // 2nd+ pass should be more targeted
+  const nextSearchPass = currentPass + 1;
   const primaryFocus = expandFocusTokens(focusTokensFromText(userText));
   const fallbackFocus = expandFocusTokens(focusTokensFromText(agentPlan.search_queries.join(" ")));
   const focusForQueryPick = primaryFocus.length > 0 ? primaryFocus : fallbackFocus;
@@ -1414,11 +1441,11 @@ async function chatTurnDoSearchAndResolveNode(state: ChatTurnGraphState) {
   }
 
   for (const q of queries.slice(1)) {
-    if (rounds.length >= 3) break;
+    if (rounds.length >= maxRounds) break;
     pushRound("alt", q);
   }
 
-  for (const { query } of rounds.slice(0, 3)) {
+  for (const { query } of rounds.slice(0, maxRounds)) {
     const { results } = await webSearch({
       query,
       numResults: 12,
@@ -1486,7 +1513,7 @@ async function chatTurnDoSearchAndResolveNode(state: ChatTurnGraphState) {
 
     if (links.length === 0) {
       agentPlan.reply = `${ensureUserFacingReplyText(agentPlan.reply)}\n\n我暂时没搜到合适的网站结果。你能补充 1 句话吗：你想要的是“表情包/图片/GIF 资源包”，还是“配音/BGM/音效网站”？也可以指定平台（GitHub/站点名/语言）。`;
-      return { agentPlan, blocks, videos, directResolveCache };
+      return { agentPlan, blocks, videos, directResolveCache, searchPass: nextSearchPass };
     }
 
     const hasLinks = blocks.some((b) => b && typeof b === "object" && (b as any).type === "links");
@@ -1500,7 +1527,7 @@ async function chatTurnDoSearchAndResolveNode(state: ChatTurnGraphState) {
       }
     }
 
-    return { agentPlan, blocks, videos, directResolveCache };
+    return { agentPlan, blocks, videos, directResolveCache, searchPass: nextSearchPass };
   }
 
   const existing = new Set(videos.map((v) => normalizeUrlForDedup(v.url)).filter(Boolean));
@@ -1533,7 +1560,7 @@ async function chatTurnDoSearchAndResolveNode(state: ChatTurnGraphState) {
 
   if (videos.length === 0) {
     agentPlan.reply = `${ensureUserFacingReplyText(agentPlan.reply)}\n\n我搜到了一些结果，但相关度不高，所以先不乱贴链接。你能补充 1 句话吗：你要的是“表情包/图片/GIF 资源包”，还是“相关的视频素材”？也可以直接给一个示例链接/BV 号，我会按它找同类。`;
-    return { agentPlan, blocks, videos, directResolveCache };
+    return { agentPlan, blocks, videos, directResolveCache, searchPass: nextSearchPass };
   }
 
   if (unresolved > 0) {
@@ -1551,7 +1578,152 @@ async function chatTurnDoSearchAndResolveNode(state: ChatTurnGraphState) {
     }
   }
 
-  return { agentPlan, blocks, videos, directResolveCache };
+  return { agentPlan, blocks, videos, directResolveCache, searchPass: nextSearchPass };
+}
+
+async function chatTurnReviewRefineNode(state: ChatTurnGraphState) {
+  const { projectId, userText, recent, thinkEnabled, useGeminiNative, baseUrl, model, geminiApiKey } = state;
+
+  const agentPlan: ChatAgentPlan = state.agentPlan || {
+    reply: ensureUserFacingReplyText(""),
+    prompt_draft: null,
+    should_search: false,
+    search_queries: [],
+  };
+
+  if (state.needsConsent) return { searchAgain: false };
+  if (!thinkEnabled) return { searchAgain: false };
+
+  const pass = typeof state.searchPass === "number" && Number.isFinite(state.searchPass) ? state.searchPass : 0;
+  // Review only once (after first search pass) to keep cost bounded.
+  if (pass !== 1) return { searchAgain: false };
+
+  const blocks: any[] = Array.isArray(state.blocks) ? state.blocks : [];
+  const videos: ChatVideoCard[] = Array.isArray(state.videos) ? state.videos : [];
+
+  const linkBlock = blocks.find((b) => b && typeof b === "object" && (b as any).type === "links");
+  const videoBlock = blocks.find((b) => b && typeof b === "object" && (b as any).type === "videos");
+
+  const links = Array.isArray((linkBlock as any)?.links) ? ((linkBlock as any).links as any[]) : [];
+  const vids = Array.isArray((videoBlock as any)?.videos) ? ((videoBlock as any).videos as any[]) : [];
+
+  const usedKeys = recentSuggestedUrlKeys(recent || []);
+  const avoidUrls: string[] = [];
+  for (const key of usedKeys) {
+    if (avoidUrls.length >= 30) break;
+    avoidUrls.push(key);
+  }
+
+  const presentLinks = links
+    .slice(0, 8)
+    .map((l) => ({
+      title: typeof l?.title === "string" ? l.title : "",
+      url: typeof l?.url === "string" ? l.url : "",
+      snippet: typeof l?.snippet === "string" ? l.snippet : null,
+    }))
+    .filter((l) => !!str(l.url));
+
+  const presentVideos = (vids.length > 0 ? vids : videos)
+    .slice(0, 8)
+    .map((v: any) => ({
+      title: typeof v?.title === "string" ? v.title : "",
+      url: typeof v?.url === "string" ? v.url : "",
+      description: typeof v?.description === "string" ? v.description : null,
+    }))
+    .filter((v: any) => !!str(v.url));
+
+  const intent = detectChatSearchIntent(`${userText} ${agentPlan.search_queries.join(" ")}`);
+
+  const systemPrompt = [
+    "You are VidUnpack Chat (视频拆解箱对话助手).",
+    "You are in the REVIEW step after ONE web-search pass.",
+    "Task: evaluate whether current candidates match the user's intent and context; if not, propose 1-2 refined search queries for ONE more targeted pass.",
+    "Rules:",
+    "- Output JSON ONLY (no markdown).",
+    '- Schema: { \"search_again\": boolean, \"search_queries\"?: string[], \"ask_user\"?: string }',
+    "- search_again=true only if another pass is likely to improve relevance.",
+    "- If user intent is ambiguous, set search_again=false and provide ask_user (1 short clarifying question).",
+    "- If providing search_queries, keep them concise and avoid repeating previous queries.",
+    "- Avoid suggesting URLs already shown before (see avoid_urls).",
+    "",
+    `intent=${intent}`,
+    "",
+    "INPUT:",
+    JSON.stringify(
+      {
+        user_text: userText,
+        previous_queries: agentPlan.search_queries,
+        candidates: { links: presentLinks, videos: presentVideos },
+        avoid_urls: avoidUrls,
+      },
+      null,
+      2,
+    ),
+  ].join("\n");
+
+  const recentTail = Array.isArray(recent) ? recent.slice(Math.max(0, recent.length - 6)) : [];
+  const contents = [
+    { role: "user", parts: [{ text: systemPrompt }] },
+    ...recentTail.map((m) => ({
+      role: m.role === "assistant" ? "model" : "user",
+      parts: [{ text: m.content || "" }],
+    })),
+  ];
+
+  const openAiMessages: OpenAIChatMessage[] = [
+    { role: "system", content: systemPrompt },
+    ...recentTail.map((m) => ({
+      role: toOpenAiRole(m.role),
+      content: m.content || "",
+    })),
+  ];
+
+  let reviewPayload: any;
+  if (useGeminiNative) {
+    const url = new URL(`/v1beta/models/${encodeURIComponent(model)}:generateContent`, baseUrl);
+    url.searchParams.set("key", geminiApiKey);
+    reviewPayload = await fetchJson<any>(url.toString(), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        contents,
+        generationConfig: { temperature: 0.2, maxOutputTokens: 512 },
+      }),
+    });
+  } else {
+    reviewPayload = await callChatCompletions({
+      baseUrl,
+      apiKey: geminiApiKey,
+      model,
+      messages: openAiMessages,
+      temperature: 0.2,
+      maxTokens: 512,
+    });
+  }
+
+  const reviewText = useGeminiNative ? extractGeminiText(reviewPayload) : extractChatCompletionsText(reviewPayload);
+  const reviewParsed = tryParseJson(reviewText);
+  const obj = reviewParsed && typeof reviewParsed === "object" ? (reviewParsed as any) : null;
+  const searchAgain = !!obj?.search_again;
+  const nextQueriesRaw = Array.isArray(obj?.search_queries) ? obj.search_queries : [];
+  const nextQueries = uniqStrings(nextQueriesRaw.map((s: any) => String(s))).filter(Boolean).slice(0, 4);
+  const askUser = typeof obj?.ask_user === "string" ? obj.ask_user.trim() : "";
+
+  if (searchAgain && nextQueries.length > 0) {
+    agentPlan.should_search = true;
+    agentPlan.search_queries = nextQueries;
+    agentPlan.reply = `${ensureUserFacingReplyText(agentPlan.reply)}\n\n我再补搜一轮，尽量提高相关度并避开重复结果…`;
+    return { agentPlan, searchAgain: true, reviewPayload, reviewText, reviewParsed };
+  }
+
+  if (!searchAgain && askUser) {
+    agentPlan.should_search = false;
+    agentPlan.search_queries = [];
+    agentPlan.reply = `${ensureUserFacingReplyText(agentPlan.reply)}\n\n${askUser}`;
+    return { agentPlan, searchAgain: false, reviewPayload, reviewText, reviewParsed };
+  }
+
+  return { searchAgain: false, reviewPayload, reviewText, reviewParsed };
 }
 
 async function chatTurnReviewNode(state: ChatTurnGraphState) {
@@ -1590,6 +1762,11 @@ async function chatTurnPersistNode(state: ChatTurnGraphState) {
   };
   const videos: ChatVideoCard[] = Array.isArray(state.videos) ? state.videos : [];
   const blocks: any[] = Array.isArray(state.blocks) ? state.blocks : [];
+  const searchPass = typeof state.searchPass === "number" && Number.isFinite(state.searchPass) ? state.searchPass : 0;
+  const searchAgain = state.searchAgain === true;
+  const reviewText = typeof state.reviewText === "string" ? state.reviewText : "";
+  const reviewParsed = state.reviewParsed ?? null;
+  const reviewPayload = state.reviewPayload ?? null;
 
   const debugArtifact = await toolserverJson<ToolserverArtifact>(`/projects/${projectId}/artifacts/text`, {
     method: "POST",
@@ -1607,9 +1784,12 @@ async function chatTurnPersistNode(state: ChatTurnGraphState) {
           prompt_draft: agentPlan.prompt_draft,
           should_search: agentPlan.should_search,
           search_queries: agentPlan.search_queries,
+          search_passes: searchPass,
+          search_again: searchAgain,
           videos,
           blocks,
           llm: { text: llmText, parsed: llmParsed, payload: llmPayload },
+          review: { text: reviewText, parsed: reviewParsed, payload: reviewPayload },
         },
         null,
         2,
@@ -1625,16 +1805,27 @@ async function chatTurnPersistNode(state: ChatTurnGraphState) {
   return { debugArtifact, assistantMessage };
 }
 
+function routeAfterReviewRefine(state: ChatTurnGraphState): "exa_search_and_resolve" | "review" {
+  const pass = typeof state.searchPass === "number" && Number.isFinite(state.searchPass) ? state.searchPass : 0;
+  if (state.searchAgain === true && pass < 2) return "exa_search_and_resolve";
+  return "review";
+}
+
 const chatTurnLangGraph = new StateGraph(ChatTurnStateAnnotation)
   .addNode("llm_plan", chatTurnPlanNode)
   .addNode("resolve_direct_urls", chatTurnDoResolveDirectUrlsNode)
   .addNode("exa_search_and_resolve", chatTurnDoSearchAndResolveNode)
+  .addNode("review_refine", chatTurnReviewRefineNode)
   .addNode("review", chatTurnReviewNode)
   .addNode("persist", chatTurnPersistNode)
   .addEdge(START, "llm_plan")
   .addEdge("llm_plan", "resolve_direct_urls")
   .addEdge("resolve_direct_urls", "exa_search_and_resolve")
-  .addEdge("exa_search_and_resolve", "review")
+  .addEdge("exa_search_and_resolve", "review_refine")
+  .addConditionalEdges("review_refine", routeAfterReviewRefine, {
+    exa_search_and_resolve: "exa_search_and_resolve",
+    review: "review",
+  })
   .addEdge("review", "persist")
   .addEdge("persist", END)
   .compile();
@@ -1914,13 +2105,18 @@ app.post("/api/projects/:projectId/chat/turn", async (req, res) => {
       llmPayload: null,
       llmText: "",
       llmParsed: null,
+      searchPass: 0,
+      searchAgain: false,
+      reviewPayload: null,
+      reviewText: "",
+      reviewParsed: null,
       agentPlan: null,
       videos: [],
       blocks: [],
       needsConsent: false,
       debugArtifact: null,
       assistantMessage: null,
-    });
+    }, { recursionLimit: 25 });
 
     const assistantMessage = graphState.assistantMessage
       ? graphState.assistantMessage
