@@ -43,7 +43,7 @@ test("chat: resolve button updates card (proxy thumbnail + auto-resume after con
   await expect(page.getByTestId("chat-panel")).toBeVisible();
 
   // Send a message containing a real Bilibili URL.
-  // In E2E mock mode, orchestrator will pick up this URL and render a card for it.
+  // Chat should prompt for consent first, then auto-send after confirming.
   const bilibiliUrl =
     "https://www.bilibili.com/video/BV1CpzUBuEZ2/?spm_id_from=333.1387.homepage.video_card.click&vd_source=e75ce3ce84f093a660cd3e5dcd45eba23";
   const input = page.getByTestId("chat-input");
@@ -51,17 +51,17 @@ test("chat: resolve button updates card (proxy thumbnail + auto-resume after con
   await input.type(bilibiliUrl);
   await input.press("Enter");
 
-  await expect(page.getByTestId("chat-video-card")).toHaveCount(2);
-
-  // Resolve should require consent first, then auto-resume after confirming.
-  await page.getByTestId("chat-video-resolve-0").click();
   await expect(page.getByTestId("consent-modal")).toBeVisible();
   await page.getByTestId("consent-confirm").click();
   await expect(page.getByTestId("consent-modal")).toHaveCount(0);
+
+  await expect(page.getByTestId("chat-video-card")).toHaveCount(2);
+
+  // Resolve should fetch metadata and use proxy thumbnails.
+  await page.getByTestId("chat-video-resolve-0").click();
 
   await expect(page.getByTestId("chat-video-resolved-0")).toBeVisible({ timeout: 120_000 });
 
   const bg = await page.getByTestId("chat-video-thumb-0").evaluate((el) => getComputedStyle(el).backgroundImage);
   expect(bg).toContain("/api/proxy/image?");
 });
-

@@ -65,6 +65,7 @@ type ChatMessage = {
 
 type UploadFileArtifactResponse = { artifact: Artifact; bytes: number; file_name: string; mime: string | null };
 type ChatAttachment = { artifact: Artifact; bytes: number; file_name: string; mime: string | null };
+type ChatTurnAttachmentPayload = { artifact_id: string; file_name: string; mime: string; bytes: number | null };
 type ChatTurnResponse = {
   ok: boolean;
   needs_consent?: boolean;
@@ -74,6 +75,20 @@ type ChatTurnResponse = {
   assistant_message: ChatMessage;
   mock?: boolean;
 };
+
+type ConsentModalNextAction =
+  | {
+      kind: "chatCardRemote";
+      url: string;
+      download: boolean;
+    }
+  | {
+      kind: "chatSend";
+      chatId: string;
+      message: string;
+      attachments: ChatTurnAttachmentPayload[];
+    }
+  | null;
 
 const CLIENT_CONFIG_KEY = "vidunpack_client_config_v1";
 
@@ -191,6 +206,26 @@ function proxyImageUrl(url: string, referer: string): string {
     return `/api/proxy/image?${qs}`;
   }
   return u;
+}
+
+function extractFirstHttpUrl(text: string): string | null {
+  const s = String(text || "");
+  const m = s.match(/https?:\/\/[^\s]+/i);
+  if (!m) return null;
+  let url = m[0];
+  url = url.replace(/[)\]}>，。,。！？!?;；]+$/g, "");
+  return url.trim() || null;
+}
+
+function toChatTurnAttachmentsPayload(items: ChatAttachment[]): ChatTurnAttachmentPayload[] {
+  return items
+    .map((a) => ({
+      artifact_id: a.artifact.id,
+      file_name: a.file_name,
+      mime: a.mime || "",
+      bytes: a.bytes,
+    }))
+    .filter((a) => !!a.artifact_id);
 }
 
 // --- Components ---
@@ -523,14 +558,7 @@ export default function App() {
   const [consentModalOpen, setConsentModalOpen] = React.useState(false);
   const [consentModalAutoConfirm, setConsentModalAutoConfirm] = React.useState(true);
   const [consentModalUrl, setConsentModalUrl] = React.useState<string | null>(null);
-  const [consentModalNextAction, setConsentModalNextAction] = React.useState<
-    | {
-        kind: "chatCardRemote";
-        url: string;
-        download: boolean;
-      }
-    | null
-  >(null);
+  const [consentModalNextAction, setConsentModalNextAction] = React.useState<ConsentModalNextAction>(null);
   const [consentModalBusy, setConsentModalBusy] = React.useState(false);
   const [consentModalError, setConsentModalError] = React.useState<string | null>(null);
 
@@ -907,6 +935,9 @@ export default function App() {
 
     if (!consent?.consented) {
       setConsentModalUrl(url);
+      setConsentModalAutoConfirm(consent?.auto_confirm ?? true);
+      setConsentModalError(null);
+      setConsentModalNextAction(null);
       setConsentModalOpen(true);
       return;
     }
@@ -1092,6 +1123,29 @@ export default function App() {
     setChatAttachments((prev) => prev.filter((a) => a.artifact.id !== artifactId));
   };
 
+  const runChatTurn = async (opts: { chatId: string; message: string; attachments: ChatTurnAttachmentPayload[] }) => {
+    if (view.kind !== "project") throw new Error("no project selected");
+    const resp = await postJson<ChatTurnResponse>(`/api/projects/${view.projectId}/chat/turn`, {
+      chat_id: opts.chatId,
+      message: opts.message,
+      base_url: clientConfig.base_url,
+      gemini_api_key: clientConfig.gemini_api_key,
+      exa_api_key: clientConfig.exa_api_key,
+      google_cse_api_key: clientConfig.google_cse_api_key,
+      google_cse_cx: clientConfig.google_cse_cx,
+      default_model: clientConfig.default_model,
+      ytdlp_cookies_from_browser: clientConfig.ytdlp_cookies_from_browser,
+      attachments: opts.attachments,
+    });
+
+    setChatMessages((prev) => [...prev, resp.user_message, resp.assistant_message]);
+    if (resp.plan !== undefined) setLastPlan(resp.plan ?? null);
+    if (resp.plan_artifact !== undefined) setLastPlanArtifact(resp.plan_artifact ?? null);
+    await refreshProject(view.projectId);
+
+    return resp;
+  };
+
   const onChatSend = async () => {
     if (view.kind !== "project") return;
     if (!activeChatId) return;
@@ -1103,31 +1157,33 @@ export default function App() {
       return;
     }
 
+    const attachmentsPayload = toChatTurnAttachmentsPayload(chatAttachments);
+
+    if (!consent?.consented) {
+      const url = extractFirstHttpUrl(message);
+      if (url) {
+        setConsentModalUrl(url);
+        setConsentModalAutoConfirm(consent?.auto_confirm ?? true);
+        setConsentModalError(null);
+        setConsentModalNextAction({ kind: "chatSend", chatId: activeChatId, message, attachments: attachmentsPayload });
+        setConsentModalOpen(true);
+        return;
+      }
+    }
+
     setChatSendBusy(true);
     try {
-      const resp = await postJson<ChatTurnResponse>(`/api/projects/${view.projectId}/chat/turn`, {
-        chat_id: activeChatId,
-        message,
-        base_url: clientConfig.base_url,
-        gemini_api_key: clientConfig.gemini_api_key,
-        exa_api_key: clientConfig.exa_api_key,
-        google_cse_api_key: clientConfig.google_cse_api_key,
-        google_cse_cx: clientConfig.google_cse_cx,
-        default_model: clientConfig.default_model,
-        ytdlp_cookies_from_browser: clientConfig.ytdlp_cookies_from_browser,
-        attachments: chatAttachments.map((a) => ({
-          artifact_id: a.artifact.id,
-          file_name: a.file_name,
-          mime: a.mime || "",
-          bytes: a.bytes,
-        })),
-      });
+      const resp = await runChatTurn({ chatId: activeChatId, message, attachments: attachmentsPayload });
       setChatDraft("");
       setChatAttachments([]);
-      setChatMessages((prev) => [...prev, resp.user_message, resp.assistant_message]);
-      if (resp.plan !== undefined) setLastPlan(resp.plan ?? null);
-      if (resp.plan_artifact !== undefined) setLastPlanArtifact(resp.plan_artifact ?? null);
-      await refreshProject(view.projectId);
+
+      if (resp.needs_consent) {
+        setConsentModalUrl(extractFirstHttpUrl(message));
+        setConsentModalAutoConfirm(consent?.auto_confirm ?? true);
+        setConsentModalError(null);
+        setConsentModalNextAction(null);
+        setConsentModalOpen(true);
+      }
     } catch (e) {
       setChatSendError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -1174,6 +1230,8 @@ export default function App() {
 
     if (!consent?.consented) {
       setConsentModalUrl(url);
+      setConsentModalAutoConfirm(consent?.auto_confirm ?? true);
+      setConsentModalError(null);
       setConsentModalNextAction({ kind: "chatCardRemote", url, download });
       setConsentModalOpen(true);
       return;
@@ -1397,9 +1455,8 @@ export default function App() {
 
   const onConfirmConsentAndSaveUrl = async () => {
     if (view.kind !== "project") return;
-    if (!consentModalUrl) return;
-
     const next = consentModalNextAction;
+    const urlToSave = consentModalUrl?.trim() || "";
     setConsentModalBusy(true);
     setConsentModalError(null);
     try {
@@ -1408,7 +1465,9 @@ export default function App() {
         auto_confirm: consentModalAutoConfirm,
       });
       setConsent(updated);
-      await postJson<Artifact>(`/tool/projects/${view.projectId}/inputs/url`, { url: consentModalUrl });
+      if (urlToSave && !artifacts.some((a) => a.kind === "input_url" && a.path === urlToSave)) {
+        await postJson<Artifact>(`/tool/projects/${view.projectId}/inputs/url`, { url: urlToSave });
+      }
       setInputUrl("");
       setConsentModalOpen(false);
       setConsentModalUrl(null);
@@ -1417,6 +1476,18 @@ export default function App() {
 
       if (next?.kind === "chatCardRemote") {
         await runChatCardRemote(next.url, next.download);
+      }
+      if (next?.kind === "chatSend") {
+        setChatSendBusy(true);
+        try {
+          await runChatTurn({ chatId: next.chatId, message: next.message, attachments: next.attachments });
+          setChatDraft("");
+          setChatAttachments([]);
+        } catch (e) {
+          setChatSendError(e instanceof Error ? e.message : String(e));
+        } finally {
+          setChatSendBusy(false);
+        }
       }
     } catch (e) {
       setConsentModalError(e instanceof Error ? e.message : String(e));
@@ -2538,9 +2609,9 @@ export default function App() {
            <div className="modal-content">
               <h3 className="text-lg font-bold mb-3">{tr("externalContentWarningTitle")}</h3>
               <p className="text-sm text-muted mb-4 leading-relaxed">{tr("externalContentWarningText")}</p>
-              <div className="code-block text-xs text-primary mb-6 break-all">
-                 {consentModalUrl}
-              </div>
+              {consentModalUrl ? (
+                <div className="code-block text-xs text-primary mb-6 break-all">{consentModalUrl}</div>
+              ) : null}
 
               <label className="flex items-center gap-2 mb-6 cursor-pointer select-none justify-center">
                   <input
