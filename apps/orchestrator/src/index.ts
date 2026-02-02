@@ -1671,6 +1671,12 @@ async function chatTurnReviewRefineNode(state: ChatTurnGraphState) {
 
   const intent = detectChatSearchIntent(`${userText} ${agentPlan.search_queries.join(" ")}`);
 
+  // Heuristic early-stop: avoid burning all passes when we already have enough candidates.
+  // The loop is capped by CHAT_MAX_SEARCH_PASSES, but the review model can still be overly eager.
+  const candidateCount = intent === "video" ? presentVideos.length : presentLinks.length;
+  const enoughCandidates = intent === "video" ? candidateCount >= 4 : candidateCount >= 6;
+  if (enoughCandidates) return { searchAgain: false };
+
   const systemPrompt = [
     "You are VidUnpack Chat (视频拆解箱对话助手).",
     "You are in the REVIEW step after a web-search pass.",
@@ -1752,7 +1758,6 @@ async function chatTurnReviewRefineNode(state: ChatTurnGraphState) {
   if (searchAgain && nextQueries.length > 0) {
     agentPlan.should_search = true;
     agentPlan.search_queries = nextQueries;
-    agentPlan.reply = `${ensureUserFacingReplyText(agentPlan.reply)}\n\n我再补搜一轮（第 ${pass + 1}/${CHAT_MAX_SEARCH_PASSES} 轮），尽量提高相关度并避开重复结果…`;
     emitChatStage({ stage: "refine", detail: nextQueries.join(" | "), pass: pass + 1, max_passes: CHAT_MAX_SEARCH_PASSES });
     return { agentPlan, searchAgain: true, reviewPayload, reviewText, reviewParsed };
   }
