@@ -5,6 +5,7 @@ const orchestratorPort = Number(process.env.E2E_ORCHESTRATOR_PORT || process.env
 const toolserverPort = Number(process.env.E2E_TOOLSERVER_PORT || process.env.TOOLSERVER_PORT || 6791);
 
 const baseURL = process.env.E2E_BASE_URL || `http://127.0.0.1:${webPort}`;
+const npmCmd = process.platform === "win32" ? "npm.cmd" : "npm";
 
 export default defineConfig({
   testDir: "./tests/e2e",
@@ -20,7 +21,7 @@ export default defineConfig({
     video: "retain-on-failure",
   },
   webServer: {
-    command: "npm run dev",
+    command: `${npmCmd} run dev`,
     url: baseURL,
     timeout: 300_000,
     reuseExistingServer: false,

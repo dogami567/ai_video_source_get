@@ -3,6 +3,7 @@ import { defineConfig, devices } from "@playwright/test";
 const orchestratorPort = Number(process.env.E2E_ORCHESTRATOR_PORT || 17890);
 const toolserverPort = Number(process.env.E2E_TOOLSERVER_PORT || 17891);
 const baseURL = process.env.E2E_BASE_URL || `http://127.0.0.1:${orchestratorPort}`;
+const npmCmd = process.platform === "win32" ? "npm.cmd" : "npm";
 
 export default defineConfig({
   testDir: "./tests/e2e",
@@ -18,8 +19,7 @@ export default defineConfig({
     video: "retain-on-failure",
   },
   webServer: {
-    command:
-      'npm -w @vidunpack/web run build && npm -w @vidunpack/orchestrator run build && concurrently -n orchestrator,toolserver -c blue,magenta "npm -w @vidunpack/orchestrator run start" "node scripts/run-toolserver.mjs"',
+    command: `${npmCmd} -w @vidunpack/web run build && ${npmCmd} -w @vidunpack/orchestrator run build && concurrently -n orchestrator,toolserver -c blue,magenta "${npmCmd} -w @vidunpack/orchestrator run start" "node scripts/run-toolserver.mjs"`,
     url: baseURL,
     timeout: 300_000,
     reuseExistingServer: false,
