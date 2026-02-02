@@ -16,6 +16,12 @@ dotenv.config({ path: path.resolve(process.cwd(), "../../.env") });
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
+const CHAT_MAX_SEARCH_PASSES = (() => {
+  const raw = Number(process.env.CHAT_MAX_SEARCH_PASSES);
+  if (!Number.isFinite(raw)) return 5;
+  return Math.max(1, Math.min(5, Math.floor(raw)));
+})();
+
 type ToolserverArtifact = { id: string; project_id: string; kind: string; path: string; created_at_ms: number };
 type ToolserverSettings = { project_id: string; think_enabled: boolean; updated_at_ms: number };
 type ToolserverConsent = { project_id: string; consented: boolean; auto_confirm: boolean; updated_at_ms: number };
@@ -1191,7 +1197,7 @@ async function chatTurnPlanNode(state: ChatTurnGraphState) {
           { action: "langgraph.plan" },
           useGeminiNative ? { action: "gemini.generateContent", model } : { action: "chat.completions", model, base_url: baseUrl },
           { action: "langgraph.do", nodes: ["resolve_direct_urls"] },
-          { action: "langgraph.loop", nodes: ["exa_search_and_resolve", "review_refine"], max_passes: 2 },
+          { action: "langgraph.loop", nodes: ["exa_search_and_resolve", "review_refine"], max_passes: CHAT_MAX_SEARCH_PASSES },
           { action: "langgraph.review" },
         ],
       }
@@ -1595,8 +1601,9 @@ async function chatTurnReviewRefineNode(state: ChatTurnGraphState) {
   if (!thinkEnabled) return { searchAgain: false };
 
   const pass = typeof state.searchPass === "number" && Number.isFinite(state.searchPass) ? state.searchPass : 0;
-  // Review only once (after first search pass) to keep cost bounded.
-  if (pass !== 1) return { searchAgain: false };
+  // Only review after at least one search pass; stop looping at max passes.
+  if (pass <= 0) return { searchAgain: false };
+  if (pass >= CHAT_MAX_SEARCH_PASSES) return { searchAgain: false };
 
   const blocks: any[] = Array.isArray(state.blocks) ? state.blocks : [];
   const videos: ChatVideoCard[] = Array.isArray(state.videos) ? state.videos : [];
@@ -1636,7 +1643,7 @@ async function chatTurnReviewRefineNode(state: ChatTurnGraphState) {
 
   const systemPrompt = [
     "You are VidUnpack Chat (视频拆解箱对话助手).",
-    "You are in the REVIEW step after ONE web-search pass.",
+    "You are in the REVIEW step after a web-search pass.",
     "Task: evaluate whether current candidates match the user's intent and context; if not, propose 1-2 refined search queries for ONE more targeted pass.",
     "Rules:",
     "- Output JSON ONLY (no markdown).",
@@ -1647,6 +1654,9 @@ async function chatTurnReviewRefineNode(state: ChatTurnGraphState) {
     "- Avoid suggesting URLs already shown before (see avoid_urls).",
     "",
     `intent=${intent}`,
+    `pass=${pass}`,
+    `max_passes=${CHAT_MAX_SEARCH_PASSES}`,
+    `remaining_passes=${Math.max(0, CHAT_MAX_SEARCH_PASSES - pass)}`,
     "",
     "INPUT:",
     JSON.stringify(
@@ -1712,7 +1722,7 @@ async function chatTurnReviewRefineNode(state: ChatTurnGraphState) {
   if (searchAgain && nextQueries.length > 0) {
     agentPlan.should_search = true;
     agentPlan.search_queries = nextQueries;
-    agentPlan.reply = `${ensureUserFacingReplyText(agentPlan.reply)}\n\n我再补搜一轮，尽量提高相关度并避开重复结果…`;
+    agentPlan.reply = `${ensureUserFacingReplyText(agentPlan.reply)}\n\n我再补搜一轮（第 ${pass + 1}/${CHAT_MAX_SEARCH_PASSES} 轮），尽量提高相关度并避开重复结果…`;
     return { agentPlan, searchAgain: true, reviewPayload, reviewText, reviewParsed };
   }
 
@@ -1807,7 +1817,7 @@ async function chatTurnPersistNode(state: ChatTurnGraphState) {
 
 function routeAfterReviewRefine(state: ChatTurnGraphState): "exa_search_and_resolve" | "review" {
   const pass = typeof state.searchPass === "number" && Number.isFinite(state.searchPass) ? state.searchPass : 0;
-  if (state.searchAgain === true && pass < 2) return "exa_search_and_resolve";
+  if (state.searchAgain === true && pass < CHAT_MAX_SEARCH_PASSES) return "exa_search_and_resolve";
   return "review";
 }
 
