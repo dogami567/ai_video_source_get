@@ -1219,6 +1219,32 @@ export default function App() {
     }
   };
 
+  const onChatSaveInputUrl = async (url: string) => {
+    if (view.kind !== "project") return;
+    setChatCardError(null);
+
+    const u = url.trim();
+    if (!u) return;
+
+    if (!consent?.consented) {
+      setConsentModalUrl(u);
+      setConsentModalAutoConfirm(consent?.auto_confirm ?? true);
+      setConsentModalError(null);
+      setConsentModalNextAction(null);
+      setConsentModalOpen(true);
+      return;
+    }
+
+    try {
+      if (!artifacts.some((a) => a.kind === "input_url" && a.path === u)) {
+        await postJson<Artifact>(`/tool/projects/${view.projectId}/inputs/url`, { url: u });
+      }
+      await refreshProject(view.projectId);
+    } catch (e) {
+      setChatCardError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
   const onChatCardResolveOrDownload = async (url: string, download: boolean) => {
     if (view.kind !== "project") return;
     setChatCardError(null);
@@ -2246,6 +2272,43 @@ export default function App() {
 	                                                <div key={`b-${idx}`} className="chat-block">
 	                                                  <div className="chat-block-title">{title}</div>
 	                                                  <div className="code-block text-xs">{text}</div>
+	                                                </div>
+	                                              );
+	                                            }
+	                                            if (type === "links") {
+	                                              const links = Array.isArray(b?.links) ? (b.links as any[]) : [];
+	                                              if (links.length === 0) return null;
+	                                              return (
+	                                                <div key={`b-${idx}`} className="chat-block">
+	                                                  <div className="link-cards">
+	                                                    {links.map((l, li) => {
+	                                                      const url = typeof l?.url === "string" ? l.url : "";
+	                                                      const title = typeof l?.title === "string" ? l.title : url;
+	                                                      const snippet = typeof l?.snippet === "string" ? l.snippet : null;
+	                                                      return (
+	                                                        <div key={`${url}-${li}`} className="link-card" data-testid="chat-link-card">
+	                                                          <div className="link-info">
+	                                                            <a className="link-title" href={url} target="_blank" rel="noreferrer">
+	                                                              {title}
+	                                                            </a>
+	                                                            {snippet ? <div className="link-desc">{snippet}</div> : null}
+	                                                            <div className="link-url mono">{url}</div>
+	                                                          </div>
+	                                                          <div className="link-actions">
+	                                                            <button
+	                                                              className="btn btn-secondary btn-sm"
+	                                                              type="button"
+	                                                              onClick={() => void onChatSaveInputUrl(url)}
+	                                                              disabled={!url}
+	                                                              data-testid={`chat-link-save-${li}`}
+	                                                            >
+	                                                              {tr("save")}
+	                                                            </button>
+	                                                          </div>
+	                                                        </div>
+	                                                      );
+	                                                    })}
+	                                                  </div>
 	                                                </div>
 	                                              );
 	                                            }

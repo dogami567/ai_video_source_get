@@ -697,6 +697,12 @@ type ChatVideoCard = {
   id?: string;
 };
 
+type ChatLinkCard = {
+  url: string;
+  title: string;
+  snippet?: string | null;
+};
+
 type ChatAgentPlan = {
   reply: string;
   prompt_draft: string | null;
@@ -864,6 +870,16 @@ function scoreByTokens(haystack: string, primary: string[], fallback: string[]):
   return score;
 }
 
+type ChatSearchIntent = "video" | "web" | "image" | "audio";
+
+function detectChatSearchIntent(text: string): ChatSearchIntent {
+  const t = String(text || "");
+  if (/bgm|配音|音效|旁白|声音|音乐|伴奏|sfx|sound effect|voiceover|voice over/i.test(t)) return "audio";
+  if (/表情包|emoji|贴纸|gif|png|透明底|图片|素材图|贴图|icon/i.test(t)) return "image";
+  if (/网站|网页|站点|信息|资料|教程|仓库|repo|github|开源|document|docs/i.test(t)) return "web";
+  return "video";
+}
+
 type WebSearchResult = { title: string; url: string; snippet?: string | null };
 
 type WebSearchProvider = "google_cse" | "exa";
@@ -1029,13 +1045,14 @@ async function chatTurnPlanNode(state: ChatTurnGraphState) {
 
   const systemPrompt = [
     "You are VidUnpack Chat (视频拆解箱对话助手).",
-    "Goal: chat with the user to clarify their intent, then search for candidate source videos and present them as cards.",
+    "Goal: chat with the user to clarify their intent, then search for candidate sources and present them as cards (videos, emoji/image packs, audio/BGM/voiceover sources, websites).",
     "Rules:",
     "- Ask 1-3 clarifying questions if needed.",
     "- If user pasted exactly one video URL, treat it as the primary reference. If multiple URLs are present, ask which one should be the primary reference before searching.",
     "- Only set should_search=true when you are confident about the topic keywords. Avoid overly broad queries; ensure each search_query contains the main topic keyword(s) from the user message.",
     "- Prefer 2-3 topic-consistent search_queries (do not mix unrelated intents like BGM/tutorial unless the user explicitly asked).",
     "- Prefer bilibili for Chinese content by default, but if the user asks for external/off-site sources (e.g. YouTube/TikTok), do NOT restrict to bilibili only.",
+    "- If the user asks for websites/info/images/audio (not videos), focus the queries on that asset type (e.g. emoji pack/png/gif, bgm/sfx/voiceover, resource websites) and do NOT force video platforms.",
     "- When ready, output JSON ONLY (no markdown).",
     "- JSON schema:",
     `  { "reply": string, "prompt_draft"?: string, "should_search"?: boolean, "search_queries"?: string[] }`,
@@ -1129,6 +1146,7 @@ async function chatTurnDoResolveDirectUrlsNode(state: ChatTurnGraphState) {
 
   let needsConsent = false;
   const videos: ChatVideoCard[] = [];
+  const links: ChatLinkCard[] = [];
 
   if (directUrls.length > 1) {
     agentPlan.should_search = false;
@@ -1143,10 +1161,18 @@ async function chatTurnDoResolveDirectUrlsNode(state: ChatTurnGraphState) {
       needsConsent = true;
       agentPlan.reply = `${ensureUserFacingReplyText(agentPlan.reply)}\n\n要解析/搜索外部链接前，请先在本项目完成一次「授权确认」。`;
       for (const u of directUrls) {
+        if (!isLikelyVideoUrl(u)) {
+          links.push({ url: u, title: u, snippet: null });
+          continue;
+        }
         videos.push({ url: u, title: u, description: null, thumbnail: null, duration_s: null, extractor: "unknown", id: "" });
       }
     } else {
       for (const u of directUrls) {
+        if (!isLikelyVideoUrl(u)) {
+          links.push({ url: u, title: u, snippet: null });
+          continue;
+        }
         try {
           const cached = directResolveCache[u];
           const r = cached || (await resolveRemoteInfo(projectId, u, cookiesFromBrowser));
@@ -1169,6 +1195,9 @@ async function chatTurnDoResolveDirectUrlsNode(state: ChatTurnGraphState) {
 
   if (videos.length > 0) {
     blocks.push({ type: "videos", videos });
+  }
+  if (links.length > 0) {
+    blocks.push({ type: "links", links });
   }
 
   return { agentPlan, videos, blocks, needsConsent, directResolveCache };
@@ -1213,18 +1242,21 @@ async function chatTurnDoSearchAndResolveNode(state: ChatTurnGraphState) {
   const pickedQueries = rawQueries.filter((q) => containsAnyToken(q, focusForQueryPick));
   const queries = (pickedQueries.length > 0 ? pickedQueries : rawQueries).slice(0, 3);
 
-  type SearchCandidate = { url: string; title: string; score: number };
+  type SearchCandidate = { url: string; title: string; snippet: string | null; score: number };
   const candidateByUrl = new Map<string, SearchCandidate>();
 
-  const hintText = `${userText} ${rawQueries.join(" ")} ${(state.directUrls || []).join(" ")}`.toLowerCase();
+  const hintText = `${userText} ${rawQueries.join(" ")} ${(state.directUrls || []).join(" ")}`;
+  const intent = detectChatSearchIntent(hintText);
+
   const wantsExternal = /外站|站外|youtube|youtu|tiktok|douyin|instagram|twitter|x\\.com/i.test(hintText);
   const wantsBilibili = /b站|bilibili|b23\\.tv|bilibili\\.com|\\bbv[0-9a-z]{6,}/i.test(hintText);
   const wantsYoutube = /youtube|youtu|油管/i.test(hintText);
 
-  const preferBilibili = wantsBilibili && !wantsExternal;
-  const preferYoutube = wantsYoutube || wantsExternal;
+  const preferBilibili = intent === "video" && wantsBilibili && !wantsExternal;
+  const preferYoutube = intent === "video" && (wantsYoutube || wantsExternal);
 
   const platformBoost = (url: string): number => {
+    if (intent !== "video") return 0;
     const u = String(url || "").toLowerCase();
     const isBili = u.includes("bilibili.com") || u.includes("b23.tv");
     const isYt = u.includes("youtube.com") || u.includes("youtu.be");
@@ -1245,13 +1277,6 @@ async function chatTurnDoSearchAndResolveNode(state: ChatTurnGraphState) {
   };
 
   const mainQuery = str(queries[0]);
-  const hasExplicitSiteFilter = /\bsite:/i.test(mainQuery) || /(bilibili\.com|b23\.tv|youtube\.com|youtu\.be)/i.test(mainQuery);
-  const canApplySiteLayer = !!mainQuery && !hasExplicitSiteFilter;
-  const order: Array<"broad" | "bilibili" | "youtube"> = preferBilibili
-    ? ["bilibili", "broad", "youtube"]
-    : preferYoutube
-      ? ["youtube", "broad", "bilibili"]
-      : ["broad", "bilibili", "youtube"];
 
   const rounds: Array<{ label: string; query: string }> = [];
   const seenRound = new Set<string>();
@@ -1263,13 +1288,30 @@ async function chatTurnDoSearchAndResolveNode(state: ChatTurnGraphState) {
     rounds.push({ label, query: q0 });
   };
 
-  const queryByKind = {
-    broad: mainQuery,
-    bilibili: canApplySiteLayer ? `${mainQuery} site:bilibili.com` : "",
-    youtube: canApplySiteLayer ? `${mainQuery} site:youtube.com` : "",
-  };
+  if (intent === "video") {
+    const hasExplicitSiteFilter =
+      /\bsite:/i.test(mainQuery) || /(bilibili\.com|b23\.tv|youtube\.com|youtu\.be)/i.test(mainQuery);
+    const canApplySiteLayer = !!mainQuery && !hasExplicitSiteFilter;
+    const order: Array<"broad" | "bilibili" | "youtube"> = preferBilibili
+      ? ["bilibili", "broad", "youtube"]
+      : preferYoutube
+        ? ["youtube", "broad", "bilibili"]
+        : ["broad", "bilibili", "youtube"];
 
-  for (const k of order) pushRound(k, queryByKind[k]);
+    const queryByKind = {
+      broad: mainQuery,
+      bilibili: canApplySiteLayer ? `${mainQuery} site:bilibili.com` : "",
+      youtube: canApplySiteLayer ? `${mainQuery} site:youtube.com` : "",
+    };
+
+    for (const k of order) pushRound(k, queryByKind[k]);
+  } else {
+    pushRound("broad", mainQuery);
+    if (intent === "image") pushRound("images", `${mainQuery} 表情包 gif png 贴纸 sticker`);
+    if (intent === "audio") pushRound("audio", `${mainQuery} bgm 音效 配音 免版权`);
+    if (intent === "web") pushRound("sites", `${mainQuery} 网站 资料 资源`);
+  }
+
   for (const q of queries.slice(1)) {
     if (rounds.length >= 3) break;
     pushRound("alt", q);
@@ -1288,7 +1330,9 @@ async function chatTurnDoSearchAndResolveNode(state: ChatTurnGraphState) {
     for (const r of results) {
       const u = str(r.url);
       const t = str(r.title) || u;
-      if (!isLikelyVideoUrl(u)) continue;
+      const isVideo = isLikelyVideoUrl(u);
+      if (intent === "video" && !isVideo) continue;
+      if (intent !== "video" && isVideo) continue;
 
       const hay = `${t} ${u} ${str(r.snippet)}`;
       const score = scoreByTokens(hay, primaryFocus, fallbackFocus) + platformBoost(u);
@@ -1296,7 +1340,7 @@ async function chatTurnDoSearchAndResolveNode(state: ChatTurnGraphState) {
 
       const prev = candidateByUrl.get(u);
       if (!prev || prev.score < score) {
-        candidateByUrl.set(u, { url: u, title: t.trim() || u, score });
+        candidateByUrl.set(u, { url: u, title: t.trim() || u, snippet: str(r.snippet) || null, score });
       }
     }
 
@@ -1306,6 +1350,36 @@ async function chatTurnDoSearchAndResolveNode(state: ChatTurnGraphState) {
 
   const ranked = Array.from(candidateByUrl.values()).sort((a, b) => b.score - a.score);
   const selected = ranked.slice(0, 6);
+
+  if (intent !== "video") {
+    const links: ChatLinkCard[] = [];
+    const seen = new Set<string>();
+    for (const cand of selected) {
+      if (links.length >= 6) break;
+      const u = cand.url;
+      if (!u || seen.has(u)) continue;
+      seen.add(u);
+      links.push({ url: u, title: cand.title || u, snippet: cand.snippet || null });
+    }
+
+    if (links.length === 0) {
+      agentPlan.reply = `${ensureUserFacingReplyText(agentPlan.reply)}\n\n我暂时没搜到合适的网站结果。你能补充 1 句话吗：你想要的是“表情包/图片/GIF 资源包”，还是“配音/BGM/音效网站”？也可以指定平台（GitHub/站点名/语言）。`;
+      return { agentPlan, blocks, videos, directResolveCache };
+    }
+
+    const hasLinks = blocks.some((b) => b && typeof b === "object" && (b as any).type === "links");
+    if (!hasLinks) blocks.push({ type: "links", links });
+    if (hasLinks) {
+      for (const b of blocks) {
+        if (b && typeof b === "object" && (b as any).type === "links") {
+          (b as any).links = links;
+          break;
+        }
+      }
+    }
+
+    return { agentPlan, blocks, videos, directResolveCache };
+  }
 
   const existing = new Set(videos.map((v) => v.url));
   let unresolved = 0;
@@ -1410,6 +1484,7 @@ async function chatTurnPersistNode(state: ChatTurnGraphState) {
           should_search: agentPlan.should_search,
           search_queries: agentPlan.search_queries,
           videos,
+          blocks,
           llm: { text: llmText, parsed: llmParsed, payload: llmPayload },
         },
         null,
@@ -1492,9 +1567,30 @@ app.post("/api/projects/:projectId/chat/turn", async (req, res) => {
       const thumb = escapeDataUrlSvg(
         `<svg xmlns="http://www.w3.org/2000/svg" width="320" height="180"><rect width="100%" height="100%" fill="#F2F2F7"/><text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" font-family="Arial" font-size="20" fill="#1D1D1F">Video</text></svg>`,
       );
+      const intent = detectChatSearchIntent(userText);
       const detectedUrls = extractHttpUrls(userText, 2);
       const url1 = detectedUrls[0] || "https://www.bilibili.com/video/BV1xx411c7mD";
       const url2 = detectedUrls[1] || "https://www.bilibili.com/video/BV1yy411c7mE";
+
+      if (intent !== "video") {
+        const links: ChatLinkCard[] = [
+          {
+            url: "https://github.com/",
+            title: "Mock: GitHub (links block)",
+            snippet: "（E2E mock）用于验证非视频链接卡片渲染。",
+          },
+          {
+            url: "https://www.wikipedia.org/",
+            title: "Mock: Wikipedia (links block)",
+            snippet: "（E2E mock）第二条链接。",
+          },
+        ];
+        const assistantMessage = await createChatMessage(projectId, chatId, "assistant", "我先给你两条示例链接（mock 模式）。", {
+          blocks: [{ type: "links", links }],
+        });
+        return res.json({ ok: true, user_message: userMessage, assistant_message: assistantMessage, mock: true });
+      }
+
       const videos: ChatVideoCard[] = [
         {
           url: url1,
