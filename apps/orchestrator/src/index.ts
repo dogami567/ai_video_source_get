@@ -1,6 +1,7 @@
 import path from "node:path";
 import process from "node:process";
 import { spawn } from "node:child_process";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { Readable } from "node:stream";
@@ -21,6 +22,25 @@ const CHAT_MAX_SEARCH_PASSES = (() => {
   if (!Number.isFinite(raw)) return 5;
   return Math.max(1, Math.min(5, Math.floor(raw)));
 })();
+
+type ChatTurnStageEvent = {
+  stage: string;
+  detail?: string | null;
+  pass?: number | null;
+  max_passes?: number | null;
+};
+
+const chatTurnStreamCtx = new AsyncLocalStorage<{ emit: (evt: ChatTurnStageEvent) => void }>();
+
+function emitChatStage(evt: ChatTurnStageEvent) {
+  const store = chatTurnStreamCtx.getStore();
+  if (!store) return;
+  try {
+    store.emit(evt);
+  } catch {
+    // ignore
+  }
+}
 
 type ToolserverArtifact = { id: string; project_id: string; kind: string; path: string; created_at_ms: number };
 type ToolserverSettings = { project_id: string; think_enabled: boolean; updated_at_ms: number };
@@ -1128,6 +1148,8 @@ function isLikelyVideoUrl(url: string): boolean {
 async function chatTurnPlanNode(state: ChatTurnGraphState) {
   const { projectId, directUrls, cookiesFromBrowser, recent, thinkEnabled, useGeminiNative, baseUrl, model, geminiApiKey } = state;
 
+  emitChatStage({ stage: "planning" });
+
   const directResolveCache = { ...(state.directResolveCache || {}) };
 
   let referenceForPrompt = "";
@@ -1243,6 +1265,10 @@ async function chatTurnPlanNode(state: ChatTurnGraphState) {
 
 async function chatTurnDoResolveDirectUrlsNode(state: ChatTurnGraphState) {
   const { projectId, directUrls, cookiesFromBrowser } = state;
+
+  if (directUrls.length > 0) {
+    emitChatStage({ stage: "resolve", detail: `${directUrls.length}` });
+  }
 
   const agentPlan: ChatAgentPlan = state.agentPlan || {
     reply: ensureUserFacingReplyText(""),
@@ -1368,6 +1394,7 @@ async function chatTurnDoSearchAndResolveNode(state: ChatTurnGraphState) {
   const currentPass = typeof state.searchPass === "number" && Number.isFinite(state.searchPass) ? state.searchPass : 0;
   const maxRounds = currentPass <= 0 ? 3 : 2; // 2nd+ pass should be more targeted
   const nextSearchPass = currentPass + 1;
+  emitChatStage({ stage: "search", pass: nextSearchPass, max_passes: CHAT_MAX_SEARCH_PASSES });
   const primaryFocus = expandFocusTokens(focusTokensFromText(userText));
   const fallbackFocus = expandFocusTokens(focusTokensFromText(agentPlan.search_queries.join(" ")));
   const focusForQueryPick = primaryFocus.length > 0 ? primaryFocus : fallbackFocus;
@@ -1452,6 +1479,7 @@ async function chatTurnDoSearchAndResolveNode(state: ChatTurnGraphState) {
   }
 
   for (const { query } of rounds.slice(0, maxRounds)) {
+    emitChatStage({ stage: "search_query", detail: query });
     const { results } = await webSearch({
       query,
       numResults: 12,
@@ -1605,6 +1633,8 @@ async function chatTurnReviewRefineNode(state: ChatTurnGraphState) {
   if (pass <= 0) return { searchAgain: false };
   if (pass >= CHAT_MAX_SEARCH_PASSES) return { searchAgain: false };
 
+  emitChatStage({ stage: "review", pass, max_passes: CHAT_MAX_SEARCH_PASSES });
+
   const blocks: any[] = Array.isArray(state.blocks) ? state.blocks : [];
   const videos: ChatVideoCard[] = Array.isArray(state.videos) ? state.videos : [];
 
@@ -1723,6 +1753,7 @@ async function chatTurnReviewRefineNode(state: ChatTurnGraphState) {
     agentPlan.should_search = true;
     agentPlan.search_queries = nextQueries;
     agentPlan.reply = `${ensureUserFacingReplyText(agentPlan.reply)}\n\n我再补搜一轮（第 ${pass + 1}/${CHAT_MAX_SEARCH_PASSES} 轮），尽量提高相关度并避开重复结果…`;
+    emitChatStage({ stage: "refine", detail: nextQueries.join(" | "), pass: pass + 1, max_passes: CHAT_MAX_SEARCH_PASSES });
     return { agentPlan, searchAgain: true, reviewPayload, reviewText, reviewParsed };
   }
 
@@ -1778,6 +1809,8 @@ async function chatTurnPersistNode(state: ChatTurnGraphState) {
   const reviewParsed = state.reviewParsed ?? null;
   const reviewPayload = state.reviewPayload ?? null;
 
+  emitChatStage({ stage: "saving" });
+
   const debugArtifact = await toolserverJson<ToolserverArtifact>(`/projects/${projectId}/artifacts/text`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -1812,6 +1845,8 @@ async function chatTurnPersistNode(state: ChatTurnGraphState) {
     debug_artifact: debugArtifact,
   });
 
+  emitChatStage({ stage: "done" });
+
   return { debugArtifact, assistantMessage };
 }
 
@@ -1840,261 +1875,263 @@ const chatTurnLangGraph = new StateGraph(ChatTurnStateAnnotation)
   .addEdge("persist", END)
   .compile();
 
-app.post("/api/projects/:projectId/chat/turn", async (req, res) => {
-  try {
-    const projectId = String(req.params.projectId || "").trim();
-    if (!projectId) return res.status(400).json({ ok: false, error: "missing project id" });
+async function handleChatTurn(projectId: string, body: any) {
+  const pid = String(projectId || "").trim();
+  if (!pid) throw new HttpError(400, "missing project id");
 
-    const chatId = str(req.body?.chat_id);
-    if (!chatId) return res.status(400).json({ ok: false, error: "missing chat_id" });
+  emitChatStage({ stage: "starting" });
 
-    const userText = String(req.body?.message || "").trimEnd();
-    if (!userText.trim()) return res.status(400).json({ ok: false, error: "missing message" });
+  const chatId = str(body?.chat_id);
+  if (!chatId) throw new HttpError(400, "missing chat_id");
 
-    const directUrls = extractHttpUrls(userText, 4);
-    const wantsAnalysis = wantsVideoAnalysis(userText);
+  const userText = String(body?.message || "").trimEnd();
+  if (!userText.trim()) throw new HttpError(400, "missing message");
 
-    const attachmentsRaw = Array.isArray(req.body?.attachments) ? req.body.attachments : [];
-    const attachments = attachmentsRaw
-      .map((a: any) => ({
-        artifact_id: typeof a?.artifact_id === "string" ? a.artifact_id : "",
-        file_name: typeof a?.file_name === "string" ? a.file_name : "",
-        mime: typeof a?.mime === "string" ? a.mime : "",
-        bytes: typeof a?.bytes === "number" ? a.bytes : null,
-      }))
-      .filter((a: any) => !!a.artifact_id);
+  const directUrls = extractHttpUrls(userText, 4);
+  const wantsAnalysis = wantsVideoAnalysis(userText);
 
-    const thinkEnabled = await getThinkEnabled(projectId);
+  const attachmentsRaw = Array.isArray(body?.attachments) ? body.attachments : [];
+  const attachments = attachmentsRaw
+    .map((a: any) => ({
+      artifact_id: typeof a?.artifact_id === "string" ? a.artifact_id : "",
+      file_name: typeof a?.file_name === "string" ? a.file_name : "",
+      mime: typeof a?.mime === "string" ? a.mime : "",
+      bytes: typeof a?.bytes === "number" ? a.bytes : null,
+    }))
+    .filter((a: any) => !!a.artifact_id);
 
-    const geminiApiKey = str(req.body?.gemini_api_key) || str(req.body?.api_key) || str(process.env.GEMINI_API_KEY);
-    const exaApiKey = str(req.body?.exa_api_key) || str(req.body?.api_key) || str(process.env.EXA_API_KEY);
-    const googleCseApiKey = str(req.body?.google_cse_api_key) || str(process.env.GOOGLE_CSE_API_KEY);
-    const googleCseCx = str(req.body?.google_cse_cx) || str(process.env.GOOGLE_CSE_CX);
-    const baseUrl = str(req.body?.base_url) || str(process.env.BASE_URL) || "https://generativelanguage.googleapis.com";
-    const model =
-      str(req.body?.model) ||
-      str(req.body?.default_model) ||
-      str(process.env.DEFAULT_MODEL) ||
-      "gemini-3-preview";
-    const cookiesFromBrowser =
-      str(req.body?.ytdlp_cookies_from_browser) || str(process.env.YTDLP_COOKIES_FROM_BROWSER) || "";
+  const thinkEnabled = await getThinkEnabled(pid);
 
-    const userMessage = await createChatMessage(
-      projectId,
-      chatId,
-      "user",
-      userText,
-      attachments.length > 0 ? { attachments } : undefined,
+  const geminiApiKey = str(body?.gemini_api_key) || str(body?.api_key) || str(process.env.GEMINI_API_KEY);
+  const exaApiKey = str(body?.exa_api_key) || str(body?.api_key) || str(process.env.EXA_API_KEY);
+  const googleCseApiKey = str(body?.google_cse_api_key) || str(process.env.GOOGLE_CSE_API_KEY);
+  const googleCseCx = str(body?.google_cse_cx) || str(process.env.GOOGLE_CSE_CX);
+  const baseUrl = str(body?.base_url) || str(process.env.BASE_URL) || "https://generativelanguage.googleapis.com";
+  const model = str(body?.model) || str(body?.default_model) || str(process.env.DEFAULT_MODEL) || "gemini-3-preview";
+  const cookiesFromBrowser = str(body?.ytdlp_cookies_from_browser) || str(process.env.YTDLP_COOKIES_FROM_BROWSER) || "";
+
+  const userMessage = await createChatMessage(
+    pid,
+    chatId,
+    "user",
+    userText,
+    attachments.length > 0 ? { attachments } : undefined,
+  );
+
+  const mock = str(process.env.E2E_MOCK_CHAT || process.env.MOCK_CHAT) === "1";
+  if (mock) {
+    emitChatStage({ stage: "mock" });
+    const thumb = escapeDataUrlSvg(
+      `<svg xmlns="http://www.w3.org/2000/svg" width="320" height="180"><rect width="100%" height="100%" fill="#F2F2F7"/><text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" font-family="Arial" font-size="20" fill="#1D1D1F">Video</text></svg>`,
     );
+    const intent = detectChatSearchIntent(userText);
+    const detectedUrls = extractHttpUrls(userText, 2);
+    const url1 = detectedUrls[0] || "https://www.bilibili.com/video/BV1xx411c7mD";
+    const url2 = detectedUrls[1] || "https://www.bilibili.com/video/BV1yy411c7mE";
 
-    const mock = str(process.env.E2E_MOCK_CHAT || process.env.MOCK_CHAT) === "1";
-    if (mock) {
-      const thumb = escapeDataUrlSvg(
-        `<svg xmlns="http://www.w3.org/2000/svg" width="320" height="180"><rect width="100%" height="100%" fill="#F2F2F7"/><text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" font-family="Arial" font-size="20" fill="#1D1D1F">Video</text></svg>`,
-      );
-      const intent = detectChatSearchIntent(userText);
-      const detectedUrls = extractHttpUrls(userText, 2);
-      const url1 = detectedUrls[0] || "https://www.bilibili.com/video/BV1xx411c7mD";
-      const url2 = detectedUrls[1] || "https://www.bilibili.com/video/BV1yy411c7mE";
-
-      if (intent !== "video") {
-        const links: ChatLinkCard[] = [
-          {
-            url: "https://github.com/",
-            title: "Mock: GitHub (links block)",
-            snippet: "（E2E mock）用于验证非视频链接卡片渲染。",
-          },
-          {
-            url: "https://www.wikipedia.org/",
-            title: "Mock: Wikipedia (links block)",
-            snippet: "（E2E mock）第二条链接。",
-          },
-        ];
-        const assistantMessage = await createChatMessage(projectId, chatId, "assistant", "我先给你两条示例链接（mock 模式）。", {
-          blocks: [{ type: "links", links }],
-        });
-        return res.json({ ok: true, user_message: userMessage, assistant_message: assistantMessage, mock: true });
-      }
-
-      const videos: ChatVideoCard[] = [
+    if (intent !== "video") {
+      const links: ChatLinkCard[] = [
         {
-          url: url1,
-          title: "Mock: 猫咪搞笑素材合集",
-          description: "（E2E mock）用于验证卡片渲染与按钮交互。",
-          thumbnail: thumb,
-          duration_s: 123,
-          extractor: "bilibili",
-          id: "BV1xx411c7mD",
+          url: "https://github.com/",
+          title: "Mock: GitHub (links block)",
+          snippet: "（E2E mock）用于验证非视频链接卡片渲染。",
         },
         {
-          url: url2,
-          title: "Mock: 热门剪辑灵感参考",
-          description: "（E2E mock）第二条卡片。",
-          thumbnail: thumb,
-          duration_s: 98,
-          extractor: "bilibili",
-          id: "BV1yy411c7mE",
+          url: "https://www.wikipedia.org/",
+          title: "Mock: Wikipedia (links block)",
+          snippet: "（E2E mock）第二条链接。",
         },
       ];
-
-      const assistantMessage = await createChatMessage(projectId, chatId, "assistant", "我先给你两条示例卡片（mock 模式）。", {
-        blocks: [{ type: "videos", videos }],
+      const assistantMessage = await createChatMessage(pid, chatId, "assistant", "我先给你两条示例链接（mock 模式）。", {
+        blocks: [{ type: "links", links }],
       });
-      return res.json({ ok: true, user_message: userMessage, assistant_message: assistantMessage, mock: true });
+      return { ok: true, user_message: userMessage, assistant_message: assistantMessage, mock: true };
     }
 
-    const useGeminiNative = isGeminiNativeBaseUrl(baseUrl);
+    const videos: ChatVideoCard[] = [
+      {
+        url: url1,
+        title: "Mock: 猫咪搞笑素材合集",
+        description: "（E2E mock）用于验证卡片渲染与按钮交互。",
+        thumbnail: thumb,
+        duration_s: 123,
+        extractor: "bilibili",
+        id: "BV1xx411c7mD",
+      },
+      {
+        url: url2,
+        title: "Mock: 热门剪辑灵感参考",
+        description: "（E2E mock）第二条卡片。",
+        thumbnail: thumb,
+        duration_s: 98,
+        extractor: "bilibili",
+        id: "BV1yy411c7mE",
+      },
+    ];
 
-    if (!geminiApiKey) {
-      const assistantMessage = await createChatMessage(
-        projectId,
-        chatId,
-        "assistant",
-        "API key is not set. Open Settings and set the API Key first, then try again.",
-      );
-      return res.json({ ok: true, user_message: userMessage, assistant_message: assistantMessage });
+    const assistantMessage = await createChatMessage(pid, chatId, "assistant", "我先给你两条示例卡片（mock 模式）。", {
+      blocks: [{ type: "videos", videos }],
+    });
+    return { ok: true, user_message: userMessage, assistant_message: assistantMessage, mock: true };
+  }
+
+  const useGeminiNative = isGeminiNativeBaseUrl(baseUrl);
+
+  if (!geminiApiKey) {
+    const assistantMessage = await createChatMessage(
+      pid,
+      chatId,
+      "assistant",
+      "API key is not set. Open Settings and set the API Key first, then try again.",
+    );
+    return { ok: true, user_message: userMessage, assistant_message: assistantMessage };
+  }
+
+  if (wantsAnalysis) {
+    emitChatStage({ stage: "analysis" });
+    // If the user asks to analyze "this video", try to run the local clip pipeline + Gemini analysis.
+    // We prefer an already-downloaded/ imported input_video; if none exists, we can download from the first URL (when auto_confirm is enabled).
+    let inputVideoArtifactId = "";
+    try {
+      const artifacts = await toolserverJson<ToolserverArtifact[]>(`/projects/${pid}/artifacts`);
+      const inputs = artifacts
+        .filter((a) => a.kind === "input_video")
+        .sort((a, b) => (b.created_at_ms || 0) - (a.created_at_ms || 0));
+      if (inputs[0]?.id) inputVideoArtifactId = inputs[0].id;
+    } catch {
+      // ignore
     }
 
-    if (wantsAnalysis) {
-      // If the user asks to analyze "this video", try to run the local clip pipeline + Gemini analysis.
-      // We prefer an already-downloaded/ imported input_video; if none exists, we can download from the first URL (when auto_confirm is enabled).
-      let inputVideoArtifactId = "";
-      try {
-        const artifacts = await toolserverJson<ToolserverArtifact[]>(`/projects/${projectId}/artifacts`);
-        const inputs = artifacts
-          .filter((a) => a.kind === "input_video")
-          .sort((a, b) => (b.created_at_ms || 0) - (a.created_at_ms || 0));
-        if (inputs[0]?.id) inputVideoArtifactId = inputs[0].id;
-      } catch {
-        // ignore
-      }
+    const blocks: any[] = [];
+    let cards: ChatVideoCard[] = [];
 
-      const blocks: any[] = [];
-      let cards: ChatVideoCard[] = [];
-
-      if (!inputVideoArtifactId && directUrls.length > 0) {
-        const consent = await getConsent(projectId);
-        if (!consent?.consented) {
-          const assistantMessage = await createChatMessage(
-            projectId,
-            chatId,
-            "assistant",
-            "我可以通过“切片 → Gemini”来分析你发的视频链接，但需要你先完成一次「授权确认」。请先在页面弹窗里确认授权，然后再发一句“开始分析”。",
-          );
-          return res.json({ ok: true, needs_consent: true, user_message: userMessage, assistant_message: assistantMessage });
-        }
-
-        // Best-effort: still render a card for what the user pasted.
-        try {
-          const r = await resolveRemoteInfo(projectId, directUrls[0], cookiesFromBrowser);
-          cards.push({
-            url: r.info.webpage_url || directUrls[0],
-            title: r.info.title || directUrls[0],
-            description: r.info.description || null,
-            thumbnail: r.info.thumbnail || null,
-            duration_s: r.info.duration_s ?? null,
-            extractor: r.info.extractor,
-            id: r.info.id,
-          });
-        } catch {
-          // ignore card failure
-        }
-
-        if (cards.length > 0) blocks.push({ type: "videos", videos: cards });
-
-        if (consent?.auto_confirm === false) {
-          const assistantMessage = await createChatMessage(
-            projectId,
-            chatId,
-            "assistant",
-            "我可以做切片分析，但你已关闭“自动确认下载”。请在卡片上点「下载」把视频保存到项目里，然后再发一句“开始分析”。",
-            blocks.length > 0 ? { blocks } : undefined,
-          );
-          return res.json({ ok: true, user_message: userMessage, assistant_message: assistantMessage });
-        }
-
-        // Auto-download for analysis (user asked to analyze and auto_confirm is enabled).
-        try {
-          const dl = await downloadRemoteMedia(projectId, directUrls[0], cookiesFromBrowser);
-          if (dl.input_video?.id) inputVideoArtifactId = dl.input_video.id;
-          if (cards.length === 0) {
-            cards.push({
-              url: dl.info.webpage_url || directUrls[0],
-              title: dl.info.title || directUrls[0],
-              description: dl.info.description || null,
-              thumbnail: dl.info.thumbnail || null,
-              duration_s: dl.info.duration_s ?? null,
-              extractor: dl.info.extractor,
-              id: dl.info.id,
-            });
-            blocks.push({ type: "videos", videos: cards });
-          }
-        } catch (e) {
-          const msg = e instanceof Error ? e.message : String(e);
-          const assistantMessage = await createChatMessage(
-            projectId,
-            chatId,
-            "assistant",
-            `下载失败：${msg}\n\n你可以先在卡片上点「下载」重试（或在 Settings 配置 Cookies from browser），下载成功后再发一句“开始分析”。`,
-            blocks.length > 0 ? { blocks } : undefined,
-          );
-          return res.json({ ok: true, user_message: userMessage, assistant_message: assistantMessage });
-        }
-      }
-
-      if (!inputVideoArtifactId) {
+    if (!inputVideoArtifactId && directUrls.length > 0) {
+      const consent = await getConsent(pid);
+      if (!consent?.consented) {
         const assistantMessage = await createChatMessage(
-          projectId,
+          pid,
           chatId,
           "assistant",
-          directUrls.length > 0
-            ? "我可以做切片分析，但目前项目里还没有可用的视频文件。请先在卡片上点「下载」（或在 Workspace 上传本地视频），然后再发一句“开始分析”。"
-            : "我可以做切片分析，但你还没导入视频。请先上传/下载一个视频到项目里，然后再说“分析这个视频”。",
-          blocks.length > 0 ? { blocks } : undefined,
+          "我可以通过“切片 → Gemini”来分析你发的视频链接，但需要你先完成一次「授权确认」。请先在页面弹窗里确认授权，然后再发一句“开始分析”。",
         );
-        return res.json({ ok: true, user_message: userMessage, assistant_message: assistantMessage });
+        return { ok: true, needs_consent: true, user_message: userMessage, assistant_message: assistantMessage };
       }
 
+      // Best-effort: still render a card for what the user pasted.
       try {
-        const analysis = await runGeminiVideoAnalysis({
-          projectId,
-          apiKey: geminiApiKey,
-          baseUrl,
-          model,
-          useGeminiNative,
-          inputVideoArtifactId,
+        emitChatStage({ stage: "resolve", detail: "analysis" });
+        const r = await resolveRemoteInfo(pid, directUrls[0], cookiesFromBrowser);
+        cards.push({
+          url: r.info.webpage_url || directUrls[0],
+          title: r.info.title || directUrls[0],
+          description: r.info.description || null,
+          thumbnail: r.info.thumbnail || null,
+          duration_s: r.info.duration_s ?? null,
+          extractor: r.info.extractor,
+          id: r.info.id,
         });
+      } catch {
+        // ignore card failure
+      }
 
-        const reply = formatAnalysisForChat(analysis.parsed, analysis.text);
-        const assistantMessage = await createChatMessage(projectId, chatId, "assistant", reply, {
-          blocks,
-          analysis_artifact: analysis.artifact,
-        });
+      if (cards.length > 0) blocks.push({ type: "videos", videos: cards });
 
-        return res.json({
-          ok: true,
-          user_message: userMessage,
-          assistant_message: assistantMessage,
-          analysis_artifact: analysis.artifact,
-        });
+      if (consent?.auto_confirm === false) {
+        const assistantMessage = await createChatMessage(
+          pid,
+          chatId,
+          "assistant",
+          "我可以做切片分析，但你已关闭“自动确认下载”。请在卡片上点「下载」把视频保存到项目里，然后再发一句“开始分析”。",
+          blocks.length > 0 ? { blocks } : undefined,
+        );
+        return { ok: true, user_message: userMessage, assistant_message: assistantMessage };
+      }
+
+      // Auto-download for analysis (user asked to analyze and auto_confirm is enabled).
+      try {
+        emitChatStage({ stage: "download" });
+        const dl = await downloadRemoteMedia(pid, directUrls[0], cookiesFromBrowser);
+        if (dl.input_video?.id) inputVideoArtifactId = dl.input_video.id;
+        if (cards.length === 0) {
+          cards.push({
+            url: dl.info.webpage_url || directUrls[0],
+            title: dl.info.title || directUrls[0],
+            description: dl.info.description || null,
+            thumbnail: dl.info.thumbnail || null,
+            duration_s: dl.info.duration_s ?? null,
+            extractor: dl.info.extractor,
+            id: dl.info.id,
+          });
+          blocks.push({ type: "videos", videos: cards });
+        }
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         const assistantMessage = await createChatMessage(
-          projectId,
+          pid,
           chatId,
           "assistant",
-          `切片分析失败：${msg}\n\n常见原因：未安装 ffmpeg、视频未下载完成、或 Gemini/代理不支持视频输入。你可以先确认 Workspace 里有 input_video，然后在 Workspace → Analysis 手动跑一次。`,
+          `下载失败：${msg}\n\n你可以先在卡片上点「下载」重试（或在 Settings 配置 Cookies from browser），下载成功后再发一句“开始分析”。`,
           blocks.length > 0 ? { blocks } : undefined,
         );
-        return res.json({ ok: true, user_message: userMessage, assistant_message: assistantMessage });
+        return { ok: true, user_message: userMessage, assistant_message: assistantMessage };
       }
     }
 
-    const history = await getChatMessages(projectId, chatId);
-    const recent = history.slice(Math.max(0, history.length - 12));
+    if (!inputVideoArtifactId) {
+      const assistantMessage = await createChatMessage(
+        pid,
+        chatId,
+        "assistant",
+        directUrls.length > 0
+          ? "我可以做切片分析，但目前项目里还没有可用的视频文件。请先在卡片上点「下载」（或在 Workspace 上传本地视频），然后再发一句“开始分析”。"
+          : "我可以做切片分析，但你还没导入视频。请先上传/下载一个视频到项目里，然后再说“分析这个视频”。",
+        blocks.length > 0 ? { blocks } : undefined,
+      );
+      return { ok: true, user_message: userMessage, assistant_message: assistantMessage };
+    }
 
-    const graphState = await chatTurnLangGraph.invoke({
-      projectId,
+    try {
+      emitChatStage({ stage: "analysis" });
+      const analysis = await runGeminiVideoAnalysis({
+        projectId: pid,
+        apiKey: geminiApiKey,
+        baseUrl,
+        model,
+        useGeminiNative,
+        inputVideoArtifactId,
+      });
+
+      const reply = formatAnalysisForChat(analysis.parsed, analysis.text);
+      const assistantMessage = await createChatMessage(pid, chatId, "assistant", reply, {
+        blocks,
+        analysis_artifact: analysis.artifact,
+      });
+
+      return {
+        ok: true,
+        user_message: userMessage,
+        assistant_message: assistantMessage,
+        analysis_artifact: analysis.artifact,
+      };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      const assistantMessage = await createChatMessage(
+        pid,
+        chatId,
+        "assistant",
+        `切片分析失败：${msg}\n\n常见原因：未安装 ffmpeg、视频未下载完成、或 Gemini/代理不支持视频输入。你可以先确认 Workspace 里有 input_video，然后在 Workspace → Analysis 手动跑一次。`,
+        blocks.length > 0 ? { blocks } : undefined,
+      );
+      return { ok: true, user_message: userMessage, assistant_message: assistantMessage };
+    }
+  }
+
+  const history = await getChatMessages(pid, chatId);
+  const recent = history.slice(Math.max(0, history.length - 12));
+
+  const graphState = await chatTurnLangGraph.invoke(
+    {
+      projectId: pid,
       chatId,
       userText,
       userMessage,
@@ -2126,20 +2163,83 @@ app.post("/api/projects/:projectId/chat/turn", async (req, res) => {
       needsConsent: false,
       debugArtifact: null,
       assistantMessage: null,
-    }, { recursionLimit: 25 });
+    },
+    { recursionLimit: 25 },
+  );
 
-    const assistantMessage = graphState.assistantMessage
-      ? graphState.assistantMessage
-      : await createChatMessage(projectId, chatId, "assistant", "OK");
+  const assistantMessage = graphState.assistantMessage
+    ? graphState.assistantMessage
+    : await createChatMessage(pid, chatId, "assistant", "OK");
 
-    return res.json({
-      ok: true,
-      needs_consent: graphState.needsConsent,
-      plan: graphState.plan,
-      plan_artifact: graphState.planArtifact,
-      user_message: userMessage,
-      assistant_message: assistantMessage,
-    });
+  return {
+    ok: true,
+    needs_consent: graphState.needsConsent,
+    plan: graphState.plan,
+    plan_artifact: graphState.planArtifact,
+    user_message: userMessage,
+    assistant_message: assistantMessage,
+  };
+}
+
+function writeSse(res: any, event: string, data: any) {
+  res.write(`event: ${event}\n`);
+  res.write(`data: ${JSON.stringify(data)}\n\n`);
+}
+
+app.post("/api/projects/:projectId/chat/turn/stream", async (req, res) => {
+  res.status(200);
+  res.setHeader("content-type", "text/event-stream; charset=utf-8");
+  res.setHeader("cache-control", "no-cache, no-transform");
+  res.setHeader("connection", "keep-alive");
+  res.flushHeaders?.();
+
+  const projectId = String(req.params.projectId || "").trim();
+  if (!projectId) {
+    writeSse(res, "error", { ok: false, error: "missing project id" });
+    res.end();
+    return;
+  }
+
+  let clientGone = false;
+  const markGone = () => {
+    clientGone = true;
+  };
+  res.on("close", markGone);
+  req.on("aborted", markGone);
+
+  const canWrite = () => !clientGone && !res.writableEnded && !res.destroyed;
+  const safeWrite = (event: string, data: unknown) => {
+    if (!canWrite()) return;
+    writeSse(res, event, data);
+  };
+
+  const emit = (evt: ChatTurnStageEvent) => {
+    safeWrite("stage", evt);
+  };
+
+  safeWrite("stage", { stage: "connected" });
+
+  try {
+    const out = await chatTurnStreamCtx.run({ emit }, async () => handleChatTurn(projectId, req.body));
+    safeWrite("final", out);
+  } catch (e) {
+    if (e instanceof HttpError) {
+      const status = e.status >= 400 && e.status < 600 ? e.status : 500;
+      safeWrite("error", { ok: false, status, error: e.message });
+    } else {
+      const message = e instanceof Error ? e.message : String(e);
+      safeWrite("error", { ok: false, error: message });
+    }
+  } finally {
+    res.end();
+  }
+});
+
+app.post("/api/projects/:projectId/chat/turn", async (req, res) => {
+  try {
+    const projectId = String(req.params.projectId || "").trim();
+    const out = await handleChatTurn(projectId, req.body);
+    return res.json(out);
   } catch (e) {
     if (e instanceof HttpError) {
       const status = e.status >= 400 && e.status < 600 ? e.status : 500;

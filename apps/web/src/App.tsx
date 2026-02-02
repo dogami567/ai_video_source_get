@@ -75,6 +75,12 @@ type ChatTurnResponse = {
   assistant_message: ChatMessage;
   mock?: boolean;
 };
+type ChatTurnStageEvent = {
+  stage: string;
+  detail?: string | null;
+  pass?: number | null;
+  max_passes?: number | null;
+};
 
 type ConsentModalNextAction =
   | {
@@ -176,6 +182,103 @@ async function postJson<T>(input: string, body: unknown): Promise<T> {
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
   });
+}
+
+class SseNotAvailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SseNotAvailableError";
+  }
+}
+
+type SseJsonOptions = {
+  onStage?: (evt: unknown) => void;
+};
+
+async function postSseJson<T>(input: string, body: unknown, opts?: SseJsonOptions): Promise<T> {
+  const res = await fetch(input, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "text/event-stream" },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    const cleaned = text.replace(/^\uFEFF/, "");
+    try {
+      const parsed = cleaned ? (JSON.parse(cleaned) as { error?: unknown }) : null;
+      if (parsed && typeof parsed.error === "string" && parsed.error.trim()) throw new Error(parsed.error);
+    } catch {
+      // ignore
+    }
+    throw new Error(cleaned || `HTTP ${res.status}`);
+  }
+
+  if (!res.body) throw new SseNotAvailableError("Streaming is not supported in this browser.");
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let eventName = "";
+  let dataLines: string[] = [];
+
+  const dispatch = (evt: string, raw: string) => {
+    const name = evt || "message";
+    let parsed: unknown = null;
+    try {
+      parsed = raw ? (JSON.parse(raw) as unknown) : null;
+    } catch {
+      parsed = raw;
+    }
+    if (name === "stage") opts?.onStage?.(parsed);
+    if (name === "error") {
+      const obj = parsed as any;
+      const msg =
+        obj && typeof obj === "object" && typeof obj.error === "string" && obj.error.trim()
+          ? obj.error.trim()
+          : typeof parsed === "string"
+            ? parsed
+            : "Chat failed.";
+      throw new Error(msg);
+    }
+    if (name === "final") return parsed as T;
+    return null;
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    while (true) {
+      const newlineIdx = buffer.indexOf("\n");
+      if (newlineIdx < 0) break;
+      let line = buffer.slice(0, newlineIdx);
+      buffer = buffer.slice(newlineIdx + 1);
+      if (line.endsWith("\r")) line = line.slice(0, -1);
+
+      if (!line) {
+        const raw = dataLines.join("\n").trim();
+        const out = dispatch(eventName, raw);
+        eventName = "";
+        dataLines = [];
+        if (out !== null) return out as T;
+        continue;
+      }
+
+      if (line.startsWith(":")) continue;
+      if (line.startsWith("event:")) {
+        eventName = line.slice("event:".length).trim();
+        continue;
+      }
+      if (line.startsWith("data:")) {
+        dataLines.push(line.slice("data:".length).trim());
+        continue;
+      }
+    }
+  }
+
+  throw new Error("Chat stream ended without a final response.");
 }
 
 function formatTs(ms: number) {
@@ -576,6 +679,8 @@ export default function App() {
   const [chatDraft, setChatDraft] = React.useState("");
   const [chatSendBusy, setChatSendBusy] = React.useState(false);
   const [chatSendError, setChatSendError] = React.useState<string | null>(null);
+  const [chatSendProgressLine, setChatSendProgressLine] = React.useState<string | null>(null);
+  const [chatSendProgressLog, setChatSendProgressLog] = React.useState<string[]>([]);
 
   const [chatAttachments, setChatAttachments] = React.useState<ChatAttachment[]>([]);
   const [chatUploadBusy, setChatUploadBusy] = React.useState(false);
@@ -1123,9 +1228,60 @@ export default function App() {
     setChatAttachments((prev) => prev.filter((a) => a.artifact.id !== artifactId));
   };
 
+  const formatChatStageLine = React.useCallback(
+    (evt: ChatTurnStageEvent) => {
+      const stage = String(evt.stage || "").trim() || "working";
+      const stageLabel =
+        stage === "connected"
+          ? tr("stageConnected")
+          : stage === "starting"
+            ? tr("stageStarting")
+            : stage === "planning"
+              ? tr("stagePlanning")
+              : stage === "resolve"
+                ? tr("stageResolve")
+                : stage === "search"
+                  ? tr("stageSearch")
+                  : stage === "search_query"
+                    ? tr("stageSearchQuery")
+                    : stage === "review"
+                      ? tr("stageReview")
+                      : stage === "refine"
+                        ? tr("stageRefine")
+                        : stage === "saving"
+                          ? tr("stageSaving")
+                          : stage === "done"
+                            ? tr("stageDone")
+                            : stage === "mock"
+                              ? tr("stageMock")
+                              : stage === "analysis"
+                                ? tr("stageAnalysis")
+                                : stage === "download"
+                                  ? tr("stageDownload")
+                                  : stage;
+
+      const pass = typeof evt.pass === "number" && Number.isFinite(evt.pass) ? evt.pass : null;
+      const maxPasses = typeof evt.max_passes === "number" && Number.isFinite(evt.max_passes) ? evt.max_passes : null;
+      const passText = pass != null && maxPasses != null ? `${pass}/${maxPasses}` : pass != null ? String(pass) : null;
+
+      let text = stageLabel;
+      if (passText) text += ` (${passText})`;
+
+      const detail = typeof evt.detail === "string" ? evt.detail.trim() : "";
+      if (detail) text += ` — ${detail}`;
+
+      return tr("chatProgressLine", { text });
+    },
+    [tr],
+  );
+
   const runChatTurn = async (opts: { chatId: string; message: string; attachments: ChatTurnAttachmentPayload[] }) => {
     if (view.kind !== "project") throw new Error("no project selected");
-    const resp = await postJson<ChatTurnResponse>(`/api/projects/${view.projectId}/chat/turn`, {
+
+    setChatSendProgressLine(null);
+    setChatSendProgressLog([]);
+
+    const payload = {
       chat_id: opts.chatId,
       message: opts.message,
       base_url: clientConfig.base_url,
@@ -1136,13 +1292,44 @@ export default function App() {
       default_model: clientConfig.default_model,
       ytdlp_cookies_from_browser: clientConfig.ytdlp_cookies_from_browser,
       attachments: opts.attachments,
-    });
+    };
+
+    let resp: ChatTurnResponse;
+    try {
+      resp = await postSseJson<ChatTurnResponse>(`/api/projects/${view.projectId}/chat/turn/stream`, payload, {
+        onStage: (raw) => {
+          const obj = raw as any;
+          const evt: ChatTurnStageEvent = {
+            stage: typeof obj?.stage === "string" ? obj.stage : "working",
+            detail: typeof obj?.detail === "string" ? obj.detail : null,
+            pass: typeof obj?.pass === "number" ? obj.pass : null,
+            max_passes: typeof obj?.max_passes === "number" ? obj.max_passes : null,
+          };
+          const line = formatChatStageLine(evt);
+          setChatSendProgressLine(line);
+          setChatSendProgressLog((prev) => {
+            if (prev[prev.length - 1] === line) return prev;
+            const next = [...prev, line];
+            if (next.length > 60) next.splice(0, next.length - 60);
+            return next;
+          });
+        },
+      });
+    } catch (e) {
+      if (e instanceof SseNotAvailableError) {
+        resp = await postJson<ChatTurnResponse>(`/api/projects/${view.projectId}/chat/turn`, payload);
+      } else {
+        throw e;
+      }
+    }
 
     setChatMessages((prev) => [...prev, resp.user_message, resp.assistant_message]);
     if (resp.plan !== undefined) setLastPlan(resp.plan ?? null);
     if (resp.plan_artifact !== undefined) setLastPlanArtifact(resp.plan_artifact ?? null);
     await refreshProject(view.projectId);
 
+    setChatSendProgressLine(null);
+    setChatSendProgressLog([]);
     return resp;
   };
 
@@ -2516,6 +2703,30 @@ export default function App() {
 	                                {chatSendBusy ? tr("sending") : tr("send")}
 	                              </button>
 	                            </div>
+
+	                            {(chatSendBusy || (chatSendError && chatSendProgressLog.length > 0)) &&
+	                              (chatSendProgressLine || chatSendProgressLog.length > 0) && (
+	                                <div className="mt-2" data-testid="chat-progress">
+	                                  {chatSendProgressLine ? (
+	                                    <div
+	                                      className="text-xs text-muted"
+	                                      style={{ overflowWrap: "anywhere", wordBreak: "break-word" }}
+	                                    >
+	                                      {chatSendProgressLine}
+	                                    </div>
+	                                  ) : null}
+	                                  {chatSendProgressLog.length > 1 ? (
+	                                    <details className="mt-1">
+	                                      <summary className="text-xs text-muted" style={{ cursor: "pointer" }}>
+	                                        {tr("chatProgressDetails")}
+	                                      </summary>
+	                                      <div className="code-block text-xs mt-2" style={{ maxHeight: 160, overflow: "auto" }}>
+	                                        {chatSendProgressLog.join("\n")}
+	                                      </div>
+	                                    </details>
+	                                  ) : null}
+	                                </div>
+	                              )}
 
 	                            <div className="text-xs text-muted mt-2">{tr("chatHint")}</div>
 	                          </div>
