@@ -545,7 +545,30 @@ async function downloadRemoteMedia(
 
 function wantsVideoAnalysis(text: string): boolean {
   const t = String(text || "");
-  return /分析|拆解|创作|制作|怎么做|镜头|剪辑|节奏|结构|脚本|配音|想做(这类|这种|同款|类似)/i.test(t);
+
+  const hasUrl = /https?:\/\/\S+/i.test(t);
+  const hasVideoContext = /(视频|这条|该视频|这个视频|链接|url)/i.test(t) || hasUrl;
+
+  // If the user is asking for websites / emoji packs / BGM / voiceover resources, do NOT
+  // auto-trigger video clip analysis unless they explicitly ask to analyze a video.
+  const hasExplicitAnalyzePhrase =
+    /(开始分析|切片分析|分析一下|分析下|拆解一下|拆解下|分析这个|拆解这个|analyze|analysis)/i.test(t) ||
+    ((/分析|拆解|切片/i.test(t) && hasVideoContext));
+  if (!hasExplicitAnalyzePhrase) {
+    const intent = detectChatSearchIntent(t);
+    if (intent !== "video") return false;
+  }
+
+  // Strong triggers
+  if (/(开始分析|切片分析|分析一下|分析下|拆解一下|拆解下)/i.test(t)) return true;
+  if (/(分析|拆解|切片)/i.test(t) && hasVideoContext) return true;
+
+  // Editing/creation keywords should only trigger when the user is referring to a video.
+  if (/(创作|制作|怎么做|镜头|剪辑|节奏|结构|脚本|想做(这类|这种|同款|类似))/i.test(t)) {
+    return hasVideoContext;
+  }
+
+  return false;
 }
 
 function formatAnalysisForChat(parsed: unknown, fallbackText: string): string {
