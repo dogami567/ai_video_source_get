@@ -58,6 +58,15 @@ type ToolserverFfmpegPipeline = {
   clips: ToolserverArtifact[];
 };
 type ToolserverProfile = { profile?: { prompt?: string } };
+type ToolserverProjectFeedbackItem = {
+  url: string;
+  kind: string;
+  rating: number;
+  anchor: boolean;
+  created_at_ms: number;
+  updated_at_ms: number;
+};
+type ToolserverProjectFeedback = { ok: boolean; project_id: string; items: ToolserverProjectFeedbackItem[] };
 type ToolserverChatMessage = {
   id: string;
   project_id: string;
@@ -141,6 +150,27 @@ async function getProfilePrompt(): Promise<string> {
   } catch {
     return "";
   }
+}
+
+async function getProjectFeedback(projectId: string): Promise<ToolserverProjectFeedbackItem[]> {
+  try {
+    const r = await toolserverJson<ToolserverProjectFeedback>(`/projects/${projectId}/feedback`);
+    return Array.isArray(r?.items) ? r.items : [];
+  } catch {
+    return [];
+  }
+}
+
+function formatProjectFeedbackForPrompt(items: ToolserverProjectFeedbackItem[]): string {
+  const liked = items.filter((x) => (x?.rating ?? 0) > 0).map((x) => String(x.url || "").trim()).filter(Boolean);
+  const disliked = items.filter((x) => (x?.rating ?? 0) < 0).map((x) => String(x.url || "").trim()).filter(Boolean);
+  const anchors = items.filter((x) => !!x?.anchor).map((x) => String(x.url || "").trim()).filter(Boolean);
+
+  const lines: string[] = [];
+  if (anchors.length > 0) lines.push(`Anchor examples (more like this): ${anchors.slice(0, 3).join(", ")}`);
+  if (liked.length > 0) lines.push(`Liked sources: ${liked.slice(0, 6).join(", ")}`);
+  if (disliked.length > 0) lines.push(`Disliked sources: ${disliked.slice(0, 6).join(", ")}`);
+  return lines.join("\n");
 }
 
 async function maybeStorePlan(projectId: string, action: string, plan: unknown): Promise<ToolserverArtifact | null> {
@@ -2336,6 +2366,7 @@ async function chatToolAgentInitNode(state: ChatToolAgentGraphState) {
   emitChatStage({ stage: "planning" });
 
   const profilePrompt = await getProfilePrompt();
+  const feedbackPrompt = formatProjectFeedbackForPrompt(await getProjectFeedback(state.projectId));
   const systemPrompt = [
     "You are VidUnpack Agent (视频素材智能助手).",
     "Your job: take the user's creative intent and find matching media sources (videos/links) via tool calls.",
@@ -2357,6 +2388,7 @@ async function chatToolAgentInitNode(state: ChatToolAgentGraphState) {
     "- IMPORTANT: IDs in select MUST be candidate IDs returned by tools.",
     "- Do not ask user questions; instead proceed with best-effort and put assumptions into reply if needed.",
     ...(profilePrompt ? ["", "User profile (cross-project preferences):", profilePrompt] : []),
+    ...(feedbackPrompt ? ["", "User feedback memory (project-scoped):", feedbackPrompt] : []),
   ].join("\n");
 
   const recentTail = Array.isArray(state.recent) ? state.recent.slice(Math.max(0, state.recent.length - 10)) : [];
@@ -2535,6 +2567,7 @@ async function chatToolAgentReviewNode(state: ChatToolAgentGraphState) {
       duration_s: typeof c.duration_s === "number" ? c.duration_s : null,
       thumbnail: str(c.thumbnail) || null,
     }));
+  const feedbackPrompt = formatProjectFeedbackForPrompt(await getProjectFeedback(state.projectId));
 
   const payload = await callChatCompletions({
     baseUrl: state.baseUrl,
@@ -2557,6 +2590,14 @@ async function chatToolAgentReviewNode(state: ChatToolAgentGraphState) {
           `remaining_passes=${Math.max(0, TOOL_AGENT_MAX_PASSES - pass)}`,
         ].join("\n"),
       },
+      ...(feedbackPrompt
+        ? [
+            {
+              role: "system",
+              content: `User feedback memory (project-scoped):\n${feedbackPrompt}`,
+            } as OpenAIChatMessage,
+          ]
+        : []),
       {
         role: "system",
         content: `Candidates digest (for scoring/dedup; ids must match):\n${JSON.stringify(digest, null, 2)}`,

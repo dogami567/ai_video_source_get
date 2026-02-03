@@ -72,13 +72,14 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/health", get(health))
-        .route("/profile", get(get_profile))
+        .route("/profile", get(get_profile).post(update_profile))
         .route("/profile/reset", post(reset_profile))
         .route("/projects", post(create_project).get(list_projects))
         .route("/projects/batch_delete", post(batch_delete_projects))
         .route("/projects/{id}", get(get_project).delete(delete_project))
         .route("/projects/{id}/consent", get(get_consent).post(upsert_consent))
         .route("/projects/{id}/settings", get(get_project_settings).post(update_project_settings))
+        .route("/projects/{id}/feedback", get(list_project_feedback).post(upsert_project_feedback))
         .route("/projects/{id}/artifacts", get(list_artifacts))
         .route("/projects/{id}/artifacts/text", post(create_text_artifact))
         .route("/projects/{id}/artifacts/upload", post(upload_file_artifact))
@@ -199,6 +200,8 @@ struct ProfileMemory {
     kind_counts: Vec<ProfileMemoryCount>,
     source_domain_counts: Vec<ProfileMemoryCount>,
     prompt: String,
+    #[serde(default)]
+    user_prompt: String,
     last_session_summary: String,
 }
 
@@ -211,6 +214,7 @@ impl Default for ProfileMemory {
             kind_counts: Vec::new(),
             source_domain_counts: Vec::new(),
             prompt: String::new(),
+            user_prompt: String::new(),
             last_session_summary: String::new(),
         }
     }
@@ -269,6 +273,11 @@ fn merge_top_counts(existing: &mut Vec<ProfileMemoryCount>, adds: impl IntoItera
 fn build_profile_prompt(p: &ProfileMemory) -> String {
     let mut lines: Vec<String> = Vec::new();
 
+    if !p.user_prompt.trim().is_empty() {
+        lines.push("User profile notes (manually edited):".to_string());
+        lines.push(truncate_with_ellipsis(p.user_prompt.trim(), 1200));
+    }
+
     if !p.kind_counts.is_empty() {
         let kinds = p
             .kind_counts
@@ -320,6 +329,7 @@ fn load_profile(conn: &Connection) -> anyhow::Result<ProfileMemory> {
         kind_counts: Vec::new(),
         source_domain_counts: Vec::new(),
         prompt: truncate_with_ellipsis(&summary, 800),
+        user_prompt: truncate_with_ellipsis(&summary, 1200),
         last_session_summary: truncate_with_ellipsis(&summary, 400),
     })
 }
@@ -498,6 +508,19 @@ CREATE TABLE IF NOT EXISTS profile (
   summary TEXT NOT NULL,
   updated_at_ms INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS project_feedback (
+  project_id TEXT NOT NULL,
+  url TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  rating INTEGER NOT NULL DEFAULT 0,
+  anchor INTEGER NOT NULL DEFAULT 0,
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(project_id, url),
+  FOREIGN KEY(project_id) REFERENCES projects(id)
+);
+CREATE INDEX IF NOT EXISTS idx_project_feedback_project_id ON project_feedback(project_id);
 
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -972,6 +995,227 @@ async fn upsert_consent(
 
     match consent {
         Some(c) => Ok(Json(c)),
+        None => Err(AppError::NotFound("project not found".to_string())),
+    }
+}
+
+async fn list_project_feedback(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+) -> AppResult<Json<ProjectFeedbackResponse>> {
+    if project_id.trim().is_empty() {
+        return Err(AppError::BadRequest("missing project id".to_string()));
+    }
+
+    let db_path = state.db_path.clone();
+    let project_id_out = project_id.clone();
+    let project_id_db = project_id.clone();
+    let items = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Vec<FeedbackItem>>> {
+        let conn = Connection::open(&db_path)?;
+        let exists: bool = conn
+            .query_row("SELECT 1 FROM projects WHERE id = ?1", [&project_id_db], |_row| Ok(()))
+            .optional()?
+            .is_some();
+        if !exists {
+            return Ok(None);
+        }
+
+        let mut stmt = conn.prepare(
+            "SELECT url, kind, rating, anchor, created_at_ms, updated_at_ms\n             FROM project_feedback\n             WHERE project_id = ?1\n             ORDER BY updated_at_ms DESC",
+        )?;
+        let rows = stmt.query_map([&project_id_db], |row| {
+            let url: String = row.get(0)?;
+            let kind: String = row.get(1)?;
+            let rating: i64 = row.get(2)?;
+            let anchor_i: i64 = row.get(3)?;
+            let created_at_ms: i64 = row.get(4)?;
+            let updated_at_ms: i64 = row.get(5)?;
+            Ok(FeedbackItem {
+                url,
+                kind,
+                rating,
+                anchor: anchor_i != 0,
+                created_at_ms,
+                updated_at_ms,
+            })
+        })?;
+
+        let mut out: Vec<FeedbackItem> = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(Some(out))
+    })
+    .await
+    .context("list_project_feedback task failed")??;
+
+    match items {
+        Some(items) => Ok(Json(ProjectFeedbackResponse {
+            ok: true,
+            project_id: project_id_out,
+            items,
+        })),
+        None => Err(AppError::NotFound("project not found".to_string())),
+    }
+}
+
+async fn upsert_project_feedback(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    Json(req): Json<UpsertProjectFeedbackRequest>,
+) -> AppResult<Json<ProjectFeedbackResponse>> {
+    if project_id.trim().is_empty() {
+        return Err(AppError::BadRequest("missing project id".to_string()));
+    }
+    let url = req.url.trim().to_string();
+    if url.is_empty() {
+        return Err(AppError::BadRequest("missing url".to_string()));
+    }
+    let kind = req
+        .kind
+        .unwrap_or_else(|| "link".to_string())
+        .trim()
+        .to_lowercase();
+    let action = req.action.trim().to_lowercase();
+    let updated_at_ms = now_ms();
+
+    let db_path = state.db_path.clone();
+    let project_id_out = project_id.clone();
+    let project_id_db = project_id.clone();
+    let items = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Vec<FeedbackItem>>> {
+        let mut conn = Connection::open(&db_path)?;
+        let exists: bool = conn
+            .query_row("SELECT 1 FROM projects WHERE id = ?1", [&project_id_db], |_row| Ok(()))
+            .optional()?
+            .is_some();
+        if !exists {
+            return Ok(None);
+        }
+
+        let tx = conn.transaction()?;
+
+        if action == "clear" {
+            tx.execute(
+                "DELETE FROM project_feedback WHERE project_id = ?1 AND url = ?2",
+                params![&project_id_db, &url],
+            )?;
+        } else {
+            let mut rating: i64 = 0;
+            let mut anchor: i64 = 0;
+            if let Some((r, a)) = tx
+                .query_row(
+                    "SELECT rating, anchor FROM project_feedback WHERE project_id = ?1 AND url = ?2",
+                    params![&project_id_db, &url],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()?
+            {
+                rating = r;
+                anchor = a;
+            }
+
+            match action.as_str() {
+                "like" => {
+                    rating = 1;
+                }
+                "dislike" => {
+                    rating = -1;
+                }
+                "anchor" | "more_like_this" => {
+                    anchor = 1;
+                }
+                "unanchor" => {
+                    anchor = 0;
+                }
+                _ => {
+                    return Err(anyhow::anyhow!("unknown action: {action}"));
+                }
+            }
+
+            let created_at_ms: i64 = tx
+                .query_row(
+                    "SELECT created_at_ms FROM project_feedback WHERE project_id = ?1 AND url = ?2",
+                    params![&project_id_db, &url],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .unwrap_or(updated_at_ms);
+
+            tx.execute(
+                "INSERT INTO project_feedback (project_id, url, kind, rating, anchor, created_at_ms, updated_at_ms)\n                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)\n                 ON CONFLICT(project_id, url) DO UPDATE SET\n                   kind = excluded.kind,\n                   rating = excluded.rating,\n                   anchor = excluded.anchor,\n                   updated_at_ms = excluded.updated_at_ms",
+                params![
+                    &project_id_db,
+                    &url,
+                    &kind,
+                    rating,
+                    anchor,
+                    created_at_ms,
+                    updated_at_ms
+                ],
+            )?;
+
+            // Keep at most 3 anchors per project (latest wins).
+            let mut anchor_stmt = tx.prepare(
+                "SELECT url FROM project_feedback WHERE project_id = ?1 AND anchor = 1 ORDER BY updated_at_ms DESC",
+            )?;
+            let anchors = anchor_stmt
+                .query_map([&project_id_db], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            if anchors.len() > 3 {
+                for old_url in anchors.iter().skip(3) {
+                    tx.execute(
+                        "UPDATE project_feedback SET anchor = 0, updated_at_ms = ?3 WHERE project_id = ?1 AND url = ?2",
+                        params![&project_id_db, old_url, updated_at_ms],
+                    )?;
+                }
+            }
+        }
+
+        tx.execute(
+            "INSERT INTO events (project_id, ts_ms, level, message, data_json) VALUES (?1, ?2, 'info', 'feedback_updated', ?3)",
+            params![
+                &project_id_db,
+                updated_at_ms,
+                serde_json::json!({ "url": url, "action": action }).to_string()
+            ],
+        )?;
+
+        tx.commit()?;
+
+        let mut stmt = conn.prepare(
+            "SELECT url, kind, rating, anchor, created_at_ms, updated_at_ms\n             FROM project_feedback\n             WHERE project_id = ?1\n             ORDER BY updated_at_ms DESC",
+        )?;
+        let rows = stmt.query_map([&project_id_db], |row| {
+            let url: String = row.get(0)?;
+            let kind: String = row.get(1)?;
+            let rating: i64 = row.get(2)?;
+            let anchor_i: i64 = row.get(3)?;
+            let created_at_ms: i64 = row.get(4)?;
+            let updated_at_ms: i64 = row.get(5)?;
+            Ok(FeedbackItem {
+                url,
+                kind,
+                rating,
+                anchor: anchor_i != 0,
+                created_at_ms,
+                updated_at_ms,
+            })
+        })?;
+        let mut out: Vec<FeedbackItem> = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(Some(out))
+    })
+    .await
+    .context("upsert_project_feedback task failed")??;
+
+    match items {
+        Some(items) => Ok(Json(ProjectFeedbackResponse {
+            ok: true,
+            project_id: project_id_out,
+            items,
+        })),
         None => Err(AppError::NotFound("project not found".to_string())),
     }
 }
@@ -2506,6 +2750,30 @@ struct ProfileResponse {
     profile_abs_path: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct FeedbackItem {
+    url: String,
+    kind: String,
+    rating: i64,
+    anchor: bool,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+}
+
+#[derive(Serialize)]
+struct ProjectFeedbackResponse {
+    ok: bool,
+    project_id: String,
+    items: Vec<FeedbackItem>,
+}
+
+#[derive(Deserialize)]
+struct UpsertProjectFeedbackRequest {
+    url: String,
+    kind: Option<String>,
+    action: String, // like | dislike | clear | anchor | unanchor
+}
+
 async fn get_profile(State(state): State<AppState>) -> AppResult<Json<ProfileResponse>> {
     let db_path = state.db_path.clone();
     let data_dir = state.data_dir.clone();
@@ -2549,6 +2817,38 @@ async fn reset_profile(State(state): State<AppState>) -> AppResult<Json<ProfileR
     })
     .await
     .context("reset_profile task failed")??;
+
+    Ok(Json(resp))
+}
+
+#[derive(Deserialize)]
+struct UpdateProfileRequest {
+    prompt: Option<String>,
+}
+
+async fn update_profile(
+    State(state): State<AppState>,
+    Json(req): Json<UpdateProfileRequest>,
+) -> AppResult<Json<ProfileResponse>> {
+    let db_path = state.db_path.clone();
+    let data_dir = state.data_dir.clone();
+    let prompt = req.prompt.unwrap_or_default();
+
+    let resp = tokio::task::spawn_blocking(move || -> anyhow::Result<ProfileResponse> {
+        let conn = Connection::open(&db_path)?;
+        let mut profile = load_profile(&conn)?;
+        profile.user_prompt = truncate_with_ellipsis(prompt.trim(), 4000);
+        profile.updated_at_ms = now_ms();
+        profile.prompt = build_profile_prompt(&profile);
+        save_profile(&conn, &data_dir, &profile)?;
+        Ok(ProfileResponse {
+            profile,
+            profile_rel_path: profile_file_name().to_string(),
+            profile_abs_path: data_dir.join(profile_file_name()).display().to_string(),
+        })
+    })
+    .await
+    .context("update_profile task failed")??;
 
     Ok(Json(resp))
 }
