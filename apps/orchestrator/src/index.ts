@@ -951,7 +951,6 @@ type AgentCandidate = {
 
 type ChatToolAgentFinal = {
   reply: string;
-  ask_user?: string | null;
   select?: { videos?: string[]; links?: string[] } | null;
   notes?: string | null;
 };
@@ -2293,6 +2292,7 @@ async function chatToolAgentInitNode(state: ChatToolAgentGraphState) {
   const systemPrompt = [
     "You are VidUnpack Agent (视频素材智能助手).",
     "You MUST use tools to search/resolve before answering. Choose tools based on the user's request.",
+    "Default behavior: do NOT ask clarifying questions. Make reasonable assumptions and proceed. If unsure, state assumptions briefly in reply and continue searching.",
     "Tool choice guidance:",
     "- If user asks for bilibili videos (B站视频/BV/bilibili.com/video), call search_bilibili_videos.",
     "- If user asks for general websites/resources, call search_web.",
@@ -2300,9 +2300,9 @@ async function chatToolAgentInitNode(state: ChatToolAgentGraphState) {
     "",
     "Output:",
     "- When you are ready to answer, output JSON ONLY (no markdown).",
-    '- Schema: { "reply": string, "ask_user"?: string, "select"?: { "videos"?: string[], "links"?: string[] } }',
+    '- Schema: { "reply": string, "select"?: { "videos"?: string[], "links"?: string[] }, "notes"?: string }',
     "- IMPORTANT: IDs in select MUST be candidate IDs returned by tools.",
-    "- If constraints are underspecified, set ask_user (ONE short question) and omit select.",
+    "- Do not ask user questions; instead proceed with best-effort and put assumptions into reply if needed.",
     ...(profilePrompt ? ["", "User profile (cross-project preferences):", profilePrompt] : []),
   ].join("\n");
 
@@ -2332,6 +2332,14 @@ async function chatToolAgentModelNode(state: ChatToolAgentGraphState) {
   const iterations = (state.iterations || 0) + 1;
 
   emitChatStage({ stage: "tool_call", detail: "llm" });
+  const intent = detectChatSearchIntent(state.userText);
+  const preferBilibili = /b站|bilibili|b23\.tv|bilibili\.com\/video|\bbv[0-9a-z]{6,}\b/i.test(String(state.userText || ""));
+  const forcedTool =
+    iterations === 1
+      ? preferBilibili || intent === "video"
+        ? { type: "function" as const, function: { name: "search_bilibili_videos" } }
+        : { type: "function" as const, function: { name: "search_web" } }
+      : "auto";
   const payload = await callChatCompletions({
     baseUrl: state.baseUrl,
     apiKey: state.geminiApiKey,
@@ -2340,7 +2348,7 @@ async function chatToolAgentModelNode(state: ChatToolAgentGraphState) {
     temperature: 0.2,
     maxTokens: 1024,
     tools,
-    toolChoice: "auto",
+    toolChoice: forcedTool as any,
   });
 
   const text = extractChatCompletionsText(payload);
@@ -2409,7 +2417,6 @@ async function chatToolAgentFinalizeNode(state: ChatToolAgentGraphState) {
   if (parsed && typeof parsed === "object") {
     final = {
       reply: typeof parsed.reply === "string" ? parsed.reply : "",
-      ask_user: typeof parsed.ask_user === "string" ? parsed.ask_user : null,
       select: parsed.select && typeof parsed.select === "object" ? parsed.select : null,
       notes: typeof parsed.notes === "string" ? parsed.notes : null,
     };
@@ -2466,7 +2473,6 @@ async function chatToolAgentFinalizeNode(state: ChatToolAgentGraphState) {
   }
 
   let reply = final?.reply ? ensureUserFacingReplyText(final.reply) : "";
-  if (final?.ask_user) reply = `${reply ? `${reply}\n\n` : ""}${final.ask_user}`;
   if (!reply) {
     reply =
       intent === "video"
