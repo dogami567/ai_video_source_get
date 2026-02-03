@@ -964,6 +964,8 @@ type ChatToolAgentThinkPlan = {
   stop_criteria?: string[];
 };
 
+const TOOL_AGENT_MAX_PASSES = 5;
+
 const ChatToolAgentStateAnnotation = Annotation.Root({
   projectId: Annotation<string>(),
   chatId: Annotation<string>(),
@@ -990,6 +992,10 @@ const ChatToolAgentStateAnnotation = Annotation.Root({
     default: () => [],
   }),
   iterations: Annotation<number>({
+    reducer: (_a, b) => b,
+    default: () => 0,
+  }),
+  pass: Annotation<number>({
     reducer: (_a, b) => b,
     default: () => 0,
   }),
@@ -2159,6 +2165,15 @@ async function execToolCall(
   const outCandidates: AgentCandidate[] = [];
 
   if (name === "search_bilibili_videos") {
+    const consent = await getConsent(state.projectId);
+    if (!consent?.consented) {
+      return {
+        toolMessage: { role: "tool", tool_call_id: call.id, name, content: JSON.stringify({ ok: false, needs_consent: true }) },
+        candidates: [],
+        needsConsent: true,
+      };
+    }
+
     const query = str(argsObj?.query);
     const numResults = Math.max(1, Math.min(20, Math.floor(Number(argsObj?.num_results || 10))));
     let q = query;
@@ -2201,6 +2216,15 @@ async function execToolCall(
   }
 
   if (name === "search_web") {
+    const consent = await getConsent(state.projectId);
+    if (!consent?.consented) {
+      return {
+        toolMessage: { role: "tool", tool_call_id: call.id, name, content: JSON.stringify({ ok: false, needs_consent: true }) },
+        candidates: [],
+        needsConsent: true,
+      };
+    }
+
     const query = str(argsObj?.query);
     const numResults = Math.max(1, Math.min(20, Math.floor(Number(argsObj?.num_results || 10))));
     const { results } = await webSearch({
@@ -2294,26 +2318,21 @@ async function execToolCall(
 async function chatToolAgentInitNode(state: ChatToolAgentGraphState) {
   emitChatStage({ stage: "planning" });
 
-  const consent = await getConsent(state.projectId);
-  if (!consent?.consented) {
-    const reply =
-      "要开始联网搜索/解析链接前，请先在本项目完成一次「授权确认」（外部内容提示）。完成后再发一句“开始搜”。";
-    return {
-      needsConsent: true,
-      final: { reply },
-      blocks: [],
-    };
-  }
-
   const profilePrompt = await getProfilePrompt();
   const systemPrompt = [
     "You are VidUnpack Agent (视频素材智能助手).",
-    "You MUST use tools to search/resolve before answering. Choose tools based on the user's request.",
-    "Default behavior: do NOT ask clarifying questions. Make reasonable assumptions and proceed. If unsure, state assumptions briefly in reply and continue searching.",
+    "Your job: take the user's creative intent and find matching media sources (videos/links) via tool calls.",
+    "Default behavior: do NOT ask clarifying questions. Make reasonable assumptions and proceed. If unsure, state assumptions briefly and continue.",
+    `Process: PLAN → DO → REVIEW (repeat up to ${TOOL_AGENT_MAX_PASSES} passes, stop early if enough).`,
+    "Rules:",
+    "- Do not do 'keyword cleaning' or rewrite the user's input; use the raw user message as ground truth.",
+    "- You should call tools to search/resolve before presenting cards, unless the user explicitly asked for non-search discussion.",
+    "- Prefer diversity: avoid duplicates / near-duplicates and keep results varied (different creators/keywords).",
+    "- If tools report needs_consent, stop and output JSON reply asking the user to confirm external content access.",
     "Tool choice guidance:",
-    "- If user asks for bilibili videos (B站视频/BV/bilibili.com/video), call search_bilibili_videos.",
-    "- If user asks for general websites/resources, call search_web.",
-    "- Call resolve_url for URLs you intend to present as cards, to get title/cover/description.",
+    "- search_bilibili_videos: bilibili video discovery.",
+    "- search_web: general web discovery.",
+    "- resolve_url: fetch title/thumbnail/description/duration (requires consent).",
     "",
     "Output:",
     "- When you are ready to answer, output JSON ONLY (no markdown).",
@@ -2351,11 +2370,11 @@ async function chatToolAgentThinkNode(state: ChatToolAgentGraphState) {
     "You MUST think about the user's request and propose a concrete tool strategy BEFORE any tool calls.",
     "Default behavior: do NOT ask clarifying questions. Make reasonable assumptions and proceed.",
     "Output JSON ONLY (no markdown).",
-    'Schema: { "intent": "video"|"audio"|"image"|"web", "platform_preference": "bilibili"|"web"|"mixed", "assumptions": string[], "tool_strategy": string[], "search_queries": string[], "stop_criteria": string[] }',
+    'Schema: { "intent": "video"|"audio"|"image"|"web", "platform_preference": "bilibili"|"web"|"mixed", "assumptions": string[], "shot_ideas": string[], "constraints": string[], "tool_strategy": string[], "stop_criteria": string[] }',
     "Rules:",
-    "- Keep search_queries short and actionable, 2-4 items.",
-    "- If user mentions B站视频/BV, platform_preference should be bilibili and queries should target bilibili video pages.",
-    "- If user mentions licensing (免版权/可商用), include it in search_queries and mention uncertainty in assumptions (do not claim verified license).",
+    "- Do not rewrite the user's message; extract intent/constraints only.",
+    "- If user mentions B站视频/BV, platform_preference should be bilibili.",
+    "- If user mentions licensing (免版权/可商用), include it in constraints and mention uncertainty in assumptions (do not claim verified license).",
   ].join("\n");
 
   const userText = String(state.userText || "");
@@ -2386,29 +2405,21 @@ async function chatToolAgentThinkNode(state: ChatToolAgentGraphState) {
   return { thinkPayload: payload, thinkText, thinkParsed, thinkPlan, messages: [message] };
 }
 
-async function chatToolAgentModelNode(state: ChatToolAgentGraphState) {
-  emitChatStage({ stage: "starting" });
+async function chatToolAgentDoNode(state: ChatToolAgentGraphState) {
+  const pass = (typeof state.pass === "number" && Number.isFinite(state.pass) ? state.pass : 0) + 1;
+  emitChatStage({ stage: "search", pass, max_passes: TOOL_AGENT_MAX_PASSES });
 
   if (state.needsConsent) return {};
   if (state.useGeminiNative) {
     const reply =
       "当前 Base URL 是 Gemini 原生接口，暂不支持本项目的“tool-calls”模式。请在设置里使用 OpenAI 兼容的中转（Base URL 指向 /v1 或 /openai）后再试。";
-    return { final: { reply }, pendingToolCalls: [] };
+    return { final: { reply }, pendingToolCalls: [], pass };
   }
 
   const tools = buildToolAgentTools();
-  const iterations = (state.iterations || 0) + 1;
+  emitChatStage({ stage: "tool_call", detail: "llm", pass, max_passes: TOOL_AGENT_MAX_PASSES });
 
-  emitChatStage({ stage: "tool_call", detail: "llm" });
-  const intent = detectChatSearchIntent(state.userText);
-  const preferBilibili = /b站|bilibili|b23\.tv|bilibili\.com\/video|\bbv[0-9a-z]{6,}\b/i.test(String(state.userText || ""));
-  const forcedTool =
-    iterations === 1
-      ? preferBilibili || intent === "video"
-        ? { type: "function" as const, function: { name: "search_bilibili_videos" } }
-        : { type: "function" as const, function: { name: "search_web" } }
-      : "auto";
-  const payload = await callChatCompletions({
+  let payload = await callChatCompletions({
     baseUrl: state.baseUrl,
     apiKey: state.geminiApiKey,
     model: state.model,
@@ -2416,15 +2427,35 @@ async function chatToolAgentModelNode(state: ChatToolAgentGraphState) {
     temperature: 0.2,
     maxTokens: 1024,
     tools,
-    toolChoice: forcedTool as any,
+    toolChoice: "auto",
   });
 
+  // First pass should attempt at least one tool call to discover candidates.
+  let toolCalls = extractChatCompletionsToolCalls(payload);
+  if (toolCalls.length === 0) {
+    try {
+      payload = await callChatCompletions({
+        baseUrl: state.baseUrl,
+        apiKey: state.geminiApiKey,
+        model: state.model,
+        messages: state.messages,
+        temperature: 0.2,
+        maxTokens: 512,
+        tools,
+        toolChoice: "required" as any,
+      });
+      toolCalls = extractChatCompletionsToolCalls(payload);
+    } catch {
+      // ignore
+    }
+  }
+
   const text = extractChatCompletionsText(payload);
-  const toolCalls = extractChatCompletionsToolCalls(payload);
   const assistant: OpenAIChatMessage = { role: "assistant", content: text || "" };
   if (toolCalls.length > 0) assistant.tool_calls = toolCalls;
 
-  return { messages: [assistant], pendingToolCalls: toolCalls, iterations };
+  const iterations = 1;
+  return { messages: [assistant], pendingToolCalls: toolCalls, iterations, pass };
 }
 
 async function chatToolAgentToolsNode(state: ChatToolAgentGraphState) {
@@ -2460,11 +2491,65 @@ async function chatToolAgentToolsNode(state: ChatToolAgentGraphState) {
   return { messages: toolMessages, candidates: added, pendingToolCalls: [] };
 }
 
-function routeAfterToolAgentModel(state: ChatToolAgentGraphState): "tools" | "hydrate" {
+async function chatToolAgentReviewNode(state: ChatToolAgentGraphState) {
+  const pass = (typeof state.pass === "number" && Number.isFinite(state.pass) ? state.pass : 0) + 1;
+  emitChatStage({ stage: "review", pass, max_passes: TOOL_AGENT_MAX_PASSES });
+
+  if (state.needsConsent) {
+    const reply = "需要先确认「外部内容访问」授权才能继续搜索/解析。请点确认后，我会自动继续。";
+    return { final: { reply }, pendingToolCalls: [], pass };
+  }
+  if (state.useGeminiNative) return {};
+
+  const tools = buildToolAgentTools();
+  const maxed = pass >= TOOL_AGENT_MAX_PASSES;
+  emitChatStage({ stage: "tool_call", detail: "llm.review", pass, max_passes: TOOL_AGENT_MAX_PASSES });
+
+  const payload = await callChatCompletions({
+    baseUrl: state.baseUrl,
+    apiKey: state.geminiApiKey,
+    model: state.model,
+    messages: [
+      ...state.messages,
+      {
+        role: "system",
+        content: [
+          "REVIEW step.",
+          "Evaluate whether current candidates match the user's creative intent.",
+          "If not enough and remaining passes > 0, call ONE tool with a refined query to improve relevance/diversity.",
+          "If enough OR remaining passes == 0, output JSON ONLY with { reply, select } (no markdown) and stop calling tools.",
+          "Avoid duplicates / near-duplicates in select.",
+          `pass=${pass}`,
+          `max_passes=${TOOL_AGENT_MAX_PASSES}`,
+          `remaining_passes=${Math.max(0, TOOL_AGENT_MAX_PASSES - pass)}`,
+        ].join("\n"),
+      },
+    ],
+    temperature: 0.2,
+    maxTokens: 1024,
+    tools,
+    toolChoice: maxed ? ("none" as any) : "auto",
+  });
+
+  const text = extractChatCompletionsText(payload);
+  const toolCalls = extractChatCompletionsToolCalls(payload);
+  const assistant: OpenAIChatMessage = { role: "assistant", content: text || "" };
+  if (!maxed && toolCalls.length > 0) assistant.tool_calls = toolCalls;
+  const iterations = (state.iterations || 0) + 1;
+  return { messages: [assistant], pendingToolCalls: toolCalls, iterations, pass };
+}
+
+function routeAfterToolAgentDo(state: ChatToolAgentGraphState): "tools" | "hydrate" {
   if (state.needsConsent) return "hydrate";
   const calls = Array.isArray(state.pendingToolCalls) ? state.pendingToolCalls : [];
-  const it = typeof state.iterations === "number" && Number.isFinite(state.iterations) ? state.iterations : 0;
-  if (calls.length > 0 && it < 10) return "tools";
+  return calls.length > 0 ? "tools" : "hydrate";
+}
+
+function routeAfterToolAgentReview(state: ChatToolAgentGraphState): "tools" | "hydrate" {
+  if (state.needsConsent) return "hydrate";
+  const calls = Array.isArray(state.pendingToolCalls) ? state.pendingToolCalls : [];
+  const pass = typeof state.pass === "number" && Number.isFinite(state.pass) ? state.pass : 0;
+  if (calls.length > 0 && pass < TOOL_AGENT_MAX_PASSES) return "tools";
   return "hydrate";
 }
 
@@ -2478,7 +2563,6 @@ async function chatToolAgentHydrateNode(state: ChatToolAgentGraphState) {
   const rawText = lastAssistant ? String(lastAssistant.content || "").trim() : "";
   const parsed = tryParseJsonObject(rawText);
 
-  const intent = detectChatSearchIntent(state.userText);
   const wanted = parsed && typeof parsed === "object" ? (parsed as any)?.select : null;
   const wantedVideos = Array.isArray(wanted?.videos) ? wanted.videos.map((x: any) => String(x || "").trim()).filter(Boolean) : [];
   const wantedLinks = Array.isArray(wanted?.links) ? wanted.links.map((x: any) => String(x || "").trim()).filter(Boolean) : [];
@@ -2503,7 +2587,7 @@ async function chatToolAgentHydrateNode(state: ChatToolAgentGraphState) {
 
   const idsToHydrate: string[] = [];
   for (const id of pickIds(wantedVideos, "video", 3)) idsToHydrate.push(id);
-  if (intent !== "video") for (const id of pickIds(wantedLinks, "link", 2)) idsToHydrate.push(id);
+  for (const id of pickIds(wantedLinks, "link", 2)) idsToHydrate.push(id);
 
   const updated: AgentCandidate[] = [];
 
@@ -2582,7 +2666,6 @@ async function chatToolAgentFinalizeNode(state: ChatToolAgentGraphState) {
     return candidates.filter((c) => c.kind === kind).slice(0, limit);
   };
 
-  const intent = detectChatSearchIntent(state.userText);
   const defaultVideoLimit = 3;
   const defaultLinkLimit = 4;
 
@@ -2601,7 +2684,7 @@ async function chatToolAgentFinalizeNode(state: ChatToolAgentGraphState) {
     }));
     blocks.push({ type: "videos", videos });
   }
-  if (linksPicked.length > 0 && intent !== "video") {
+  if (linksPicked.length > 0) {
     const links: ChatLinkCard[] = linksPicked.map((c) => ({
       url: c.url,
       title: c.title || c.url,
@@ -2612,10 +2695,7 @@ async function chatToolAgentFinalizeNode(state: ChatToolAgentGraphState) {
 
   let reply = final?.reply ? ensureUserFacingReplyText(final.reply) : "";
   if (!reply) {
-    reply =
-      intent === "video"
-        ? "我先给你一些候选视频卡片。你更偏向哪种风格/时长/用途？我可以再精确补搜。"
-        : "我先给你一些候选链接。你更偏向哪类资源？我可以再精确补搜。";
+    reply = "我先给你一些候选卡片。你更偏向哪种风格/时长/用途？我可以再继续补搜或换方向。";
   }
 
   return { final: { reply }, blocks };
@@ -2624,18 +2704,23 @@ async function chatToolAgentFinalizeNode(state: ChatToolAgentGraphState) {
 const chatToolAgentGraph = new StateGraph(ChatToolAgentStateAnnotation)
   .addNode("init", chatToolAgentInitNode)
   .addNode("think", chatToolAgentThinkNode)
-  .addNode("agent", chatToolAgentModelNode)
+  .addNode("do", chatToolAgentDoNode)
   .addNode("tools", chatToolAgentToolsNode)
+  .addNode("review", chatToolAgentReviewNode)
   .addNode("hydrate", chatToolAgentHydrateNode)
   .addNode("finalize", chatToolAgentFinalizeNode)
   .addEdge(START, "init")
   .addEdge("init", "think")
-  .addEdge("think", "agent")
-  .addConditionalEdges("agent", routeAfterToolAgentModel, {
+  .addEdge("think", "do")
+  .addConditionalEdges("do", routeAfterToolAgentDo, {
     tools: "tools",
     hydrate: "hydrate",
   })
-  .addEdge("tools", "agent")
+  .addEdge("tools", "review")
+  .addConditionalEdges("review", routeAfterToolAgentReview, {
+    tools: "tools",
+    hydrate: "hydrate",
+  })
   .addEdge("hydrate", "finalize")
   .addEdge("finalize", END)
   .compile();
@@ -2916,7 +3001,7 @@ async function handleChatTurn(projectId: string, body: any) {
   const plan = thinkEnabled
     ? {
         action: "chat_tool_agent",
-        loop: { max_iterations: 10 },
+        loop: { max_passes: TOOL_AGENT_MAX_PASSES },
         tools: ["search_bilibili_videos", "search_web", "resolve_url"],
       }
     : null;
@@ -2941,6 +3026,7 @@ async function handleChatTurn(projectId: string, body: any) {
       messages: [],
       pendingToolCalls: [],
       iterations: 0,
+      pass: 0,
       candidates: [],
       final: null,
       blocks: [],
@@ -2966,6 +3052,7 @@ async function handleChatTurn(projectId: string, body: any) {
           user: { message_id: userMessage.id, text: userText },
           tool_agent: {
             iterations: agentState.iterations || 0,
+            pass: agentState.pass || 0,
             needs_consent: !!agentState.needsConsent,
             think: {
               text: agentState.thinkText || "",
