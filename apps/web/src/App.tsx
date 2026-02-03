@@ -2482,6 +2482,14 @@ export default function App() {
 	                                                      const url = typeof l?.url === "string" ? l.url.trim() : "";
 	                                                      const title = typeof l?.title === "string" ? l.title : url;
 	                                                      const snippet = typeof l?.snippet === "string" ? l.snippet : null;
+	                                                      const matchTags = Array.isArray(l?.match_tags)
+	                                                        ? (l.match_tags as any[]).map((x) => String(x)).filter(Boolean).slice(0, 8)
+	                                                        : null;
+	                                                      const matchReason = typeof l?.match_reason === "string" ? l.match_reason : null;
+	                                                      const matchScore =
+	                                                        typeof l?.match_score === "number" && Number.isFinite(l.match_score)
+	                                                          ? l.match_score
+	                                                          : null;
 	                                                      return (
 	                                                        <div key={url} className="link-card" data-testid="chat-link-card">
 	                                                          <div className="link-info">
@@ -2489,6 +2497,17 @@ export default function App() {
 	                                                              {title}
 	                                                            </a>
 	                                                            {snippet ? <div className="link-desc">{snippet}</div> : null}
+	                                                            {matchTags && matchTags.length > 0 ? (
+	                                                              <div className="text-xs text-dim mt-1">{matchTags.join(" · ")}</div>
+	                                                            ) : null}
+	                                                            {matchReason ? (
+	                                                              <div className="text-xs text-muted mt-1">
+	                                                                {matchScore != null ? `Match ${Math.round(matchScore * 100)}% — ` : ""}
+	                                                                {matchReason}
+	                                                              </div>
+	                                                            ) : matchScore != null ? (
+	                                                              <div className="text-xs text-muted mt-1">{`Match ${Math.round(matchScore * 100)}%`}</div>
+	                                                            ) : null}
 	                                                            <div className="link-url mono">{url}</div>
 	                                                          </div>
 	                                                          <div className="link-actions">
@@ -2532,6 +2551,14 @@ export default function App() {
 	                                                      const desc =
 	                                                        resolved?.description ?? (typeof v?.description === "string" ? v.description : null);
 	                                                      const thumb = resolved?.thumbnail ?? (typeof v?.thumbnail === "string" ? v.thumbnail : null);
+	                                                      const matchTags = Array.isArray(v?.match_tags)
+	                                                        ? (v.match_tags as any[]).map((x) => String(x)).filter(Boolean).slice(0, 8)
+	                                                        : null;
+	                                                      const matchReason = typeof v?.match_reason === "string" ? v.match_reason : null;
+	                                                      const matchScore =
+	                                                        typeof v?.match_score === "number" && Number.isFinite(v.match_score)
+	                                                          ? v.match_score
+	                                                          : null;
 	                                                      const thumbSrc = thumb && url ? proxyImageUrl(thumb, url) : "";
 	                                                      const busy = chatCardBusyUrl === url;
 	                                                      return (
@@ -2546,6 +2573,17 @@ export default function App() {
 	                                                              {title}
 	                                                            </a>
 	                                                            {desc ? <div className="video-desc">{desc}</div> : null}
+	                                                            {matchTags && matchTags.length > 0 ? (
+	                                                              <div className="text-xs text-dim mt-1">{matchTags.join(" · ")}</div>
+	                                                            ) : null}
+	                                                            {matchReason ? (
+	                                                              <div className="text-xs text-muted mt-1">
+	                                                                {matchScore != null ? `Match ${Math.round(matchScore * 100)}% — ` : ""}
+	                                                                {matchReason}
+	                                                              </div>
+	                                                            ) : matchScore != null ? (
+	                                                              <div className="text-xs text-muted mt-1">{`Match ${Math.round(matchScore * 100)}%`}</div>
+	                                                            ) : null}
 	                                                            <div className="video-url mono">{url}</div>
 	                                                            <div className="video-actions">
 	                                                              <button

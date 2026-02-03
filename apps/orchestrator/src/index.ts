@@ -875,12 +875,18 @@ type ChatVideoCard = {
   duration_s?: number | null;
   extractor?: string;
   id?: string;
+  match_tags?: string[] | null;
+  match_reason?: string | null;
+  match_score?: number | null;
 };
 
 type ChatLinkCard = {
   url: string;
   title: string;
   snippet?: string | null;
+  match_tags?: string[] | null;
+  match_reason?: string | null;
+  match_score?: number | null;
 };
 
 type ChatAgentPlan = {
@@ -952,6 +958,17 @@ type AgentCandidate = {
 type ChatToolAgentFinal = {
   reply: string;
   select?: { videos?: string[]; links?: string[] } | null;
+  scorecard?:
+    | Record<
+        string,
+        {
+          score?: number | null;
+          tags?: string[] | null;
+          reason?: string | null;
+        }
+      >
+    | null;
+  dedupe_groups?: string[][] | null;
   notes?: string | null;
 };
 
@@ -2336,7 +2353,7 @@ async function chatToolAgentInitNode(state: ChatToolAgentGraphState) {
     "",
     "Output:",
     "- When you are ready to answer, output JSON ONLY (no markdown).",
-    '- Schema: { "reply": string, "select"?: { "videos"?: string[], "links"?: string[] }, "notes"?: string }',
+    '- Schema: { "reply": string, "select"?: { "videos"?: string[], "links"?: string[] }, "scorecard"?: { [id: string]: { "score"?: number, "tags"?: string[], "reason"?: string } }, "dedupe_groups"?: string[][], "notes"?: string }',
     "- IMPORTANT: IDs in select MUST be candidate IDs returned by tools.",
     "- Do not ask user questions; instead proceed with best-effort and put assumptions into reply if needed.",
     ...(profilePrompt ? ["", "User profile (cross-project preferences):", profilePrompt] : []),
@@ -2505,6 +2522,20 @@ async function chatToolAgentReviewNode(state: ChatToolAgentGraphState) {
   const maxed = pass >= TOOL_AGENT_MAX_PASSES;
   emitChatStage({ stage: "tool_call", detail: "llm.review", pass, max_passes: TOOL_AGENT_MAX_PASSES });
 
+  const candidates = Array.isArray(state.candidates) ? state.candidates : [];
+  const digest = candidates
+    .slice(0, 30)
+    .map((c) => ({
+      id: c.id,
+      kind: c.kind,
+      url: c.url,
+      title: c.title,
+      snippet: str(c.description) || str(c.snippet) || null,
+      extractor: str(c.extractor) || null,
+      duration_s: typeof c.duration_s === "number" ? c.duration_s : null,
+      thumbnail: str(c.thumbnail) || null,
+    }));
+
   const payload = await callChatCompletions({
     baseUrl: state.baseUrl,
     apiKey: state.geminiApiKey,
@@ -2517,12 +2548,18 @@ async function chatToolAgentReviewNode(state: ChatToolAgentGraphState) {
           "REVIEW step.",
           "Evaluate whether current candidates match the user's creative intent.",
           "If not enough and remaining passes > 0, call ONE tool with a refined query to improve relevance/diversity.",
-          "If enough OR remaining passes == 0, output JSON ONLY with { reply, select } (no markdown) and stop calling tools.",
+          "If enough OR remaining passes == 0, output JSON ONLY with { reply, select, scorecard, dedupe_groups } (no markdown) and stop calling tools.",
           "Avoid duplicates / near-duplicates in select.",
+          'scorecard schema: { [id: string]: { score?: number (0..1), tags?: string[], reason?: string } }',
+          "dedupe_groups schema: string[][] (each group lists candidate ids that are near-duplicates).",
           `pass=${pass}`,
           `max_passes=${TOOL_AGENT_MAX_PASSES}`,
           `remaining_passes=${Math.max(0, TOOL_AGENT_MAX_PASSES - pass)}`,
         ].join("\n"),
+      },
+      {
+        role: "system",
+        content: `Candidates digest (for scoring/dedup; ids must match):\n${JSON.stringify(digest, null, 2)}`,
       },
     ],
     temperature: 0.2,
@@ -2539,10 +2576,10 @@ async function chatToolAgentReviewNode(state: ChatToolAgentGraphState) {
   return { messages: [assistant], pendingToolCalls: toolCalls, iterations, pass };
 }
 
-function routeAfterToolAgentDo(state: ChatToolAgentGraphState): "tools" | "hydrate" {
-  if (state.needsConsent) return "hydrate";
+function routeAfterToolAgentDo(state: ChatToolAgentGraphState): "tools" | "review" {
+  if (state.needsConsent) return "review";
   const calls = Array.isArray(state.pendingToolCalls) ? state.pendingToolCalls : [];
-  return calls.length > 0 ? "tools" : "hydrate";
+  return calls.length > 0 ? "tools" : "review";
 }
 
 function routeAfterToolAgentReview(state: ChatToolAgentGraphState): "tools" | "hydrate" {
@@ -2640,6 +2677,8 @@ async function chatToolAgentFinalizeNode(state: ChatToolAgentGraphState) {
     final = {
       reply: typeof parsed.reply === "string" ? parsed.reply : "",
       select: parsed.select && typeof parsed.select === "object" ? parsed.select : null,
+      scorecard: parsed.scorecard && typeof parsed.scorecard === "object" ? (parsed.scorecard as any) : null,
+      dedupe_groups: Array.isArray(parsed.dedupe_groups) ? (parsed.dedupe_groups as any) : null,
       notes: typeof parsed.notes === "string" ? parsed.notes : null,
     };
   }
@@ -2671,25 +2710,47 @@ async function chatToolAgentFinalizeNode(state: ChatToolAgentGraphState) {
 
   const videosPicked = pick(wanted?.videos, "video", defaultVideoLimit);
   const linksPicked = pick(wanted?.links, "link", defaultLinkLimit);
+  const scorecard = final?.scorecard && typeof final.scorecard === "object" ? final.scorecard : null;
+  const scoreFor = (id: string) => {
+    if (!scorecard) return null;
+    const it = (scorecard as any)[id];
+    if (!it || typeof it !== "object") return null;
+    const score = typeof it.score === "number" && Number.isFinite(it.score) ? it.score : null;
+    const tags = Array.isArray(it.tags) ? it.tags.map((s: any) => String(s)).filter(Boolean).slice(0, 8) : null;
+    const reason = typeof it.reason === "string" ? it.reason : null;
+    return { score, tags, reason };
+  };
 
   if (videosPicked.length > 0) {
-    const videos: ChatVideoCard[] = videosPicked.map((c) => ({
-      url: c.url,
-      title: c.title || c.url,
-      description: c.description || c.snippet || null,
-      thumbnail: c.thumbnail || null,
-      duration_s: typeof c.duration_s === "number" ? c.duration_s : null,
-      extractor: c.extractor || (c.url.includes("bilibili") ? "bilibili" : "unknown"),
-      id: "",
-    }));
+    const videos: ChatVideoCard[] = videosPicked.map((c) => {
+      const sc = scoreFor(c.id);
+      return {
+        url: c.url,
+        title: c.title || c.url,
+        description: c.description || c.snippet || null,
+        thumbnail: c.thumbnail || null,
+        duration_s: typeof c.duration_s === "number" ? c.duration_s : null,
+        extractor: c.extractor || (c.url.includes("bilibili") ? "bilibili" : "unknown"),
+        id: "",
+        match_score: sc?.score ?? null,
+        match_tags: sc?.tags ?? null,
+        match_reason: sc?.reason ?? null,
+      };
+    });
     blocks.push({ type: "videos", videos });
   }
   if (linksPicked.length > 0) {
-    const links: ChatLinkCard[] = linksPicked.map((c) => ({
-      url: c.url,
-      title: c.title || c.url,
-      snippet: c.snippet || null,
-    }));
+    const links: ChatLinkCard[] = linksPicked.map((c) => {
+      const sc = scoreFor(c.id);
+      return {
+        url: c.url,
+        title: c.title || c.url,
+        snippet: c.snippet || null,
+        match_score: sc?.score ?? null,
+        match_tags: sc?.tags ?? null,
+        match_reason: sc?.reason ?? null,
+      };
+    });
     blocks.push({ type: "links", links });
   }
 
@@ -2714,7 +2775,7 @@ const chatToolAgentGraph = new StateGraph(ChatToolAgentStateAnnotation)
   .addEdge("think", "do")
   .addConditionalEdges("do", routeAfterToolAgentDo, {
     tools: "tools",
-    hydrate: "hydrate",
+    review: "review",
   })
   .addEdge("tools", "review")
   .addConditionalEdges("review", routeAfterToolAgentReview, {
