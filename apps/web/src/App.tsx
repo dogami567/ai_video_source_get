@@ -1238,6 +1238,8 @@ export default function App() {
             ? tr("stageStarting")
             : stage === "planning"
               ? tr("stagePlanning")
+              : stage === "thinking"
+                ? tr("stageThinking")
               : stage === "resolve"
                 ? tr("stageResolve")
                 : stage === "search"

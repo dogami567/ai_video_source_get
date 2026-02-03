@@ -955,6 +955,15 @@ type ChatToolAgentFinal = {
   notes?: string | null;
 };
 
+type ChatToolAgentThinkPlan = {
+  intent?: "video" | "audio" | "image" | "web";
+  platform_preference?: "bilibili" | "web" | "mixed";
+  assumptions?: string[];
+  tool_strategy?: string[];
+  search_queries?: string[];
+  stop_criteria?: string[];
+};
+
 const ChatToolAgentStateAnnotation = Annotation.Root({
   projectId: Annotation<string>(),
   chatId: Annotation<string>(),
@@ -983,6 +992,14 @@ const ChatToolAgentStateAnnotation = Annotation.Root({
   iterations: Annotation<number>({
     reducer: (_a, b) => b,
     default: () => 0,
+  }),
+
+  thinkPayload: Annotation<any>(),
+  thinkText: Annotation<string>(),
+  thinkParsed: Annotation<unknown | null>(),
+  thinkPlan: Annotation<ChatToolAgentThinkPlan | null>({
+    reducer: (_a, b) => b,
+    default: () => null,
   }),
 
   candidates: Annotation<AgentCandidate[]>({
@@ -2318,6 +2335,57 @@ async function chatToolAgentInitNode(state: ChatToolAgentGraphState) {
   return { messages, needsConsent: false };
 }
 
+async function chatToolAgentThinkNode(state: ChatToolAgentGraphState) {
+  if (state.needsConsent) return {};
+
+  emitChatStage({ stage: "thinking" });
+
+  if (state.useGeminiNative) {
+    const reply =
+      "当前 Base URL 是 Gemini 原生接口，暂不支持本项目的“tool-calls agent”模式。请在设置里使用 OpenAI 兼容的中转（Base URL 指向 /v1 或 /openai）后再试。";
+    return { final: { reply }, thinkPlan: null, thinkText: "", thinkParsed: null };
+  }
+
+  const systemPrompt = [
+    "You are VidUnpack Agent (internal THINK step).",
+    "You MUST think about the user's request and propose a concrete tool strategy BEFORE any tool calls.",
+    "Default behavior: do NOT ask clarifying questions. Make reasonable assumptions and proceed.",
+    "Output JSON ONLY (no markdown).",
+    'Schema: { "intent": "video"|"audio"|"image"|"web", "platform_preference": "bilibili"|"web"|"mixed", "assumptions": string[], "tool_strategy": string[], "search_queries": string[], "stop_criteria": string[] }',
+    "Rules:",
+    "- Keep search_queries short and actionable, 2-4 items.",
+    "- If user mentions B站视频/BV, platform_preference should be bilibili and queries should target bilibili video pages.",
+    "- If user mentions licensing (免版权/可商用), include it in search_queries and mention uncertainty in assumptions (do not claim verified license).",
+  ].join("\n");
+
+  const userText = String(state.userText || "");
+  const payload = await callChatCompletions({
+    baseUrl: state.baseUrl,
+    apiKey: state.geminiApiKey,
+    model: state.model,
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userText },
+    ],
+    temperature: 0.2,
+    maxTokens: 512,
+    toolChoice: "none",
+  });
+
+  const thinkText = extractChatCompletionsText(payload);
+  const thinkParsed = tryParseJson(thinkText);
+  const thinkPlan = (thinkParsed && typeof thinkParsed === "object" ? (thinkParsed as any) : null) as any;
+
+  // Feed the plan back to the agent as an internal system note to guide tool choice.
+  const planNote = thinkText && thinkText.trim() ? thinkText.trim() : "{}";
+  const message: OpenAIChatMessage = {
+    role: "system",
+    content: `Internal plan (do not reveal to user):\n${planNote}`,
+  };
+
+  return { thinkPayload: payload, thinkText, thinkParsed, thinkPlan, messages: [message] };
+}
+
 async function chatToolAgentModelNode(state: ChatToolAgentGraphState) {
   emitChatStage({ stage: "starting" });
 
@@ -2485,11 +2553,13 @@ async function chatToolAgentFinalizeNode(state: ChatToolAgentGraphState) {
 
 const chatToolAgentGraph = new StateGraph(ChatToolAgentStateAnnotation)
   .addNode("init", chatToolAgentInitNode)
+  .addNode("think", chatToolAgentThinkNode)
   .addNode("agent", chatToolAgentModelNode)
   .addNode("tools", chatToolAgentToolsNode)
   .addNode("finalize", chatToolAgentFinalizeNode)
   .addEdge(START, "init")
-  .addEdge("init", "agent")
+  .addEdge("init", "think")
+  .addEdge("think", "agent")
   .addConditionalEdges("agent", routeAfterToolAgentModel, {
     tools: "tools",
     finalize: "finalize",
@@ -2825,6 +2895,11 @@ async function handleChatTurn(projectId: string, body: any) {
           tool_agent: {
             iterations: agentState.iterations || 0,
             needs_consent: !!agentState.needsConsent,
+            think: {
+              text: agentState.thinkText || "",
+              parsed: agentState.thinkParsed ?? null,
+              plan: agentState.thinkPlan ?? null,
+            },
             final: agentState.final,
             candidates: agentState.candidates || [],
             messages: (agentState.messages || []).map((m) => ({
