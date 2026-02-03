@@ -1027,6 +1027,13 @@ type ChatSearchIntent = "video" | "web" | "image" | "audio";
 
 function detectChatSearchIntent(text: string): ChatSearchIntent {
   const t = String(text || "");
+  // Disambiguation: if user explicitly says "视频"/BV/bilibili video links, treat as video unless they explicitly want audio-only.
+  // This keeps the agent flexible while respecting strong user signals.
+  const wantsVideo =
+    /视频|番剧|影视|\bbv[0-9a-z]{6,}\b/i.test(t) || /bilibili\.com\/video\/|b23\.tv\//i.test(t);
+  const audioOnly = /不要视频|不需要视频|只要音频|仅音频|只要声音|只要配音|只要bgm/i.test(t);
+  if (wantsVideo && !audioOnly) return "video";
+
   if (/bgm|配音|音效|旁白|声音|音乐|伴奏|sfx|sound effect|voiceover|voice over/i.test(t)) return "audio";
   if (/表情包|emoji|贴纸|gif|png|透明底|图片|素材图|贴图|icon/i.test(t)) return "image";
   if (/网站|网页|站点|信息|资料|教程|仓库|repo|github|开源|document|docs/i.test(t)) return "web";
