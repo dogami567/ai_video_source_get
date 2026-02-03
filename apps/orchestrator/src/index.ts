@@ -23,6 +23,12 @@ const CHAT_MAX_SEARCH_PASSES = (() => {
   return Math.max(1, Math.min(5, Math.floor(raw)));
 })();
 
+const GEMINI_THINKING_BUDGET = (() => {
+  const raw = Number(process.env.GEMINI_THINKING_BUDGET);
+  if (!Number.isFinite(raw)) return 1024;
+  return Math.max(0, Math.min(8192, Math.floor(raw)));
+})();
+
 type ChatTurnStageEvent = {
   stage: string;
   detail?: string | null;
@@ -957,7 +963,21 @@ function extractKeywordTokens(text: string): string[] {
 
   // CJK tokens (连续汉字)
   for (const m of t.matchAll(/[\p{Script=Han}]{2,}/gu)) {
-    out.push(String(m[0]).toLowerCase());
+    const raw = String(m[0]).toLowerCase();
+    out.push(raw);
+    // Add short n-grams to avoid "b站哈基米" being captured as a single long token ("站哈基米").
+    // This improves intent/topic matching without requiring a full tokenizer.
+    if (raw.length >= 3 && raw.length <= 12) {
+      for (let n = 2; n <= 4; n++) {
+        if (raw.length < n) continue;
+        for (let i = 0; i + n <= raw.length; i++) {
+          out.push(raw.slice(i, i + n));
+          if (out.length > 80) break;
+        }
+        if (out.length > 80) break;
+      }
+    }
+    if (out.length > 120) break;
   }
 
   return uniqStrings(out).filter(Boolean);
@@ -1011,6 +1031,46 @@ function detectChatSearchIntent(text: string): ChatSearchIntent {
   if (/表情包|emoji|贴纸|gif|png|透明底|图片|素材图|贴图|icon/i.test(t)) return "image";
   if (/网站|网页|站点|信息|资料|教程|仓库|repo|github|开源|document|docs/i.test(t)) return "web";
   return "video";
+}
+
+type ChatConstraintHints = {
+  wants_license: boolean;
+  license_terms: string[];
+  target_platforms: string[];
+  wants_external: boolean;
+  wants_bilibili: boolean;
+};
+
+function inferConstraintHints(text: string): ChatConstraintHints {
+  const t = String(text || "").toLowerCase();
+  const licenseTerms: string[] = [];
+  const push = (s: string) => {
+    const v = String(s || "").trim();
+    if (!v) return;
+    if (!licenseTerms.includes(v)) licenseTerms.push(v);
+  };
+  if (/免版权|无版权|版权无|royalty[- ]?free|copyright[- ]?free/i.test(t)) push("免版权/royalty-free");
+  if (/可商用|商用|commercial use|for commercial use/i.test(t)) push("可商用");
+  if (/cc0|creative commons 0/i.test(t)) push("CC0");
+  if (/署名|attribution|by[- ]?sa|cc-by/i.test(t)) push("需署名/CC-BY");
+  if (/不可商用|non[- ]?commercial|cc-nc/i.test(t)) push("不可商用/NC");
+
+  const targetPlatforms: string[] = [];
+  if (/b站|bilibili|b23\.tv/i.test(t)) targetPlatforms.push("bilibili");
+  if (/youtube|youtu/i.test(t)) targetPlatforms.push("youtube");
+  if (/tiktok|douyin|抖音/i.test(t)) targetPlatforms.push("tiktok/douyin");
+  if (/instagram|ins\b/i.test(t)) targetPlatforms.push("instagram");
+
+  const wantsExternal = /外站|站外|海外|youtube|youtu|tiktok|douyin|instagram|twitter|x\.com/i.test(t);
+  const wantsBilibili = /b站|bilibili|b23\.tv|bilibili\.com|\bbv[0-9a-z]{6,}/i.test(t);
+
+  return {
+    wants_license: licenseTerms.length > 0,
+    license_terms: licenseTerms,
+    target_platforms: targetPlatforms,
+    wants_external: wantsExternal,
+    wants_bilibili: wantsBilibili,
+  };
 }
 
 type WebSearchResult = { title: string; url: string; snippet?: string | null };
@@ -1235,7 +1295,11 @@ async function chatTurnPlanNode(state: ChatTurnGraphState) {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           contents,
-          generationConfig: { temperature: 0.2, maxOutputTokens: 1024 },
+          generationConfig: {
+            temperature: 0.2,
+            maxOutputTokens: 1024,
+            ...(thinkEnabled && GEMINI_THINKING_BUDGET > 0 ? { thinkingConfig: { thinkingBudget: GEMINI_THINKING_BUDGET } } : {}),
+          },
         }),
       });
     } else {
@@ -1408,6 +1472,7 @@ async function chatTurnDoSearchAndResolveNode(state: ChatTurnGraphState) {
 
   const hintText = `${userText} ${rawQueries.join(" ")} ${(state.directUrls || []).join(" ")}`;
   const intent = detectChatSearchIntent(hintText);
+  const constraintHints = inferConstraintHints(hintText);
 
   const wantsExternal = /外站|站外|youtube|youtu|tiktok|douyin|instagram|twitter|x\\.com/i.test(hintText);
   const wantsBilibili = /b站|bilibili|b23\\.tv|bilibili\\.com|\\bbv[0-9a-z]{6,}/i.test(hintText);
@@ -1437,7 +1502,11 @@ async function chatTurnDoSearchAndResolveNode(state: ChatTurnGraphState) {
     return 0;
   };
 
-  const mainQuery = str(queries[0]);
+  let mainQuery = str(queries[0]);
+  if (constraintHints.wants_license && intent !== "video") {
+    const hasLicenseToken = /免版权|可商用|cc0|royalty[- ]?free|copyright[- ]?free/i.test(mainQuery);
+    if (!hasLicenseToken) mainQuery = `${mainQuery} 免版权 可商用`;
+  }
 
   const rounds: Array<{ label: string; query: string }> = [];
   const seenRound = new Set<string>();
@@ -1670,6 +1739,8 @@ async function chatTurnReviewRefineNode(state: ChatTurnGraphState) {
     .filter((v: any) => !!str(v.url));
 
   const intent = detectChatSearchIntent(`${userText} ${agentPlan.search_queries.join(" ")}`);
+  const constraints = inferConstraintHints(userText);
+  const focusTokens = focusTokensFromText(userText).slice(0, 12);
 
   // Heuristic early-stop: avoid burning all passes when we already have enough candidates.
   // The loop is capped by CHAT_MAX_SEARCH_PASSES, but the review model can still be overly eager.
@@ -1680,14 +1751,19 @@ async function chatTurnReviewRefineNode(state: ChatTurnGraphState) {
   const systemPrompt = [
     "You are VidUnpack Chat (视频拆解箱对话助手).",
     "You are in the REVIEW step after a web-search pass.",
-    "Task: evaluate whether current candidates match the user's intent and context; if not, propose 1-2 refined search queries for ONE more targeted pass.",
+    "Task: evaluate whether current candidates match the user's exact constraints (asset type + topic + licensing + platforms). Then decide ONE of:",
+    "- stop (search_again=false): results are good enough to present",
+    "- refine (search_again=true): propose 1-3 refined search_queries for ONE more targeted pass",
+    "- ask_user (search_again=false): ask ONE clarifying question if constraints are underspecified",
     "Rules:",
     "- Output JSON ONLY (no markdown).",
-    '- Schema: { \"search_again\": boolean, \"search_queries\"?: string[], \"ask_user\"?: string }',
+    '- Schema: { \"search_again\": boolean, \"search_queries\"?: string[], \"ask_user\"?: string, \"checks\"?: object, \"missing\"?: string[], \"decision\"?: string, \"notes\"?: string }',
     "- search_again=true only if another pass is likely to improve relevance.",
     "- If user intent is ambiguous, set search_again=false and provide ask_user (1 short clarifying question).",
-    "- If providing search_queries, keep them concise and avoid repeating previous queries.",
+    "- If user has licensing requirements (e.g. 免版权/可商用/CC0), do NOT assume. Mark as 'unknown' unless candidates explicitly mention license terms. Prefer asking the user what they mean by '免版权' if needed.",
+    "- If providing search_queries, keep them concise, MUST include the core topic token(s) from user_text, and avoid repeating previous queries.",
     "- Avoid suggesting URLs already shown before (see avoid_urls).",
+    "- Do NOT write progress phrases like '我再补搜一轮…' into any user-facing reply here.",
     "",
     `intent=${intent}`,
     `pass=${pass}`,
@@ -1698,6 +1774,8 @@ async function chatTurnReviewRefineNode(state: ChatTurnGraphState) {
     JSON.stringify(
       {
         user_text: userText,
+        focus_tokens: focusTokens,
+        constraint_hints: constraints,
         previous_queries: agentPlan.search_queries,
         candidates: { links: presentLinks, videos: presentVideos },
         avoid_urls: avoidUrls,
@@ -1733,7 +1811,11 @@ async function chatTurnReviewRefineNode(state: ChatTurnGraphState) {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         contents,
-        generationConfig: { temperature: 0.2, maxOutputTokens: 512 },
+        generationConfig: {
+          temperature: 0.2,
+          maxOutputTokens: 1024,
+          ...(GEMINI_THINKING_BUDGET > 0 ? { thinkingConfig: { thinkingBudget: GEMINI_THINKING_BUDGET } } : {}),
+        },
       }),
     });
   } else {
@@ -1743,7 +1825,7 @@ async function chatTurnReviewRefineNode(state: ChatTurnGraphState) {
       model,
       messages: openAiMessages,
       temperature: 0.2,
-      maxTokens: 512,
+      maxTokens: 1024,
     });
   }
 
