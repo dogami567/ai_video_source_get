@@ -2460,12 +2460,82 @@ async function chatToolAgentToolsNode(state: ChatToolAgentGraphState) {
   return { messages: toolMessages, candidates: added, pendingToolCalls: [] };
 }
 
-function routeAfterToolAgentModel(state: ChatToolAgentGraphState): "tools" | "finalize" {
-  if (state.needsConsent) return "finalize";
+function routeAfterToolAgentModel(state: ChatToolAgentGraphState): "tools" | "hydrate" {
+  if (state.needsConsent) return "hydrate";
   const calls = Array.isArray(state.pendingToolCalls) ? state.pendingToolCalls : [];
   const it = typeof state.iterations === "number" && Number.isFinite(state.iterations) ? state.iterations : 0;
   if (calls.length > 0 && it < 10) return "tools";
-  return "finalize";
+  return "hydrate";
+}
+
+async function chatToolAgentHydrateNode(state: ChatToolAgentGraphState) {
+  if (state.needsConsent) return {};
+
+  emitChatStage({ stage: "resolve", detail: "hydrate" });
+
+  const messages = Array.isArray(state.messages) ? state.messages : [];
+  const lastAssistant = [...messages].reverse().find((m) => m && m.role === "assistant");
+  const rawText = lastAssistant ? String(lastAssistant.content || "").trim() : "";
+  const parsed = tryParseJsonObject(rawText);
+
+  const intent = detectChatSearchIntent(state.userText);
+  const wanted = parsed && typeof parsed === "object" ? (parsed as any)?.select : null;
+  const wantedVideos = Array.isArray(wanted?.videos) ? wanted.videos.map((x: any) => String(x || "").trim()).filter(Boolean) : [];
+  const wantedLinks = Array.isArray(wanted?.links) ? wanted.links.map((x: any) => String(x || "").trim()).filter(Boolean) : [];
+
+  const candidates = Array.isArray(state.candidates) ? state.candidates : [];
+  const byId = new Map<string, AgentCandidate>();
+  for (const c of candidates) if (c && c.id) byId.set(c.id, c);
+
+  const pickIds = (ids: string[], kind: AgentCandidateKind, limit: number): string[] => {
+    const out: string[] = [];
+    for (const id of ids) {
+      const c = byId.get(id);
+      if (!c || c.kind !== kind) continue;
+      out.push(id);
+      if (out.length >= limit) break;
+    }
+    if (out.length > 0) return out;
+    // fallback: hydrate top candidates to improve UX
+    const fallback = candidates.filter((c) => c.kind === kind).slice(0, limit).map((c) => c.id);
+    return fallback;
+  };
+
+  const idsToHydrate: string[] = [];
+  for (const id of pickIds(wantedVideos, "video", 3)) idsToHydrate.push(id);
+  if (intent !== "video") for (const id of pickIds(wantedLinks, "link", 2)) idsToHydrate.push(id);
+
+  const updated: AgentCandidate[] = [];
+
+  for (const id of idsToHydrate) {
+    const c = byId.get(id);
+    if (!c || !c.url) continue;
+    const needs =
+      !str(c.thumbnail) ||
+      !str(c.description) ||
+      !str(c.title) ||
+      (str(c.title) && str(c.url) && str(c.title) === str(c.url));
+    if (!needs) continue;
+
+    try {
+      const r = await withTimeout(resolveRemoteInfo(state.projectId, c.url, state.cookiesFromBrowser), 20_000);
+      updated.push({
+        ...c,
+        url: r.info.webpage_url || c.url,
+        title: str(r.info.title) || c.title,
+        description: str(r.info.description) || c.description || c.snippet || null,
+        snippet: c.snippet || str(r.info.description) || null,
+        thumbnail: str(r.info.thumbnail) || c.thumbnail || null,
+        duration_s: r.info.duration_s ?? c.duration_s ?? null,
+        extractor: str(r.info.extractor) || c.extractor || null,
+      });
+    } catch {
+      // best-effort; keep the original candidate
+    }
+  }
+
+  if (updated.length === 0) return {};
+  return { candidates: updated };
 }
 
 async function chatToolAgentFinalizeNode(state: ChatToolAgentGraphState) {
@@ -2556,15 +2626,17 @@ const chatToolAgentGraph = new StateGraph(ChatToolAgentStateAnnotation)
   .addNode("think", chatToolAgentThinkNode)
   .addNode("agent", chatToolAgentModelNode)
   .addNode("tools", chatToolAgentToolsNode)
+  .addNode("hydrate", chatToolAgentHydrateNode)
   .addNode("finalize", chatToolAgentFinalizeNode)
   .addEdge(START, "init")
   .addEdge("init", "think")
   .addEdge("think", "agent")
   .addConditionalEdges("agent", routeAfterToolAgentModel, {
     tools: "tools",
-    finalize: "finalize",
+    hydrate: "hydrate",
   })
   .addEdge("tools", "agent")
+  .addEdge("hydrate", "finalize")
   .addEdge("finalize", END)
   .compile();
 
