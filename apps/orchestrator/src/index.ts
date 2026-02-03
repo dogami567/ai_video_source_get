@@ -2,6 +2,7 @@ import path from "node:path";
 import process from "node:process";
 import { spawn } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { Readable } from "node:stream";
@@ -509,9 +510,28 @@ function openUrlInBrowser(opts: { browser: string; url: string }): { ok: boolean
   return { ok: true };
 }
 
-type OpenAIChatMessage =
-  | { role: "system" | "user" | "assistant" | "tool"; content: string }
-  | { role: "system" | "user" | "assistant" | "tool"; content: Array<Record<string, any>> };
+type OpenAIChatToolCall = {
+  id: string;
+  type: "function";
+  function: { name: string; arguments: string };
+};
+
+type OpenAIChatMessage = {
+  role: "system" | "user" | "assistant" | "tool";
+  content: string | Array<Record<string, any>>;
+  tool_call_id?: string;
+  name?: string;
+  tool_calls?: OpenAIChatToolCall[];
+};
+
+type OpenAIToolDef = {
+  type: "function";
+  function: {
+    name: string;
+    description?: string;
+    parameters?: any;
+  };
+};
 
 function joinUrl(base: string, pathName: string): string {
   const b = String(base || "").trim();
@@ -569,6 +589,28 @@ function extractChatCompletionsText(payload: any): string {
   return "";
 }
 
+function extractChatCompletionsToolCalls(payload: any): OpenAIChatToolCall[] {
+  const choices = payload?.choices;
+  if (!Array.isArray(choices) || choices.length === 0) return [];
+  const msg = choices[0]?.message;
+  const calls = msg?.tool_calls;
+  if (!Array.isArray(calls) || calls.length === 0) return [];
+  const out: OpenAIChatToolCall[] = [];
+  for (const c of calls) {
+    const id = typeof c?.id === "string" ? c.id : "";
+    const name = typeof c?.function?.name === "string" ? c.function.name : "";
+    const args = typeof c?.function?.arguments === "string" ? c.function.arguments : "";
+    if (!id || !name) continue;
+    out.push({ id, type: "function", function: { name, arguments: args } });
+  }
+  return out;
+}
+
+function tryParseJsonObject(text: string): any | null {
+  const parsed = tryParseJson(text);
+  return parsed && typeof parsed === "object" ? (parsed as any) : null;
+}
+
 async function callChatCompletions(opts: {
   baseUrl: string;
   apiKey: string;
@@ -576,11 +618,15 @@ async function callChatCompletions(opts: {
   messages: OpenAIChatMessage[];
   temperature?: number;
   maxTokens?: number;
+  tools?: OpenAIToolDef[];
+  toolChoice?: "auto" | "none" | { type: "function"; function: { name: string } };
 }): Promise<any> {
   const url = chatCompletionsUrl(opts.baseUrl);
   const headers: Record<string, string> = { "content-type": "application/json" };
   const bearer = authBearer(opts.apiKey);
   if (bearer) headers["authorization"] = bearer;
+  const tools = Array.isArray(opts.tools) ? opts.tools : undefined;
+  const toolChoice = opts.toolChoice ?? (tools && tools.length > 0 ? "auto" : undefined);
   return fetchJson<any>(url, {
     method: "POST",
     headers,
@@ -589,6 +635,8 @@ async function callChatCompletions(opts: {
       messages: opts.messages,
       temperature: typeof opts.temperature === "number" ? opts.temperature : 0.4,
       max_tokens: typeof opts.maxTokens === "number" ? opts.maxTokens : 1024,
+      ...(tools && tools.length > 0 ? { tools } : {}),
+      ...(toolChoice ? { tool_choice: toolChoice } : {}),
       stream: false,
     }),
   });
@@ -887,6 +935,78 @@ const ChatTurnStateAnnotation = Annotation.Root({
 
 type ChatTurnGraphState = typeof ChatTurnStateAnnotation.State;
 
+type AgentCandidateKind = "video" | "link";
+type AgentCandidate = {
+  id: string;
+  kind: AgentCandidateKind;
+  url: string;
+  title: string;
+  snippet?: string | null;
+  thumbnail?: string | null;
+  description?: string | null;
+  duration_s?: number | null;
+  extractor?: string | null;
+  external_license?: string | null;
+};
+
+type ChatToolAgentFinal = {
+  reply: string;
+  ask_user?: string | null;
+  select?: { videos?: string[]; links?: string[] } | null;
+  notes?: string | null;
+};
+
+const ChatToolAgentStateAnnotation = Annotation.Root({
+  projectId: Annotation<string>(),
+  chatId: Annotation<string>(),
+  userText: Annotation<string>(),
+  recent: Annotation<ToolserverChatMessage[]>(),
+  thinkEnabled: Annotation<boolean>(),
+  geminiApiKey: Annotation<string>(),
+  exaApiKey: Annotation<string>(),
+  googleCseApiKey: Annotation<string>(),
+  googleCseCx: Annotation<string>(),
+  baseUrl: Annotation<string>(),
+  model: Annotation<string>(),
+  cookiesFromBrowser: Annotation<string>(),
+  useGeminiNative: Annotation<boolean>(),
+  needsConsent: Annotation<boolean>(),
+
+  // OpenAI-style conversation used for tool calling.
+  messages: Annotation<OpenAIChatMessage[]>({
+    reducer: (a, b) => a.concat(b),
+    default: () => [],
+  }),
+  pendingToolCalls: Annotation<OpenAIChatToolCall[]>({
+    reducer: (_a, b) => b,
+    default: () => [],
+  }),
+  iterations: Annotation<number>({
+    reducer: (_a, b) => b,
+    default: () => 0,
+  }),
+
+  candidates: Annotation<AgentCandidate[]>({
+    reducer: (a, b) => {
+      const byId = new Map<string, AgentCandidate>();
+      for (const it of a) if (it && it.id) byId.set(it.id, it);
+      for (const it of b) if (it && it.id) byId.set(it.id, it);
+      return Array.from(byId.values());
+    },
+    default: () => [],
+  }),
+  final: Annotation<ChatToolAgentFinal | null>({
+    reducer: (_a, b) => b,
+    default: () => null,
+  }),
+  blocks: Annotation<any[]>({
+    reducer: (_a, b) => b,
+    default: () => [],
+  }),
+});
+
+type ChatToolAgentGraphState = typeof ChatToolAgentStateAnnotation.State;
+
 function ensureUserFacingReplyText(text: unknown): string {
   const t = String(text ?? "").trim();
   if (!t) return "我收到你的消息。你想找什么类型的素材（主题/风格/时长/用途）？";
@@ -950,6 +1070,14 @@ function normalizeSearchText(text: string): string {
   return String(text || "")
     .replace(/\uFEFF/g, "")
     .replace(/dorof/gi, "doro");
+}
+
+function sha1Hex(text: string): string {
+  try {
+    return createHash("sha1").update(String(text || ""), "utf8").digest("hex");
+  } catch {
+    return String(text || "");
+  }
 }
 
 function extractKeywordTokens(text: string): string[] {
@@ -1950,6 +2078,420 @@ function routeAfterReviewRefine(state: ChatTurnGraphState): "exa_search_and_reso
   return "review";
 }
 
+function candidateId(kind: AgentCandidateKind, url: string): string {
+  const u = String(url || "").trim();
+  const norm = normalizeUrlForDedup(u) || u;
+  const h = sha1Hex(norm).slice(0, 12);
+  return `${kind}_${h}`;
+}
+
+function buildToolAgentTools(): OpenAIToolDef[] {
+  return [
+    {
+      type: "function",
+      function: {
+        name: "search_bilibili_videos",
+        description: "Search bilibili videos (bilibili.com/video or b23.tv). Returns candidate IDs.",
+        parameters: {
+          type: "object",
+          properties: {
+            query: { type: "string" },
+            num_results: { type: "number", description: "1-20" },
+          },
+          required: ["query"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "search_web",
+        description: "General web search. Returns candidate IDs (links).",
+        parameters: {
+          type: "object",
+          properties: {
+            query: { type: "string" },
+            num_results: { type: "number", description: "1-20" },
+          },
+          required: ["query"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "resolve_url",
+        description: "Resolve a URL to metadata (title/thumbnail/description/duration) via yt-dlp (requires consent). Returns/updates a candidate.",
+        parameters: {
+          type: "object",
+          properties: {
+            url: { type: "string" },
+          },
+          required: ["url"],
+        },
+      },
+    },
+  ];
+}
+
+async function execToolCall(
+  state: ChatToolAgentGraphState,
+  call: OpenAIChatToolCall,
+): Promise<{ toolMessage: OpenAIChatMessage; candidates: AgentCandidate[]; needsConsent?: boolean }> {
+  const name = String(call?.function?.name || "").trim();
+  const argsObj = tryParseJsonObject(String(call?.function?.arguments || "")) || {};
+  const outCandidates: AgentCandidate[] = [];
+
+  if (name === "search_bilibili_videos") {
+    const query = str(argsObj?.query);
+    const numResults = Math.max(1, Math.min(20, Math.floor(Number(argsObj?.num_results || 10))));
+    let q = query;
+    const hasSite = /\bsite:/i.test(q);
+    if (!hasSite) q = `${q} site:bilibili.com/video`;
+
+    const { results } = await webSearch({
+      query: q,
+      numResults: Math.min(20, numResults),
+      googleApiKey: state.googleCseApiKey,
+      googleCx: state.googleCseCx,
+      exaApiKey: state.exaApiKey,
+      prefer: str(state.googleCseApiKey) && str(state.googleCseCx) ? "google_cse" : "exa",
+    });
+
+    const candidates: Array<{ id: string; url: string; title: string; snippet?: string | null }> = [];
+    for (const r of results) {
+      const url = str(r.url);
+      const lower = url.toLowerCase();
+      if (!url) continue;
+      if (lower.includes("bilibili.com/read") || lower.includes("bilibili.com/opus")) continue;
+      const isVideo = lower.includes("bilibili.com/video/") || lower.includes("b23.tv/");
+      if (!isVideo) continue;
+      const id = candidateId("video", url);
+      const title = str(r.title) || url;
+      const snippet = typeof r.snippet === "string" ? r.snippet : null;
+      candidates.push({ id, url, title, snippet });
+      outCandidates.push({ id, kind: "video", url, title, snippet });
+    }
+
+    return {
+      toolMessage: {
+        role: "tool",
+        tool_call_id: call.id,
+        name,
+        content: JSON.stringify({ ok: true, query: q, candidates }),
+      },
+      candidates: outCandidates,
+    };
+  }
+
+  if (name === "search_web") {
+    const query = str(argsObj?.query);
+    const numResults = Math.max(1, Math.min(20, Math.floor(Number(argsObj?.num_results || 10))));
+    const { results } = await webSearch({
+      query,
+      numResults: Math.min(20, numResults),
+      googleApiKey: state.googleCseApiKey,
+      googleCx: state.googleCseCx,
+      exaApiKey: state.exaApiKey,
+      prefer: str(state.googleCseApiKey) && str(state.googleCseCx) ? "google_cse" : "exa",
+    });
+
+    const candidates: Array<{ id: string; url: string; title: string; snippet?: string | null }> = [];
+    for (const r of results) {
+      const url = str(r.url);
+      const title = str(r.title) || url;
+      if (!url) continue;
+      const id = candidateId("link", url);
+      const snippet = typeof r.snippet === "string" ? r.snippet : null;
+      candidates.push({ id, url, title, snippet });
+      outCandidates.push({ id, kind: "link", url, title, snippet });
+    }
+
+    return {
+      toolMessage: {
+        role: "tool",
+        tool_call_id: call.id,
+        name,
+        content: JSON.stringify({ ok: true, query, candidates }),
+      },
+      candidates: outCandidates,
+    };
+  }
+
+  if (name === "resolve_url") {
+    const url = str(argsObj?.url);
+    if (!url) {
+      return {
+        toolMessage: { role: "tool", tool_call_id: call.id, name, content: JSON.stringify({ ok: false, error: "missing url" }) },
+        candidates: [],
+      };
+    }
+
+    const consent = await getConsent(state.projectId);
+    if (!consent?.consented) {
+      return {
+        toolMessage: { role: "tool", tool_call_id: call.id, name, content: JSON.stringify({ ok: false, needs_consent: true, url }) },
+        candidates: [],
+        needsConsent: true,
+      };
+    }
+
+    const r = await withTimeout(resolveRemoteInfo(state.projectId, url, state.cookiesFromBrowser), 20_000);
+    const isVideo = isLikelyVideoUrl(url);
+    const kind: AgentCandidateKind = isVideo ? "video" : "link";
+    const id = candidateId(kind, r.info.webpage_url || url);
+    const cand: AgentCandidate = {
+      id,
+      kind,
+      url: r.info.webpage_url || url,
+      title: r.info.title || url,
+      snippet: r.info.description || null,
+      thumbnail: r.info.thumbnail || null,
+      description: r.info.description || null,
+      duration_s: r.info.duration_s ?? null,
+      extractor: r.info.extractor || null,
+    };
+    outCandidates.push(cand);
+
+    return {
+      toolMessage: {
+        role: "tool",
+        tool_call_id: call.id,
+        name,
+        content: JSON.stringify({ ok: true, info: r.info, candidate: { id: cand.id, url: cand.url } }),
+      },
+      candidates: outCandidates,
+    };
+  }
+
+  return {
+    toolMessage: {
+      role: "tool",
+      tool_call_id: call.id,
+      name: name || "unknown_tool",
+      content: JSON.stringify({ ok: false, error: `unknown tool: ${name}` }),
+    },
+    candidates: [],
+  };
+}
+
+async function chatToolAgentInitNode(state: ChatToolAgentGraphState) {
+  emitChatStage({ stage: "planning" });
+
+  const consent = await getConsent(state.projectId);
+  if (!consent?.consented) {
+    const reply =
+      "要开始联网搜索/解析链接前，请先在本项目完成一次「授权确认」（外部内容提示）。完成后再发一句“开始搜”。";
+    return {
+      needsConsent: true,
+      final: { reply },
+      blocks: [],
+    };
+  }
+
+  const profilePrompt = await getProfilePrompt();
+  const systemPrompt = [
+    "You are VidUnpack Agent (视频素材智能助手).",
+    "You MUST use tools to search/resolve before answering. Choose tools based on the user's request.",
+    "Tool choice guidance:",
+    "- If user asks for bilibili videos (B站视频/BV/bilibili.com/video), call search_bilibili_videos.",
+    "- If user asks for general websites/resources, call search_web.",
+    "- Call resolve_url for URLs you intend to present as cards, to get title/cover/description.",
+    "",
+    "Output:",
+    "- When you are ready to answer, output JSON ONLY (no markdown).",
+    '- Schema: { "reply": string, "ask_user"?: string, "select"?: { "videos"?: string[], "links"?: string[] } }',
+    "- IMPORTANT: IDs in select MUST be candidate IDs returned by tools.",
+    "- If constraints are underspecified, set ask_user (ONE short question) and omit select.",
+    ...(profilePrompt ? ["", "User profile (cross-project preferences):", profilePrompt] : []),
+  ].join("\n");
+
+  const recentTail = Array.isArray(state.recent) ? state.recent.slice(Math.max(0, state.recent.length - 10)) : [];
+  const messages: OpenAIChatMessage[] = [
+    { role: "system", content: systemPrompt },
+    ...recentTail
+      .filter((m) => m && (m.role === "user" || m.role === "assistant"))
+      .map((m) => ({ role: toOpenAiRole(m.role), content: String(m.content || "") })),
+    { role: "user", content: state.userText },
+  ];
+
+  return { messages, needsConsent: false };
+}
+
+async function chatToolAgentModelNode(state: ChatToolAgentGraphState) {
+  emitChatStage({ stage: "starting" });
+
+  if (state.needsConsent) return {};
+  if (state.useGeminiNative) {
+    const reply =
+      "当前 Base URL 是 Gemini 原生接口，暂不支持本项目的“tool-calls”模式。请在设置里使用 OpenAI 兼容的中转（Base URL 指向 /v1 或 /openai）后再试。";
+    return { final: { reply }, pendingToolCalls: [] };
+  }
+
+  const tools = buildToolAgentTools();
+  const iterations = (state.iterations || 0) + 1;
+
+  emitChatStage({ stage: "tool_call", detail: "llm" });
+  const payload = await callChatCompletions({
+    baseUrl: state.baseUrl,
+    apiKey: state.geminiApiKey,
+    model: state.model,
+    messages: state.messages,
+    temperature: 0.2,
+    maxTokens: 1024,
+    tools,
+    toolChoice: "auto",
+  });
+
+  const text = extractChatCompletionsText(payload);
+  const toolCalls = extractChatCompletionsToolCalls(payload);
+  const assistant: OpenAIChatMessage = { role: "assistant", content: text || "" };
+  if (toolCalls.length > 0) assistant.tool_calls = toolCalls;
+
+  return { messages: [assistant], pendingToolCalls: toolCalls, iterations };
+}
+
+async function chatToolAgentToolsNode(state: ChatToolAgentGraphState) {
+  if (state.needsConsent) return {};
+  const calls = Array.isArray(state.pendingToolCalls) ? state.pendingToolCalls : [];
+  if (calls.length === 0) return { pendingToolCalls: [] };
+
+  const added: AgentCandidate[] = [];
+  const toolMessages: OpenAIChatMessage[] = [];
+
+  for (const call of calls.slice(0, 6)) {
+    const name = String(call?.function?.name || "").trim();
+    emitChatStage({ stage: "tool_call", detail: name || "tool" });
+    try {
+      const r = await execToolCall(state, call);
+      toolMessages.push(r.toolMessage);
+      added.push(...r.candidates);
+      if (r.needsConsent) {
+        return { messages: toolMessages, candidates: added, pendingToolCalls: [], needsConsent: true };
+      }
+      emitChatStage({ stage: "tool_result", detail: name || "tool" });
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      toolMessages.push({
+        role: "tool",
+        tool_call_id: call.id,
+        name,
+        content: JSON.stringify({ ok: false, error: message }),
+      });
+    }
+  }
+
+  return { messages: toolMessages, candidates: added, pendingToolCalls: [] };
+}
+
+function routeAfterToolAgentModel(state: ChatToolAgentGraphState): "tools" | "finalize" {
+  if (state.needsConsent) return "finalize";
+  const calls = Array.isArray(state.pendingToolCalls) ? state.pendingToolCalls : [];
+  const it = typeof state.iterations === "number" && Number.isFinite(state.iterations) ? state.iterations : 0;
+  if (calls.length > 0 && it < 10) return "tools";
+  return "finalize";
+}
+
+async function chatToolAgentFinalizeNode(state: ChatToolAgentGraphState) {
+  emitChatStage({ stage: "review" });
+  if (state.needsConsent) {
+    const reply =
+      "要开始联网搜索/解析链接前，请先在本项目完成一次「授权确认」（外部内容提示）。完成后再发一句“开始搜”。";
+    return { final: { reply }, blocks: [] };
+  }
+
+  const messages = Array.isArray(state.messages) ? state.messages : [];
+  const lastAssistant = [...messages].reverse().find((m) => m && m.role === "assistant");
+  const rawText = lastAssistant ? String(lastAssistant.content || "").trim() : "";
+
+  let final: ChatToolAgentFinal | null = null;
+  const parsed = tryParseJsonObject(rawText);
+  if (parsed && typeof parsed === "object") {
+    final = {
+      reply: typeof parsed.reply === "string" ? parsed.reply : "",
+      ask_user: typeof parsed.ask_user === "string" ? parsed.ask_user : null,
+      select: parsed.select && typeof parsed.select === "object" ? parsed.select : null,
+      notes: typeof parsed.notes === "string" ? parsed.notes : null,
+    };
+  }
+
+  const candidates = Array.isArray(state.candidates) ? state.candidates : [];
+  const byId = new Map<string, AgentCandidate>();
+  for (const c of candidates) if (c && c.id) byId.set(c.id, c);
+
+  const blocks: any[] = [];
+
+  const wanted = final?.select && typeof final.select === "object" ? final.select : null;
+  const pick = (ids: unknown, kind: AgentCandidateKind, limit: number): AgentCandidate[] => {
+    const arr = Array.isArray(ids) ? ids : [];
+    const out: AgentCandidate[] = [];
+    for (const x of arr) {
+      const id = String(x || "").trim();
+      const c = byId.get(id);
+      if (!c || c.kind !== kind) continue;
+      out.push(c);
+      if (out.length >= limit) break;
+    }
+    if (out.length > 0) return out;
+    // fallback
+    return candidates.filter((c) => c.kind === kind).slice(0, limit);
+  };
+
+  const intent = detectChatSearchIntent(state.userText);
+  const defaultVideoLimit = 3;
+  const defaultLinkLimit = 4;
+
+  const videosPicked = pick(wanted?.videos, "video", defaultVideoLimit);
+  const linksPicked = pick(wanted?.links, "link", defaultLinkLimit);
+
+  if (videosPicked.length > 0) {
+    const videos: ChatVideoCard[] = videosPicked.map((c) => ({
+      url: c.url,
+      title: c.title || c.url,
+      description: c.description || c.snippet || null,
+      thumbnail: c.thumbnail || null,
+      duration_s: typeof c.duration_s === "number" ? c.duration_s : null,
+      extractor: c.extractor || (c.url.includes("bilibili") ? "bilibili" : "unknown"),
+      id: "",
+    }));
+    blocks.push({ type: "videos", videos });
+  }
+  if (linksPicked.length > 0 && intent !== "video") {
+    const links: ChatLinkCard[] = linksPicked.map((c) => ({
+      url: c.url,
+      title: c.title || c.url,
+      snippet: c.snippet || null,
+    }));
+    blocks.push({ type: "links", links });
+  }
+
+  let reply = final?.reply ? ensureUserFacingReplyText(final.reply) : "";
+  if (final?.ask_user) reply = `${reply ? `${reply}\n\n` : ""}${final.ask_user}`;
+  if (!reply) {
+    reply =
+      intent === "video"
+        ? "我先给你一些候选视频卡片。你更偏向哪种风格/时长/用途？我可以再精确补搜。"
+        : "我先给你一些候选链接。你更偏向哪类资源？我可以再精确补搜。";
+  }
+
+  return { final: { reply }, blocks };
+}
+
+const chatToolAgentGraph = new StateGraph(ChatToolAgentStateAnnotation)
+  .addNode("init", chatToolAgentInitNode)
+  .addNode("agent", chatToolAgentModelNode)
+  .addNode("tools", chatToolAgentToolsNode)
+  .addNode("finalize", chatToolAgentFinalizeNode)
+  .addEdge(START, "init")
+  .addEdge("init", "agent")
+  .addConditionalEdges("agent", routeAfterToolAgentModel, {
+    tools: "tools",
+    finalize: "finalize",
+  })
+  .addEdge("tools", "agent")
+  .addEdge("finalize", END)
+  .compile();
+
 const chatTurnLangGraph = new StateGraph(ChatTurnStateAnnotation)
   .addNode("llm_plan", chatTurnPlanNode)
   .addNode("resolve_direct_urls", chatTurnDoResolveDirectUrlsNode)
@@ -2223,13 +2765,20 @@ async function handleChatTurn(projectId: string, body: any) {
   const history = await getChatMessages(pid, chatId);
   const recent = history.slice(Math.max(0, history.length - 12));
 
-  const graphState = await chatTurnLangGraph.invoke(
+  const plan = thinkEnabled
+    ? {
+        action: "chat_tool_agent",
+        loop: { max_iterations: 10 },
+        tools: ["search_bilibili_videos", "search_web", "resolve_url"],
+      }
+    : null;
+  const planArtifact = plan ? await maybeStorePlan(pid, "chat-tool-agent", plan) : null;
+
+  const agentState = await chatToolAgentGraph.invoke(
     {
       projectId: pid,
       chatId,
       userText,
-      userMessage,
-      directUrls,
       recent,
       thinkEnabled,
       geminiApiKey,
@@ -2240,36 +2789,63 @@ async function handleChatTurn(projectId: string, body: any) {
       model,
       cookiesFromBrowser,
       useGeminiNative,
-      directResolveCache: {},
-      plan: null,
-      planArtifact: null,
-      llmPayload: null,
-      llmText: "",
-      llmParsed: null,
-      searchPass: 0,
-      searchAgain: false,
-      reviewPayload: null,
-      reviewText: "",
-      reviewParsed: null,
-      agentPlan: null,
-      videos: [],
-      blocks: [],
       needsConsent: false,
-      debugArtifact: null,
-      assistantMessage: null,
+      messages: [],
+      pendingToolCalls: [],
+      iterations: 0,
+      candidates: [],
+      final: null,
+      blocks: [],
     },
-    { recursionLimit: 25 },
+    { recursionLimit: 50 },
   );
 
-  const assistantMessage = graphState.assistantMessage
-    ? graphState.assistantMessage
-    : await createChatMessage(pid, chatId, "assistant", "OK");
+  const reply = ensureUserFacingReplyText(agentState.final?.reply || "");
+  const blocks = Array.isArray(agentState.blocks) ? agentState.blocks : [];
+
+  const debugArtifact = await toolserverJson<ToolserverArtifact>(`/projects/${pid}/artifacts/text`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      kind: "chat_turn",
+      out_path: `chat/turn-${Date.now()}.json`,
+      content: JSON.stringify(
+        {
+          mode: "tool_agent",
+          plan,
+          plan_artifact_id: planArtifact?.id || null,
+          model: { base_url: baseUrl, use_gemini_native: useGeminiNative, model },
+          user: { message_id: userMessage.id, text: userText },
+          tool_agent: {
+            iterations: agentState.iterations || 0,
+            needs_consent: !!agentState.needsConsent,
+            final: agentState.final,
+            candidates: agentState.candidates || [],
+            messages: (agentState.messages || []).map((m) => ({
+              role: m.role,
+              content: typeof m.content === "string" ? m.content : "[array]",
+              tool_call_id: (m as any).tool_call_id || null,
+              name: (m as any).name || null,
+              tool_calls: Array.isArray((m as any).tool_calls) ? (m as any).tool_calls : null,
+            })),
+          },
+        },
+        null,
+        2,
+      ),
+    }),
+  });
+
+  const assistantMessage = await createChatMessage(pid, chatId, "assistant", reply || "OK", {
+    blocks,
+    debug_artifact: debugArtifact,
+  });
 
   return {
     ok: true,
-    needs_consent: graphState.needsConsent,
-    plan: graphState.plan,
-    plan_artifact: graphState.planArtifact,
+    needs_consent: agentState.needsConsent,
+    plan,
+    plan_artifact: planArtifact,
     user_message: userMessage,
     assistant_message: assistantMessage,
   };
