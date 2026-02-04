@@ -123,9 +123,6 @@ const en = {
   videoUrl: "Video URL",
   save: "Save",
   reset: "Reset",
-  like: "Like",
-  dislike: "Dislike",
-  moreLikeThis: "More like this",
   resolve: "Resolve",
   downloadNow: "Download",
   resolvedOk: "Resolved",
@@ -187,15 +184,6 @@ const en = {
   cancel: "Cancel",
   confirming: "Confirming…",
   iConfirm: "I Confirm",
-
-  confirmResetProfile: "Reset AI profile memory? This will clear your manually edited notes.",
-
-  settingsProfileMemory: "AI Profile Memory",
-  settingsProfileMemoryHint:
-    "This is cross-project memory that the agent will see in every chat turn. Keep it short and actionable (no secrets).",
-  settingsProfileMemoryLabel: "Notes",
-  settingsProfileMemoryPlaceholder: "Example: I prefer short B-roll clips, avoid low-res reuploads, prioritize official sources…",
-  settingsProfileMemoryApplied: "Applied automatically to the agent prompt in future chats.",
 
   errEnterUrl: "Please enter a URL",
   errEnterMessage: "Please enter a message",
@@ -324,9 +312,6 @@ const zhCN: typeof en = {
   videoUrl: "视频链接",
   save: "保存",
   reset: "重置",
-  like: "喜欢",
-  dislike: "不喜欢",
-  moreLikeThis: "更像这个",
   resolve: "解析",
   downloadNow: "下载",
   resolvedOk: "已解析",
@@ -388,14 +373,6 @@ const zhCN: typeof en = {
   cancel: "取消",
   confirming: "确认中…",
   iConfirm: "我确认",
-
-  confirmResetProfile: "确认重置 AI 跨项目记忆？将清空你手动编辑的备注。",
-
-  settingsProfileMemory: "AI 跨项目记忆",
-  settingsProfileMemoryHint: "这段内容会在每次聊天时提供给 Agent。尽量短且可执行（不要写任何密钥/隐私）。",
-  settingsProfileMemoryLabel: "备注",
-  settingsProfileMemoryPlaceholder: "例如：偏好短 B-roll、避免低清搬运、优先官方/高质量来源…",
-  settingsProfileMemoryApplied: "会自动注入到后续聊天的 Agent Prompt 中。",
 
   errEnterUrl: "请输入 URL",
   errEnterMessage: "请输入内容",

@@ -28,11 +28,6 @@ type Project = { id: string; title: string; created_at_ms: number };
 type Consent = { project_id: string; consented: boolean; auto_confirm: boolean; updated_at_ms: number };
 type ProjectSettings = { project_id: string; think_enabled: boolean; updated_at_ms: number };
 type Artifact = { id: string; project_id: string; kind: string; path: string; created_at_ms: number };
-type ToolserverProfileResponse = {
-  profile: { prompt: string; user_prompt?: string; updated_at_ms?: number };
-  profile_rel_path: string;
-  profile_abs_path: string;
-};
 type ImportLocalResponse = { artifact: Artifact; bytes: number; file_name: string };
 type RemoteMediaInfoSummary = {
   extractor: string;
@@ -44,15 +39,6 @@ type RemoteMediaInfoSummary = {
   description?: string | null;
 };
 type ImportRemoteMediaResponse = { info: RemoteMediaInfoSummary; info_artifact: Artifact; input_video?: Artifact | null };
-type ProjectFeedbackItem = {
-  url: string;
-  kind: string;
-  rating: number; // -1 dislike, 0 neutral, 1 like
-  anchor: boolean;
-  created_at_ms: number;
-  updated_at_ms: number;
-};
-type ProjectFeedbackResponse = { ok: boolean; project_id: string; items: ProjectFeedbackItem[] };
 type PoolItem = {
   id: string;
   project_id: string;
@@ -604,17 +590,12 @@ export default function App() {
   const [settingsSavedAt, setSettingsSavedAt] = React.useState<number | null>(null);
   const [systemBrowsers, setSystemBrowsers] = React.useState<string[] | null>(null);
   const [systemBrowsersError, setSystemBrowsersError] = React.useState<string | null>(null);
-  const [profileDraft, setProfileDraft] = React.useState("");
-  const [profileBusy, setProfileBusy] = React.useState(false);
-  const [profileError, setProfileError] = React.useState<string | null>(null);
-  const [profileSavedAt, setProfileSavedAt] = React.useState<number | null>(null);
 
   const [project, setProject] = React.useState<Project | null>(null);
   const [consent, setConsent] = React.useState<Consent | null>(null);
   const [settings, setSettings] = React.useState<ProjectSettings | null>(null);
   const [artifacts, setArtifacts] = React.useState<Artifact[]>([]);
   const [poolItems, setPoolItems] = React.useState<PoolItem[]>([]);
-  const [feedbackByUrl, setFeedbackByUrl] = React.useState<Record<string, ProjectFeedbackItem>>({});
   const [projectError, setProjectError] = React.useState<string | null>(null);
   const [projectLoading, setProjectLoading] = React.useState(false);
 
@@ -750,26 +731,18 @@ export default function App() {
     setProjectLoading(true);
     setProjectError(null);
     try {
-      const [p, c, s, a, pool, feedback] = await Promise.all([
+      const [p, c, s, a, pool] = await Promise.all([
         fetchJson<Project>(`/tool/projects/${projectId}`),
         fetchJson<Consent>(`/tool/projects/${projectId}/consent`),
         fetchJson<ProjectSettings>(`/tool/projects/${projectId}/settings`),
         fetchJson<Artifact[]>(`/tool/projects/${projectId}/artifacts`),
         fetchJson<PoolItem[]>(`/tool/projects/${projectId}/pool/items`),
-        fetchJson<ProjectFeedbackResponse>(`/tool/projects/${projectId}/feedback`),
       ]);
       setProject(p);
       setConsent(c);
       setSettings(s);
       setArtifacts(a);
       setPoolItems(pool);
-      setFeedbackByUrl(() => {
-        const out: Record<string, ProjectFeedbackItem> = {};
-        for (const it of feedback.items || []) {
-          if (it && typeof it.url === "string" && it.url.trim()) out[it.url.trim()] = it;
-        }
-        return out;
-      });
     } catch (e) {
       setProjectError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -931,19 +904,6 @@ export default function App() {
     }
   };
 
-  const refreshProfile = async () => {
-    setProfileError(null);
-    setProfileBusy(true);
-    try {
-      const resp = await fetchJson<ToolserverProfileResponse>("/tool/profile");
-      setProfileDraft(typeof resp?.profile?.user_prompt === "string" ? resp.profile.user_prompt : "");
-    } catch (e) {
-      setProfileError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setProfileBusy(false);
-    }
-  };
-
   const onOpenSettings = () => {
     returnFromSettings.current = view.kind === "settings" ? { kind: "list" } : view;
     setSettingsDraft({
@@ -957,7 +917,6 @@ export default function App() {
     });
     setSettingsSavedAt(null);
     void refreshSystemBrowsers();
-    void refreshProfile();
     setView({ kind: "settings" });
   };
 
@@ -996,37 +955,6 @@ export default function App() {
     });
     setSettingsSavedAt(Date.now());
     setAnalysisModel(orchConfig?.default_model ?? "gemini-3-preview");
-  };
-
-  const onSaveProfile = async () => {
-    setProfileError(null);
-    setProfileSavedAt(null);
-    setProfileBusy(true);
-    try {
-      await postJson<ToolserverProfileResponse>("/tool/profile", { prompt: profileDraft });
-      setProfileSavedAt(Date.now());
-    } catch (e) {
-      setProfileError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setProfileBusy(false);
-    }
-  };
-
-  const onResetProfile = async () => {
-    const ok = window.confirm(tr("confirmResetProfile"));
-    if (!ok) return;
-    setProfileError(null);
-    setProfileSavedAt(null);
-    setProfileBusy(true);
-    try {
-      const resp = await postJson<ToolserverProfileResponse>("/tool/profile/reset", {});
-      setProfileDraft(typeof resp?.profile?.user_prompt === "string" ? resp.profile.user_prompt : "");
-      setProfileSavedAt(Date.now());
-    } catch (e) {
-      setProfileError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setProfileBusy(false);
-    }
   };
 
   const onBackToList = () => {
@@ -1491,29 +1419,6 @@ export default function App() {
       setChatCardError(e instanceof Error ? e.message : String(e));
     } finally {
       setChatCardBusyUrl(null);
-    }
-  };
-
-  const onChatCardFeedback = async (url: string, kind: string, action: string) => {
-    if (view.kind !== "project") return;
-    const u = url.trim();
-    if (!u) return;
-    setChatCardError(null);
-    try {
-      const resp = await postJson<ProjectFeedbackResponse>(`/tool/projects/${view.projectId}/feedback`, {
-        url: u,
-        kind,
-        action,
-      });
-      setFeedbackByUrl(() => {
-        const out: Record<string, ProjectFeedbackItem> = {};
-        for (const it of resp.items || []) {
-          if (it && typeof it.url === "string" && it.url.trim()) out[it.url.trim()] = it;
-        }
-        return out;
-      });
-    } catch (e) {
-      setChatCardError(e instanceof Error ? e.message : String(e));
     }
   };
 
@@ -2106,53 +2011,6 @@ export default function App() {
 	                  </div>
 	                </div>
 
-                  <div className="panel mt-6">
-                    <div className="panel-header">
-                      <div className="panel-title">{tr("settingsProfileMemory")}</div>
-                    </div>
-                    <div className="text-sm text-muted mb-3">{tr("settingsProfileMemoryHint")}</div>
-
-                    <div className="input-group">
-                      <label className="input-label">{tr("settingsProfileMemoryLabel")}</label>
-                      <textarea
-                        className="input-field"
-                        rows={6}
-                        value={profileDraft}
-                        onChange={(e) => setProfileDraft(e.target.value)}
-                        placeholder={tr("settingsProfileMemoryPlaceholder")}
-                        data-testid="settings-profile-prompt"
-                        disabled={profileBusy}
-                      />
-                      <div className="text-xs text-dim mt-2">{tr("settingsProfileMemoryApplied")}</div>
-                    </div>
-
-                    {profileError ? <div className="alert mt-3">{profileError}</div> : null}
-
-                    <div className="flex items-center justify-between mt-4">
-                      <button
-                        className="btn btn-ghost btn-sm"
-                        type="button"
-                        onClick={() => void onResetProfile()}
-                        disabled={profileBusy}
-                        data-testid="settings-profile-reset"
-                      >
-                        {tr("reset")}
-                      </button>
-                      <div className="flex items-center gap-2">
-                        {profileSavedAt ? <span className="text-sm text-muted">{tr("saved")}</span> : null}
-                        <button
-                          className="btn btn-primary btn-sm"
-                          type="button"
-                          onClick={() => void onSaveProfile()}
-                          disabled={profileBusy}
-                          data-testid="settings-profile-save"
-                        >
-                          {profileBusy ? "…" : tr("save")}
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-
                 <div className="flex items-center justify-between mt-6">
                   <button className="btn btn-ghost btn-sm" type="button" onClick={onClearSettings} data-testid="settings-clear">
                     {tr("clear")}
@@ -2646,10 +2504,6 @@ export default function App() {
 	                                                        typeof l?.match_score === "number" && Number.isFinite(l.match_score)
 	                                                          ? l.match_score
 	                                                          : null;
-	                                                      const fb = url ? feedbackByUrl[url] : undefined;
-	                                                      const liked = (fb?.rating ?? 0) > 0;
-	                                                      const disliked = (fb?.rating ?? 0) < 0;
-	                                                      const anchored = !!fb?.anchor;
 	                                                      return (
 	                                                        <div key={url} className="link-card" data-testid="chat-link-card">
 	                                                          <div className="link-info">
@@ -2679,39 +2533,6 @@ export default function App() {
 	                                                              data-testid={`chat-link-save-${li}`}
 	                                                            >
 	                                                              {tr("save")}
-	                                                            </button>
-	                                                            <button
-	                                                              className="btn btn-ghost btn-sm"
-	                                                              type="button"
-	                                                              aria-pressed={liked}
-	                                                              onClick={() => void onChatCardFeedback(url, "link", liked ? "clear" : "like")}
-	                                                              disabled={!url}
-	                                                              data-testid={`chat-link-like-${li}`}
-	                                                            >
-	                                                              {liked ? "✓ " : ""}
-	                                                              {tr("like")}
-	                                                            </button>
-	                                                            <button
-	                                                              className="btn btn-ghost btn-sm"
-	                                                              type="button"
-	                                                              aria-pressed={disliked}
-	                                                              onClick={() => void onChatCardFeedback(url, "link", disliked ? "clear" : "dislike")}
-	                                                              disabled={!url}
-	                                                              data-testid={`chat-link-dislike-${li}`}
-	                                                            >
-	                                                              {disliked ? "✓ " : ""}
-	                                                              {tr("dislike")}
-	                                                            </button>
-	                                                            <button
-	                                                              className="btn btn-ghost btn-sm"
-	                                                              type="button"
-	                                                              aria-pressed={anchored}
-	                                                              onClick={() => void onChatCardFeedback(url, "link", anchored ? "unanchor" : "anchor")}
-	                                                              disabled={!url}
-	                                                              data-testid={`chat-link-morelike-${li}`}
-	                                                            >
-	                                                              {anchored ? "✓ " : ""}
-	                                                              {tr("moreLikeThis")}
 	                                                            </button>
 	                                                          </div>
 	                                                        </div>
@@ -2754,10 +2575,6 @@ export default function App() {
 	                                                          : null;
 	                                                      const thumbSrc = thumb && url ? proxyImageUrl(thumb, url) : "";
 	                                                      const busy = chatCardBusyUrl === url;
-	                                                      const fb = url ? feedbackByUrl[url] : undefined;
-	                                                      const liked = (fb?.rating ?? 0) > 0;
-	                                                      const disliked = (fb?.rating ?? 0) < 0;
-	                                                      const anchored = !!fb?.anchor;
 	                                                      return (
 	                                                        <div key={url} className="video-card" data-testid="chat-video-card">
 	                                                          <div
@@ -2801,39 +2618,6 @@ export default function App() {
 	                                                                data-testid={`chat-video-download-${vi}`}
 	                                                              >
 	                                                                {busy ? "…" : tr("downloadNow")}
-	                                                              </button>
-	                                                              <button
-	                                                                className="btn btn-ghost btn-sm"
-	                                                                type="button"
-	                                                                aria-pressed={liked}
-	                                                                onClick={() => void onChatCardFeedback(url, "video", liked ? "clear" : "like")}
-	                                                                disabled={!url || busy}
-	                                                                data-testid={`chat-video-like-${vi}`}
-	                                                              >
-	                                                                {liked ? "✓ " : ""}
-	                                                                {tr("like")}
-	                                                              </button>
-	                                                              <button
-	                                                                className="btn btn-ghost btn-sm"
-	                                                                type="button"
-	                                                                aria-pressed={disliked}
-	                                                                onClick={() => void onChatCardFeedback(url, "video", disliked ? "clear" : "dislike")}
-	                                                                disabled={!url || busy}
-	                                                                data-testid={`chat-video-dislike-${vi}`}
-	                                                              >
-	                                                                {disliked ? "✓ " : ""}
-	                                                                {tr("dislike")}
-	                                                              </button>
-	                                                              <button
-	                                                                className="btn btn-ghost btn-sm"
-	                                                                type="button"
-	                                                                aria-pressed={anchored}
-	                                                                onClick={() => void onChatCardFeedback(url, "video", anchored ? "unanchor" : "anchor")}
-	                                                                disabled={!url || busy}
-	                                                                data-testid={`chat-video-morelike-${vi}`}
-	                                                              >
-	                                                                {anchored ? "✓ " : ""}
-	                                                                {tr("moreLikeThis")}
 	                                                              </button>
 	                                                            </div>
 	                                                            {(resolved || downloaded || infoArtifact) && (

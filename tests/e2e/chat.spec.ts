@@ -67,8 +67,7 @@ test("chat: mock cards render and send behavior", async ({ page, request }) => {
   await expect(page.getByText(/mock 模式/i)).toBeVisible({ timeout: 60_000 });
   await expect(page.getByTestId("chat-video-card")).toHaveCount(2);
 
-  // Feedback buttons should work (optimistic UI + persisted per-project).
-  const likeBtn = page.getByTestId("chat-video-like-0");
-  await likeBtn.click();
-  await expect(likeBtn).toHaveAttribute("aria-pressed", "true");
+  // Cards should expose resolve/download actions.
+  await expect(page.getByTestId("chat-video-resolve-0")).toBeVisible();
+  await expect(page.getByTestId("chat-video-download-0")).toBeVisible();
 });
