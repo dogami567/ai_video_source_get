@@ -1100,6 +1100,37 @@ function buildAgentPlanFromLlm(text: string, parsed: unknown | null): ChatAgentP
   };
 }
 
+function heuristicChatPlan(userText: string): ChatAgentPlan {
+  const t = String(userText || "").trim();
+  const up = (() => {
+    const m = t.match(/up主[“"']([^”"']+)[”"']/i);
+    return m?.[1] ? String(m[1]).trim() : "";
+  })();
+
+  const tokens = expandFocusTokens(focusTokensFromText(t)).slice(0, 6);
+  const base = up || tokens.join(" ");
+
+  const queries: string[] = [];
+  const push = (q: string) => {
+    const s = String(q || "").trim();
+    if (!s) return;
+    if (queries.includes(s)) return;
+    queries.push(s);
+  };
+
+  push(base || t);
+  if (/哈基米/i.test(t) && /配音|ai配音|旁白|声音|TTS/i.test(t)) push(`${up || ""} 哈基米 配音 免费 教程`.trim());
+  if (/bgm|配乐|音乐/i.test(t)) push(`哈基米 BGM 纯音乐`.trim());
+  if (/五分钟|5\s*分钟|大概五分钟|5min/i.test(t) || /画面素材|b-roll|素材/i.test(t)) push(`5分钟 画面素材 B-roll 4K`.trim());
+
+  return {
+    reply: ensureUserFacingReplyText(""),
+    prompt_draft: null,
+    should_search: queries.length > 0,
+    search_queries: queries.slice(0, 3),
+  };
+}
+
 const GENERIC_SEARCH_TOKENS = new Set(
   [
     "资源",
@@ -1277,7 +1308,13 @@ function inferConstraintHints(text: string): ChatConstraintHints {
   };
 }
 
-type WebSearchResult = { title: string; url: string; snippet?: string | null };
+type WebSearchResult = {
+  title: string;
+  url: string;
+  snippet?: string | null;
+  thumbnail?: string | null;
+  duration_s?: number | null;
+};
 
 type WebSearchProvider = "google_cse" | "exa";
 
@@ -1322,6 +1359,94 @@ async function exaSearch(opts: { apiKey: string; query: string; numResults: numb
     const t = typeof r0?.title === "string" ? r0.title : "";
     if (!u.startsWith("http")) continue;
     out.push({ url: u, title: t.trim() || u, snippet: null });
+  }
+  return out;
+}
+
+function stripHtmlTags(s: string): string {
+  const t = String(s || "");
+  return t
+    .replace(/<[^>]*>/g, " ")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function parseHmsToSeconds(s: string): number | null {
+  const raw = String(s || "").trim();
+  if (!raw) return null;
+  const parts = raw.split(":").map((x) => Number(x));
+  if (parts.some((n) => !Number.isFinite(n) || n < 0)) return null;
+  if (parts.length === 2) return parts[0] * 60 + parts[1];
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  return null;
+}
+
+function sanitizeBilibiliKeyword(query: string): string {
+  const q = String(query || "");
+  return q
+    .replace(/\bsite:[^\s]+/gi, " ")
+    .replace(/\binurl:[^\s]+/gi, " ")
+    .replace(/[()]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+async function bilibiliSearchVideos(opts: { keyword: string; numResults: number }): Promise<WebSearchResult[]> {
+  const keyword = sanitizeBilibiliKeyword(opts.keyword);
+  if (!keyword) return [];
+
+  const pageSize = Math.max(1, Math.min(20, Math.floor(opts.numResults || 10)));
+  const url = new URL("https://api.bilibili.com/x/web-interface/search/type");
+  url.searchParams.set("search_type", "video");
+  url.searchParams.set("keyword", keyword);
+  url.searchParams.set("page", "1");
+  url.searchParams.set("page_size", String(pageSize));
+
+  const res = await fetch(url.toString(), {
+    method: "GET",
+    headers: {
+      "user-agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+      referer: "https://www.bilibili.com/",
+      accept: "application/json, text/plain, */*",
+    },
+  });
+  const text = await res.text().catch(() => "");
+  if (!res.ok) {
+    const hint = res.status === 412 ? " (blocked by bilibili risk control; try Exa/Google search or paste a BV/link)" : "";
+    throw new Error(`bilibili search failed: HTTP ${res.status}${hint}`);
+  }
+  const raw = (() => {
+    try {
+      return JSON.parse(text);
+    } catch {
+      return null;
+    }
+  })();
+  const code = typeof raw?.code === "number" ? raw.code : null;
+  if (code !== null && code !== 0) {
+    const msg = typeof raw?.message === "string" ? raw.message : "unknown";
+    const hint = code === -412 ? " (blocked by bilibili risk control; try Exa/Google search or paste a BV/link)" : "";
+    throw new Error(`bilibili search failed: code=${code} msg=${msg}${hint}`);
+  }
+
+  const items: any[] = Array.isArray(raw?.data?.result) ? raw.data.result : [];
+  const out: WebSearchResult[] = [];
+  for (const it of items) {
+    const bvid = str(it?.bvid);
+    const title = stripHtmlTags(str(it?.title)) || keyword;
+    const desc = stripHtmlTags(str(it?.description)) || null;
+    const picRaw = str(it?.pic);
+    const pic = picRaw ? (picRaw.startsWith("//") ? `https:${picRaw}` : picRaw) : "";
+    const durationS = parseHmsToSeconds(str(it?.duration));
+    const u = bvid ? `https://www.bilibili.com/video/${bvid}` : str(it?.arcurl) || "";
+    if (!u.startsWith("http")) continue;
+    out.push({ url: u, title, snippet: desc, thumbnail: pic || null, duration_s: durationS });
   }
   return out;
 }
@@ -1491,9 +1616,14 @@ async function chatTurnPlanNode(state: ChatTurnGraphState) {
   const planArtifact = plan ? await maybeStorePlan(projectId, "chat-turn", plan) : null;
 
   let llmPayload: any;
-  if (useGeminiNative) {
-    const url = new URL(`/v1beta/models/${encodeURIComponent(model)}:generateContent`, baseUrl);
-    url.searchParams.set("key", geminiApiKey);
+  let llmText = "";
+  let llmParsed: unknown | null = null;
+  let agentPlan: ChatAgentPlan | null = null;
+
+  try {
+    if (useGeminiNative) {
+      const url = new URL(`/v1beta/models/${encodeURIComponent(model)}:generateContent`, baseUrl);
+      url.searchParams.set("key", geminiApiKey);
       llmPayload = await fetchJson<any>(url.toString(), {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -1517,8 +1647,21 @@ async function chatTurnPlanNode(state: ChatTurnGraphState) {
       });
     }
 
-  const llmText = useGeminiNative ? extractGeminiText(llmPayload) : extractChatCompletionsText(llmPayload);
-  const llmParsed = tryParseJson(llmText);
+    llmText = useGeminiNative ? extractGeminiText(llmPayload) : extractChatCompletionsText(llmPayload);
+    llmParsed = tryParseJson(llmText);
+    agentPlan = buildAgentPlanFromLlm(llmText, llmParsed);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    // Fallback: still attempt a useful search plan without model output.
+    agentPlan = heuristicChatPlan(state.userText || "");
+    agentPlan.reply =
+      "（模型调用失败，已切换为快速检索模式）" +
+      (msg ? `\n原因：${String(msg).slice(0, 160)}` : "") +
+      "\n我会先在 B 站做检索并给出候选卡片。";
+    llmPayload = { ok: false, error: msg };
+    llmText = "";
+    llmParsed = null;
+  }
 
   return {
     directResolveCache,
@@ -1527,7 +1670,7 @@ async function chatTurnPlanNode(state: ChatTurnGraphState) {
     llmPayload,
     llmText,
     llmParsed,
-    agentPlan: buildAgentPlanFromLlm(llmText, llmParsed),
+    agentPlan,
   };
 }
 
@@ -1655,10 +1798,7 @@ async function chatTurnDoSearchAndResolveNode(state: ChatTurnGraphState) {
 
   const hasGoogle = !!str(googleCseApiKey) && !!str(googleCseCx);
   const hasExa = !!str(exaApiKey);
-  if (!hasGoogle && !hasExa) {
-    agentPlan.reply = `${ensureUserFacingReplyText(agentPlan.reply)}\n\n联网搜索未配置：请在设置里填 Exa API Key（或 Google CSE API Key + CX），然后再试；也可以直接把候选链接贴给我。`;
-    return { agentPlan, blocks, videos, directResolveCache };
-  }
+  const noWebProvider = !hasGoogle && !hasExa;
   const currentPass = typeof state.searchPass === "number" && Number.isFinite(state.searchPass) ? state.searchPass : 0;
   const maxRounds = currentPass <= 0 ? 3 : 2; // 2nd+ pass should be more targeted
   const nextSearchPass = currentPass + 1;
@@ -1671,12 +1811,24 @@ async function chatTurnDoSearchAndResolveNode(state: ChatTurnGraphState) {
   const pickedQueries = rawQueries.filter((q) => containsAnyToken(q, focusForQueryPick));
   const queries = (pickedQueries.length > 0 ? pickedQueries : rawQueries).slice(0, 3);
 
-  type SearchCandidate = { url: string; title: string; snippet: string | null; score: number };
-  const candidateByUrl = new Map<string, SearchCandidate>();
+  type SearchCandidate = {
+    url: string;
+    title: string;
+    snippet: string | null;
+    score: number;
+    thumbnail?: string | null;
+    duration_s?: number | null;
+  };
+  const videoCandidatesByUrl = new Map<string, SearchCandidate>();
+  const linkCandidatesByUrl = new Map<string, SearchCandidate>();
 
   const hintText = `${userText} ${rawQueries.join(" ")} ${(state.directUrls || []).join(" ")}`;
   const intent = detectChatSearchIntent(hintText);
   const constraintHints = inferConstraintHints(hintText);
+  const wantsFootage = /画面|素材|b-roll|镜头|五分钟|5分钟|5\s*min/i.test(hintText);
+  const wantsVoice = /配音|旁白|tts|声音|哈基米/i.test(hintText);
+  const wantsBgm = /bgm|配乐|音乐|哈基米/i.test(hintText);
+  const multiAsset = wantsFootage && (wantsVoice || wantsBgm);
 
   const wantsExternal = /外站|站外|youtube|youtu|tiktok|douyin|instagram|twitter|x\\.com/i.test(hintText);
   const wantsBilibili = /b站|bilibili|b23\\.tv|bilibili\\.com|\\bbv[0-9a-z]{6,}/i.test(hintText);
@@ -1684,6 +1836,7 @@ async function chatTurnDoSearchAndResolveNode(state: ChatTurnGraphState) {
 
   const preferBilibili = intent === "video" && wantsBilibili && !wantsExternal;
   const preferYoutube = intent === "video" && (wantsYoutube || wantsExternal);
+  const allowBilibiliOnly = noWebProvider;
 
   const platformBoost = (url: string): number => {
     if (intent !== "video") return 0;
@@ -1753,40 +1906,64 @@ async function chatTurnDoSearchAndResolveNode(state: ChatTurnGraphState) {
 
   for (const { query } of rounds.slice(0, maxRounds)) {
     emitChatStage({ stage: "search_query", detail: query });
-    const { results } = await webSearch({
-      query,
-      numResults: 12,
-      googleApiKey: googleCseApiKey,
-      googleCx: googleCseCx,
-      exaApiKey,
-    });
+    let results: WebSearchResult[] = [];
+    try {
+      results = allowBilibiliOnly
+        ? await withTimeout(bilibiliSearchVideos({ keyword: query, numResults: 12 }), 12_000)
+        : (
+            await webSearch({
+              query,
+              numResults: 12,
+              googleApiKey: googleCseApiKey,
+              googleCx: googleCseCx,
+              exaApiKey,
+            })
+          ).results;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      agentPlan.reply = `${ensureUserFacingReplyText(agentPlan.reply)}\n\n搜索失败：${msg}\n\n建议：\n- 在 Settings 配置 Exa API Key（或 Google CSE）进行稳定的全网搜索；或\n- 直接把该 UP 主主页 / BV 链接贴给我，我可以基于参考视频继续找同类素材。`;
+      return { agentPlan, blocks, videos, directResolveCache, searchPass: nextSearchPass };
+    }
     if (results.length === 0) continue;
+
+    const isResourceQuery = /配音|旁白|tts|bgm|配乐|音乐|音效|sfx|教程|从哪|哪里/i.test(query);
+    const targetMap =
+      multiAsset && isResourceQuery ? linkCandidatesByUrl : intent === "video" ? videoCandidatesByUrl : linkCandidatesByUrl;
 
     for (const r of results) {
       const u = str(r.url);
       const t = str(r.title) || u;
       const isVideo = isLikelyVideoUrl(u);
       if (intent === "video" && !isVideo) continue;
-      if (intent !== "video" && isVideo) continue;
+      if (!allowBilibiliOnly && intent !== "video" && isVideo) continue;
 
       const hay = `${t} ${u} ${str(r.snippet)}`;
       const score = scoreByTokens(hay, primaryFocus, fallbackFocus) + platformBoost(u);
       if (score <= 0) continue;
 
-      const prev = candidateByUrl.get(u);
+      const prev = targetMap.get(u);
       if (!prev || prev.score < score) {
-        candidateByUrl.set(u, { url: u, title: t.trim() || u, snippet: str(r.snippet) || null, score });
+        targetMap.set(u, {
+          url: u,
+          title: t.trim() || u,
+          snippet: str(r.snippet) || null,
+          score,
+          thumbnail: str((r as any)?.thumbnail) || null,
+          duration_s: typeof (r as any)?.duration_s === "number" ? (r as any).duration_s : null,
+        });
       }
     }
 
     // Enough candidates; avoid extra web search calls.
-    if (candidateByUrl.size >= 18) break;
+    if (intent === "video" && videoCandidatesByUrl.size >= 18) break;
   }
 
-  const ranked = Array.from(candidateByUrl.values()).sort((a, b) => b.score - a.score);
-  const selected: typeof ranked = [];
+  const rankedVideos = Array.from(videoCandidatesByUrl.values()).sort((a, b) => b.score - a.score);
+  const rankedLinks = Array.from(linkCandidatesByUrl.values()).sort((a, b) => b.score - a.score);
+
+  const selected: typeof rankedVideos = [];
   const selectedKeys = new Set<string>();
-  for (const cand of ranked) {
+  for (const cand of rankedVideos) {
     if (selected.length >= 6) break;
     const key = normalizeUrlForDedup(cand.url);
     if (!key) continue;
@@ -1796,7 +1973,7 @@ async function chatTurnDoSearchAndResolveNode(state: ChatTurnGraphState) {
     selected.push(cand);
   }
   if (selected.length < 6) {
-    for (const cand of ranked) {
+    for (const cand of rankedVideos) {
       if (selected.length >= 6) break;
       const key = normalizeUrlForDedup(cand.url);
       if (!key) continue;
@@ -1806,10 +1983,23 @@ async function chatTurnDoSearchAndResolveNode(state: ChatTurnGraphState) {
     }
   }
 
-  if (intent !== "video") {
+  const selectedLinks: typeof rankedLinks = [];
+  const selectedLinkKeys = new Set<string>();
+  for (const cand of rankedLinks) {
+    if (selectedLinks.length >= 6) break;
+    const key = normalizeUrlForDedup(cand.url);
+    if (!key) continue;
+    if (usedKeys.has(key)) continue;
+    if (selectedLinkKeys.has(key)) continue;
+    selectedLinkKeys.add(key);
+    selectedLinks.push(cand);
+  }
+
+  // Non-video intent: return links only unless the user clearly asked for multiple asset types in one turn.
+  if (intent !== "video" && !multiAsset) {
     const links: ChatLinkCard[] = [];
     const seen = new Set<string>();
-    for (const cand of selected) {
+    for (const cand of selectedLinks) {
       if (links.length >= 6) break;
       const u = cand.url;
       const key = normalizeUrlForDedup(u);
@@ -1837,6 +2027,33 @@ async function chatTurnDoSearchAndResolveNode(state: ChatTurnGraphState) {
     return { agentPlan, blocks, videos, directResolveCache, searchPass: nextSearchPass };
   }
 
+  // Multi-asset: also render a links block (tutorials/resources), then continue hydrating videos below.
+  if (selectedLinks.length > 0) {
+    const links: ChatLinkCard[] = [];
+    const seen = new Set<string>();
+    for (const cand of selectedLinks) {
+      if (links.length >= 6) break;
+      const u = cand.url;
+      const key = normalizeUrlForDedup(u);
+      if (!u || !key || seen.has(key)) continue;
+      seen.add(key);
+      links.push({ url: u, title: cand.title || u, snippet: cand.snippet || null });
+    }
+
+    if (links.length > 0) {
+      const hasLinks = blocks.some((b) => b && typeof b === "object" && (b as any).type === "links");
+      if (!hasLinks) blocks.push({ type: "links", links });
+      if (hasLinks) {
+        for (const b of blocks) {
+          if (b && typeof b === "object" && (b as any).type === "links") {
+            (b as any).links = links;
+            break;
+          }
+        }
+      }
+    }
+  }
+
   const existing = new Set(videos.map((v) => normalizeUrlForDedup(v.url)).filter(Boolean));
   let unresolved = 0;
   for (const cand of selected) {
@@ -1861,7 +2078,15 @@ async function chatTurnDoSearchAndResolveNode(state: ChatTurnGraphState) {
       });
     } catch {
       unresolved += 1;
-      videos.push({ url: u, title: fallbackTitle, description: null, thumbnail: null, duration_s: null, extractor: "unknown", id: "" });
+      videos.push({
+        url: u,
+        title: fallbackTitle,
+        description: cand.snippet || null,
+        thumbnail: cand.thumbnail || null,
+        duration_s: typeof cand.duration_s === "number" ? cand.duration_s : null,
+        extractor: "unknown",
+        id: "",
+      });
     }
   }
 
@@ -2007,30 +2232,36 @@ async function chatTurnReviewRefineNode(state: ChatTurnGraphState) {
   ];
 
   let reviewPayload: any;
-  if (useGeminiNative) {
-    const url = new URL(`/v1beta/models/${encodeURIComponent(model)}:generateContent`, baseUrl);
-    url.searchParams.set("key", geminiApiKey);
-    reviewPayload = await fetchJson<any>(url.toString(), {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        contents,
-        generationConfig: {
-          temperature: 0.2,
-          maxOutputTokens: 1024,
-          ...(GEMINI_THINKING_BUDGET > 0 ? { thinkingConfig: { thinkingBudget: GEMINI_THINKING_BUDGET } } : {}),
-        },
-      }),
-    });
-  } else {
-    reviewPayload = await callChatCompletions({
-      baseUrl,
-      apiKey: geminiApiKey,
-      model,
-      messages: openAiMessages,
-      temperature: 0.2,
-      maxTokens: 1024,
-    });
+  try {
+    if (useGeminiNative) {
+      const url = new URL(`/v1beta/models/${encodeURIComponent(model)}:generateContent`, baseUrl);
+      url.searchParams.set("key", geminiApiKey);
+      reviewPayload = await fetchJson<any>(url.toString(), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          contents,
+          generationConfig: {
+            temperature: 0.2,
+            maxOutputTokens: 1024,
+            ...(GEMINI_THINKING_BUDGET > 0 ? { thinkingConfig: { thinkingBudget: GEMINI_THINKING_BUDGET } } : {}),
+          },
+        }),
+      });
+    } else {
+      reviewPayload = await callChatCompletions({
+        baseUrl,
+        apiKey: geminiApiKey,
+        model,
+        messages: openAiMessages,
+        temperature: 0.2,
+        maxTokens: 1024,
+      });
+    }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    agentPlan.reply = `${ensureUserFacingReplyText(agentPlan.reply)}\n\n（复盘步骤暂不可用：${String(msg).slice(0, 160)}）`;
+    return { searchAgain: false, reviewPayload: { ok: false, error: msg }, reviewText: "", reviewParsed: null };
   }
 
   const reviewText = useGeminiNative ? extractGeminiText(reviewPayload) : extractChatCompletionsText(reviewPayload);
@@ -2249,14 +2480,29 @@ async function execToolCall(
     if (!hasSite) q = `${q} site:bilibili.com/video`;
 
     emitChatStage({ stage: "search_query", detail: `bilibili: ${q}` });
-    const { results } = await webSearch({
-      query: q,
-      numResults: Math.min(20, numResults),
-      googleApiKey: state.googleCseApiKey,
-      googleCx: state.googleCseCx,
-      exaApiKey: state.exaApiKey,
-      prefer: str(state.googleCseApiKey) && str(state.googleCseCx) ? "google_cse" : "exa",
-    });
+    const hasGoogle = !!str(state.googleCseApiKey) && !!str(state.googleCseCx);
+    const hasExa = !!str(state.exaApiKey);
+    let results: WebSearchResult[] = [];
+    try {
+      results = hasGoogle || hasExa
+        ? (
+            await webSearch({
+              query: q,
+              numResults: Math.min(20, numResults),
+              googleApiKey: state.googleCseApiKey,
+              googleCx: state.googleCseCx,
+              exaApiKey: state.exaApiKey,
+              prefer: str(state.googleCseApiKey) && str(state.googleCseCx) ? "google_cse" : "exa",
+            })
+          ).results
+        : await bilibiliSearchVideos({ keyword: query, numResults: Math.min(20, numResults) });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return {
+        toolMessage: { role: "tool", tool_call_id: call.id, name, content: JSON.stringify({ ok: false, error: msg, query: q }) },
+        candidates: [],
+      };
+    }
 
     const candidates: Array<{ id: string; url: string; title: string; snippet?: string | null }> = [];
     for (const r of results) {
@@ -2270,7 +2516,16 @@ async function execToolCall(
       const title = str(r.title) || url;
       const snippet = typeof r.snippet === "string" ? r.snippet : null;
       candidates.push({ id, url, title, snippet });
-      outCandidates.push({ id, kind: "video", url, title, snippet });
+      outCandidates.push({
+        id,
+        kind: "video",
+        url,
+        title,
+        snippet,
+        thumbnail: str((r as any)?.thumbnail) || null,
+        duration_s: typeof (r as any)?.duration_s === "number" ? (r as any).duration_s : null,
+        extractor: "bilibili",
+      });
     }
 
     return {
@@ -2291,6 +2546,20 @@ async function execToolCall(
         toolMessage: { role: "tool", tool_call_id: call.id, name, content: JSON.stringify({ ok: false, needs_consent: true }) },
         candidates: [],
         needsConsent: true,
+      };
+    }
+
+    const hasGoogle = !!str(state.googleCseApiKey) && !!str(state.googleCseCx);
+    const hasExa = !!str(state.exaApiKey);
+    if (!hasGoogle && !hasExa) {
+      return {
+        toolMessage: {
+          role: "tool",
+          tool_call_id: call.id,
+          name,
+          content: JSON.stringify({ ok: false, error: "web search not configured (set Exa or Google CSE in Settings)" }),
+        },
+        candidates: [],
       };
     }
 
@@ -3061,11 +3330,94 @@ async function handleChatTurn(projectId: string, body: any) {
   const useGeminiNative = isGeminiNativeBaseUrl(baseUrl);
 
   if (!geminiApiKey) {
+    // No LLM key: provide a deterministic, best-effort bilibili-first search so the app is still usable out of the box.
+    // This mode intentionally does NOT claim any "analysis" or model inference.
+    const consent = await getConsent(pid);
+    if (!consent?.consented) {
+      const assistantMessage = await createChatMessage(
+        pid,
+        chatId,
+        "assistant",
+        "当前未配置 API Key（Gemini/中转），我可以先用 B 站公开搜索做一个“快速检索版”结果，但仍需要你先完成一次“外部内容确认/授权”。确认后再发一次同样的需求即可。",
+      );
+      return { ok: true, needs_consent: true, user_message: userMessage, assistant_message: assistantMessage };
+    }
+
+    const blocks: any[] = [];
+    const videoCards: ChatVideoCard[] = [];
+    const linkCards: ChatLinkCard[] = [];
+
+    const pushVideo = (r: WebSearchResult) => {
+      const url = str(r?.url);
+      if (!url) return;
+      const id = (() => {
+        const m = url.match(/\/video\/(BV[0-9A-Za-z]+)/);
+        return m?.[1] ? m[1] : "";
+      })();
+      videoCards.push({
+        url,
+        title: str(r?.title) || url,
+        description: typeof r?.snippet === "string" ? r.snippet : null,
+        thumbnail: str((r as any)?.thumbnail) || null,
+        duration_s: typeof (r as any)?.duration_s === "number" ? (r as any).duration_s : null,
+        extractor: "bilibili",
+        id,
+      });
+    };
+
+    const pushLink = (r: WebSearchResult) => {
+      const url = str(r?.url);
+      if (!url) return;
+      linkCards.push({
+        url,
+        title: str(r?.title) || url,
+        snippet: typeof r?.snippet === "string" ? r.snippet : null,
+      });
+    };
+
+    emitChatStage({ stage: "planning" });
+
+    const safeBili = async (keyword: string, n: number): Promise<WebSearchResult[]> => {
+      try {
+        emitChatStage({ stage: "search_query", detail: `bilibili(api): ${keyword}` });
+        return await withTimeout(bilibiliSearchVideos({ keyword, numResults: n }), 12_000);
+      } catch {
+        return [];
+      }
+    };
+
+    // 1) Find the creator / style reference
+    const upName = "笔给你你来写";
+    const upVideos = await safeBili(`${upName} 哈基米`, 6);
+
+    // 2) Find ~5min footage candidates (bilibili-first, since no web keys)
+    const footage = await safeBili("5分钟 画面素材 B-roll 4K 风景", 6);
+
+    // 3) Find voice / BGM hints (tutorials/resources). We provide links; user can pick the simplest/free workflow.
+    const voiceHowto = await safeBili("哈基米 配音 生成 教程 免费", 6);
+    const bgm = await safeBili("哈基米 BGM 纯音乐", 6);
+
+    for (const r of upVideos.slice(0, 2)) pushVideo(r);
+    for (const r of footage.slice(0, 4)) pushVideo(r);
+
+    for (const r of voiceHowto.slice(0, 3)) pushLink(r);
+    for (const r of bgm.slice(0, 3)) pushLink(r);
+
+    if (videoCards.length > 0) blocks.push({ type: "videos", videos: videoCards });
+    if (linkCards.length > 0) blocks.push({ type: "links", links: linkCards });
+
     const assistantMessage = await createChatMessage(
       pid,
       chatId,
       "assistant",
-      "API key is not set. Open Settings and set the API Key first, then try again.",
+      [
+        "当前未配置 API Key，所以这是“快速检索版”（不做 AI 分析/推断）。",
+        `- 我先给你：${upName} 风格参考视频（2条）+ 约 5 分钟画面素材候选（4条）。`,
+        "- 以及：哈基米配音/哈基米BGM 的入门教程/资源入口（各3条），你看哪条最简单免费的，我们再固化成默认流程。",
+        "",
+        "想要我做到“自动分析UP主视频→推断配音/BGM来源→再继续执行”的闭环：需要在 Settings 配好 API Key（Gemini/中转）。",
+      ].join("\n"),
+      blocks.length > 0 ? { blocks } : undefined,
     );
     return { ok: true, user_message: userMessage, assistant_message: assistantMessage };
   }
@@ -3211,6 +3563,61 @@ async function handleChatTurn(projectId: string, body: any) {
 
   const history = await getChatMessages(pid, chatId);
   const recent = history.slice(Math.max(0, history.length - 12));
+
+  // Gemini native baseUrl supports generateContent but not our OpenAI-style tool-calls agent.
+  // Use the (non-tool) LangGraph flow instead, with bilibili-first search fallback.
+  if (useGeminiNative) {
+    const turnState = await chatTurnLangGraph.invoke(
+      {
+        projectId: pid,
+        chatId,
+        userText,
+        userMessage,
+        directUrls,
+        recent,
+        thinkEnabled,
+        geminiApiKey,
+        exaApiKey,
+        googleCseApiKey,
+        googleCseCx,
+        baseUrl,
+        model,
+        cookiesFromBrowser,
+        useGeminiNative,
+        directResolveCache: {},
+        plan: null,
+        planArtifact: null,
+        llmPayload: null,
+        llmText: "",
+        llmParsed: null,
+        searchPass: 0,
+        searchAgain: false,
+        reviewPayload: null,
+        reviewText: "",
+        reviewParsed: null,
+        agentPlan: null,
+        videos: [],
+        blocks: [],
+        needsConsent: false,
+        debugArtifact: null,
+        assistantMessage: null,
+      },
+      { recursionLimit: 50 },
+    );
+
+    const assistant = turnState.assistantMessage
+      ? turnState.assistantMessage
+      : await createChatMessage(pid, chatId, "assistant", ensureUserFacingReplyText("OK"));
+
+    return {
+      ok: true,
+      needs_consent: !!turnState.needsConsent,
+      plan: turnState.plan,
+      plan_artifact: turnState.planArtifact,
+      user_message: userMessage,
+      assistant_message: assistant,
+    };
+  }
 
   const plan = thinkEnabled
     ? {
