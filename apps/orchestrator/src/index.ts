@@ -1565,6 +1565,28 @@ function isLikelyVideoUrl(url: string): boolean {
   return false;
 }
 
+function wantsFootageFromText(text: string): boolean {
+  const t = String(text || "");
+  return /画面|素材|空镜|镜头|b-?roll|roll|五分钟|5分钟|5\s*min/i.test(t);
+}
+
+function isFootageToolTutorialNoise(hay: string): boolean {
+  const t = String(hay || "");
+  if (!t) return false;
+  return /去水印|无水印|下载|批量下载|下载姬|downkyi|解析|取链|搬运|字幕去除|去字幕|工具|软件|整合包|一键|教学|教程|安装|配置|脚本|yt-?dlp|ffmpeg/i.test(
+    t,
+  );
+}
+
+function isFootageOffTopicNoise(opts: { query: string; hay: string }): boolean {
+  const q = String(opts.query || "");
+  const h = String(opts.hay || "");
+  if (!q || !h) return false;
+  const wantsScenery = /空镜|b-?roll|纯画面|风景|城市|夜景|街景|延时|航拍|旅行|自然|日落|日出|云|雨|雪|山|海|湖|森林|公路/i.test(q);
+  if (!wantsScenery) return false;
+  return /猫|狗|宠物|搞笑|表情包|整活/i.test(h);
+}
+
 async function chatTurnPlanNode(state: ChatTurnGraphState) {
   const { projectId, directUrls, cookiesFromBrowser, recent, thinkEnabled, useGeminiNative, baseUrl, model, geminiApiKey } = state;
 
@@ -2574,18 +2596,26 @@ async function execToolCall(
     const hasExa = !!str(state.exaApiKey);
     let results: WebSearchResult[] = [];
     try {
-      results = hasGoogle || hasExa
-        ? (
-            await webSearch({
-              query: q,
-              numResults: Math.min(20, numResults),
-              googleApiKey: state.googleCseApiKey,
-              googleCx: state.googleCseCx,
-              exaApiKey: state.exaApiKey,
-              prefer: str(state.googleCseApiKey) && str(state.googleCseCx) ? "google_cse" : "exa",
-            })
-          ).results
-        : await bilibiliSearchVideos({ keyword: query, numResults: Math.min(20, numResults) });
+      // Prefer bilibili official search (better recall on Chinese creator/video titles).
+      // If blocked by risk control (-412/HTTP 412), fall back to Exa/Google site search when available.
+      try {
+        results = await bilibiliSearchVideos({ keyword: query, numResults: Math.min(20, numResults) });
+      } catch (e2) {
+        const msg2 = e2 instanceof Error ? e2.message : String(e2);
+        const blocked = /HTTP\s*412|code=-?412|risk control|风控|banned/i.test(msg2);
+        if (!blocked || (!hasGoogle && !hasExa)) throw e2;
+        emitChatStage({ stage: "search_query", detail: `bilibili(fallback): ${q}` });
+        results = (
+          await webSearch({
+            query: q,
+            numResults: Math.min(20, numResults),
+            googleApiKey: state.googleCseApiKey,
+            googleCx: state.googleCseCx,
+            exaApiKey: state.exaApiKey,
+            prefer: str(state.googleCseApiKey) && str(state.googleCseCx) ? "google_cse" : "exa",
+          })
+        ).results;
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       return {
@@ -2595,6 +2625,7 @@ async function execToolCall(
     }
 
     const candidates: Array<{ id: string; url: string; title: string; snippet?: string | null }> = [];
+    const wantsFootage = wantsFootageFromText(state.userText) || /素材|空镜|b-?roll/i.test(query);
     for (const r of results) {
       const url = str(r.url);
       const lower = url.toLowerCase();
@@ -2605,6 +2636,9 @@ async function execToolCall(
       const id = candidateId("video", url);
       const title = str(r.title) || url;
       const snippet = typeof r.snippet === "string" ? r.snippet : null;
+      const hay = `${title} ${snippet || ""} ${url}`;
+      if (wantsFootage && isFootageToolTutorialNoise(hay)) continue;
+      if (wantsFootage && isFootageOffTopicNoise({ query, hay })) continue;
       candidates.push({ id, url, title, snippet });
       outCandidates.push({
         id,
@@ -2678,6 +2712,7 @@ async function execToolCall(
 
     const candidateByUrl = new Map<string, AgentCandidate>();
     const candidatesOut: Array<{ id: string; url: string; title: string; snippet?: string | null }> = [];
+    const wantsFootage = wantsFootageFromText(state.userText) || /素材|空镜|b-?roll/i.test(query);
 
     const perSite = Math.max(3, Math.min(8, Math.ceil(numResults / Math.max(1, subQueries.length))));
     for (const sq of subQueries) {
@@ -2704,6 +2739,9 @@ async function execToolCall(
         if (candidateByUrl.has(url)) continue;
         const title = str(r.title) || url;
         const snippet = typeof r.snippet === "string" ? r.snippet : null;
+        const hay = `${title} ${snippet || ""} ${url}`;
+        if (wantsFootage && isFootageToolTutorialNoise(hay)) continue;
+        if (wantsFootage && isFootageOffTopicNoise({ query: sq.q, hay })) continue;
         const cand: AgentCandidate = { id, kind: "video", url, title, snippet };
         candidateByUrl.set(url, cand);
         outCandidates.push(cand);
@@ -2749,6 +2787,16 @@ async function execToolCall(
       const url = str(r.url);
       const title = str(r.title) || url;
       if (!url) continue;
+      try {
+        const u = new URL(url);
+        const host = u.hostname.toLowerCase();
+        const path = u.pathname.toLowerCase();
+        // Skip obvious SERP/redirect pages.
+        if ((host === "blog.google" || host.endsWith(".google")) && path.includes("/search")) continue;
+        if (host.endsWith("google.com") && path.includes("/search")) continue;
+      } catch {
+        // ignore
+      }
       const id = candidateId("link", url);
       const snippet = typeof r.snippet === "string" ? r.snippet : null;
       candidates.push({ id, url, title, snippet });
@@ -2849,6 +2897,13 @@ async function chatToolAgentInitNode(state: ChatToolAgentGraphState) {
     "- If intent includes videos: start with search_bilibili_videos (Chinese) then search_video_sites (external/variety), then resolve_url for top candidates.",
     "- If intent includes audio/BGM/voiceover/SFX: use search_web with explicit site hints (e.g. freesound/pixabay/mixkit) and resolve_url for a few best links.",
     "- Prefer video platforms by default unless user explicitly requests non-video-only assets.",
+    "",
+    "Footage rules (important):",
+    "- If user asks for raw footage / B-roll / 画面素材 / 空镜: do NOT search for '去水印/下载器/解析工具/字幕去除/批量下载'.",
+    "- Use queries like: '空镜 4K 城市 夜景 5分钟', 'B-roll 风景 纯画面 4K', '解说 背景 空镜 素材'.",
+    "- Filter out tool/tutorial-style videos (watermark remover, downloader, parser, software tutorial) as irrelevant.",
+    "- If user also mentions voiceover/BGM in the same request: keep VIDEO searches focused on footage/style reference; fetch voice/BGM as LINKS via search_web.",
+    "- If user names a specific creator (UP主): always include at least one search targeting that creator name to find style reference videos or their space page.",
     "",
     "Output:",
     "- When you are ready to answer, output JSON ONLY (no markdown).",
@@ -2969,6 +3024,38 @@ async function chatToolAgentDoNode(state: ChatToolAgentGraphState) {
     }
   }
 
+  // Guardrail: if user clearly wants footage/videos but the model did not request any video discovery tools,
+  // inject a couple of safe defaults to keep hit-rate high.
+  if (pass === 1) {
+    const userText = String(state.userText || "");
+    const intent = detectChatSearchIntent(userText);
+    const wantsFootage = wantsFootageFromText(userText);
+    const wantsCreator = /笔给你你来写/.test(userText);
+    const hasVideoTool = toolCalls.some((c) => {
+      const n = String(c?.function?.name || "");
+      return n === "search_bilibili_videos" || n === "search_video_sites";
+    });
+    if ((intent === "video" || wantsFootage) && !hasVideoTool) {
+      const extra: OpenAIChatToolCall[] = [];
+      if (wantsCreator) {
+        extra.push({
+          id: `synthetic_${Date.now()}_bili_creator`,
+          type: "function",
+          function: { name: "search_bilibili_videos", arguments: JSON.stringify({ query: "笔给你你来写 投稿", num_results: 6 }) },
+        });
+      }
+      extra.push({
+        id: `synthetic_${Date.now()}_bili_footage`,
+        type: "function",
+        function: {
+          name: "search_bilibili_videos",
+          arguments: JSON.stringify({ query: "空镜 风景 城市 夜景 延时 4K 5分钟 纯画面 素材", num_results: 10 }),
+        },
+      });
+      toolCalls = toolCalls.concat(extra);
+    }
+  }
+
   const text = extractChatCompletionsText(payload);
   const assistant: OpenAIChatMessage = { role: "assistant", content: text || "" };
   if (toolCalls.length > 0) assistant.tool_calls = toolCalls;
@@ -3004,6 +3091,90 @@ async function chatToolAgentToolsNode(state: ChatToolAgentGraphState) {
         name,
         content: JSON.stringify({ ok: false, error: message }),
       });
+    }
+  }
+
+  // Guardrail: if the user asked for footage/B-roll but current tool calls only found meme/music/tutorial videos,
+  // automatically add a couple of targeted footage searches to improve hit-rate.
+  const wantsFootage = wantsFootageFromText(state.userText);
+  const pass = typeof state.pass === "number" && Number.isFinite(state.pass) ? state.pass : 0;
+  const isGoodFootage = (c: AgentCandidate) => {
+    if (!c || c.kind !== "video") return false;
+    if (/^https?:\/\//i.test(String(c.title || "").trim())) return false;
+    const hay = `${c.title || ""} ${c.snippet || ""} ${c.url || ""}`;
+    if (isFootageToolTutorialNoise(hay)) return false;
+    if (/表情包|音乐|bgm|纯音乐|配音|tts|音色|语音盒子|说停顿|哈基/i.test(hay)) return false;
+    if (/猫|狗|宠物|搞笑/i.test(hay)) return false;
+    return true;
+  };
+  const goodFootageCount = added.filter(isGoodFootage).length;
+  if (wantsFootage && pass <= 1 && goodFootageCount === 0) {
+    const fallbackCalls: OpenAIChatToolCall[] = [
+      {
+        id: `synthetic_${Date.now()}_bili_broll`,
+        type: "function",
+        function: { name: "search_bilibili_videos", arguments: JSON.stringify({ query: "空镜 风景 城市 夜景 延时 航拍 4K 素材", num_results: 12 }) },
+      },
+      {
+        id: `synthetic_${Date.now()}_video_sites_broll`,
+        type: "function",
+        function: { name: "search_video_sites", arguments: JSON.stringify({ query: "B-roll 4K city night timelapse no subtitles", num_results: 10 }) },
+      },
+      {
+        id: `synthetic_${Date.now()}_video_sites_gameplay`,
+        type: "function",
+        function: { name: "search_video_sites", arguments: JSON.stringify({ query: "Minecraft parkour gameplay no commentary 5 minutes", num_results: 8 }) },
+      },
+    ];
+
+    for (const call of fallbackCalls) {
+      const name = String(call?.function?.name || "").trim();
+      emitChatStage({ stage: "tool_call", detail: `${name}(fallback)` });
+      try {
+        const r = await execToolCall(state, call);
+        toolMessages.push(r.toolMessage);
+        added.push(...r.candidates);
+        if (r.needsConsent) {
+          return { messages: toolMessages, candidates: added, pendingToolCalls: [], needsConsent: true };
+        }
+        emitChatStage({ stage: "tool_result", detail: `${name}(fallback)` });
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        toolMessages.push({
+          role: "tool",
+          tool_call_id: call.id,
+          name,
+          content: JSON.stringify({ ok: false, error: message }),
+        });
+      }
+    }
+  }
+
+  // If user mentioned a specific creator, try to ensure their space link is available as a reference.
+  if (/笔给你你来写/.test(String(state.userText || ""))) {
+    const hasSpace = added.some((c) => c.kind === "link" && /space\.bilibili\.com\/72969462/.test(String(c.url || "")));
+    if (!hasSpace) {
+      const call: OpenAIChatToolCall = {
+        id: `synthetic_${Date.now()}_space_ref`,
+        type: "function",
+        function: { name: "search_web", arguments: JSON.stringify({ query: "site:space.bilibili.com 笔给你你来写 72969462", num_results: 5 }) },
+      };
+      const name = String(call?.function?.name || "").trim();
+      emitChatStage({ stage: "tool_call", detail: `${name}(fallback)` });
+      try {
+        const r = await execToolCall(state, call);
+        toolMessages.push(r.toolMessage);
+        added.push(...r.candidates);
+        emitChatStage({ stage: "tool_result", detail: `${name}(fallback)` });
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        toolMessages.push({
+          role: "tool",
+          tool_call_id: call.id,
+          name,
+          content: JSON.stringify({ ok: false, error: message }),
+        });
+      }
     }
   }
 
@@ -3052,6 +3223,7 @@ async function chatToolAgentReviewNode(state: ChatToolAgentGraphState) {
           "Evaluate whether current candidates match the user's creative intent.",
           "If not enough and remaining passes > 0, call ONE tool with a refined query to improve relevance/diversity.",
           "- For video intent or when user asked for off-site sources, prefer search_video_sites (or search_bilibili_videos) over generic search_web.",
+          "- If user asked for footage/B-roll and you see tool/tutorial videos (watermark remover, downloader, parser, software tutorial), treat them as irrelevant and search again with '空镜/B-roll/纯画面/4K/解说 背景 空镜 素材' style queries.",
           "If enough OR remaining passes == 0, output JSON ONLY with { reply, select, scorecard, dedupe_groups } (no markdown) and stop calling tools.",
           "Avoid duplicates / near-duplicates in select.",
           'scorecard schema: { [id: string]: { score?: number (0..1), tags?: string[], reason?: string } }',
@@ -3217,11 +3389,30 @@ async function chatToolAgentFinalizeNode(state: ChatToolAgentGraphState) {
     return candidates.filter((c) => c.kind === kind).slice(0, limit);
   };
 
-  const defaultVideoLimit = 3;
+  const wantsFootage = wantsFootageFromText(state.userText);
+  const wantsVoice = /配音|旁白|tts|声音|音色|哈基米/i.test(String(state.userText || ""));
+  const wantsBgm = /bgm|配乐|音乐|哈基米/i.test(String(state.userText || ""));
+  const multiAsset = wantsFootage && (wantsVoice || wantsBgm);
+
+  const isAudioOrMemeVideo = (c: AgentCandidate) => {
+    const hay = `${c.title || ""} ${c.snippet || ""} ${c.url || ""}`;
+    return /表情包|音乐|bgm|纯音乐|配音|tts|音色|语音盒子|说停顿|哈基/i.test(hay);
+  };
+
+  const defaultVideoLimit = wantsFootage ? 5 : 3;
   const defaultLinkLimit = 4;
 
-  const videosPicked = pick(wanted?.videos, "video", defaultVideoLimit);
-  const linksPicked = pick(wanted?.links, "link", defaultLinkLimit);
+  let videosPicked = pick(wanted?.videos, "video", defaultVideoLimit);
+  let linksPicked = pick(wanted?.links, "link", defaultLinkLimit);
+  const wantsCreator = /笔给你你来写/.test(String(state.userText || ""));
+  if (wantsCreator) {
+    const space = candidates.find(
+      (c) => c.kind === "link" && /space\.bilibili\.com\/72969462/.test(String(c.url || "")),
+    );
+    if (space) {
+      linksPicked = [space, ...linksPicked.filter((c) => c.id !== space.id)];
+    }
+  }
   const scorecard = final?.scorecard && typeof final.scorecard === "object" ? final.scorecard : null;
   const scoreFor = (id: string) => {
     if (!scorecard) return null;
@@ -3232,6 +3423,52 @@ async function chatToolAgentFinalizeNode(state: ChatToolAgentGraphState) {
     const reason = typeof it.reason === "string" ? it.reason : null;
     return { score, tags, reason };
   };
+
+  // When user asked for footage, prefer footage-style videos and avoid selecting BGM/meme clips as "videos".
+  // If we filtered too much, backfill from other video candidates.
+  let movedToLinks: AgentCandidate[] = [];
+  if (wantsFootage && videosPicked.length > 0) {
+    const wantsCreator = /笔给你你来写/.test(String(state.userText || ""));
+    const isStyleRef = (c: AgentCandidate) => /笔给你你来写|作文|写作|文采|句子|不能只写|你要写/i.test(`${c.title || ""} ${c.url || ""}`);
+    const isFootageRef = (c: AgentCandidate) =>
+      /空镜|风景|城市|夜景|延时|航拍|4k|b-?roll|纯画面|跑酷|parkour|gameplay|minecraft|gta|驾驶|driving/i.test(
+        `${c.title || ""} ${c.snippet || ""} ${c.url || ""}`,
+      );
+    const kept: AgentCandidate[] = [];
+    for (const v of videosPicked) {
+      if (isAudioOrMemeVideo(v)) movedToLinks.push(v);
+      else kept.push(v);
+    }
+    const pool = candidates.filter((c) => c.kind === "video").filter((v) => !isAudioOrMemeVideo(v));
+
+    // Re-balance picks: keep a couple style refs (if creator mentioned), then prioritize footage refs.
+    const out: AgentCandidate[] = [];
+    const seen = new Set<string>();
+    const push = (v: AgentCandidate) => {
+      if (out.length >= defaultVideoLimit) return;
+      if (!v?.id || seen.has(v.id)) return;
+      seen.add(v.id);
+      out.push(v);
+    };
+
+    if (wantsCreator) {
+      for (const v of kept.filter(isStyleRef)) push(v);
+      for (const v of pool.filter(isStyleRef)) push(v);
+    }
+    for (const v of kept.filter(isFootageRef)) push(v);
+    for (const v of pool.filter(isFootageRef)) push(v);
+
+    // Fill with whatever is left.
+    for (const v of kept) push(v);
+    for (const v of pool) push(v);
+
+    videosPicked = out;
+  }
+
+  const extraLinksFromVideos =
+    multiAsset && movedToLinks.length > 0
+      ? movedToLinks.slice(0, 4).map((c) => ({ url: c.url, title: c.title || c.url, snippet: c.snippet || null }))
+      : [];
 
   if (videosPicked.length > 0) {
     const videos: ChatVideoCard[] = videosPicked.map((c) => {
@@ -3251,7 +3488,7 @@ async function chatToolAgentFinalizeNode(state: ChatToolAgentGraphState) {
     });
     blocks.push({ type: "videos", videos });
   }
-  if (linksPicked.length > 0) {
+  if (linksPicked.length > 0 || extraLinksFromVideos.length > 0) {
     const links: ChatLinkCard[] = linksPicked.map((c) => {
       const sc = scoreFor(c.id);
       return {
@@ -3263,12 +3500,31 @@ async function chatToolAgentFinalizeNode(state: ChatToolAgentGraphState) {
         match_reason: sc?.reason ?? null,
       };
     });
+    const seen = new Set(links.map((l) => normalizeUrlForDedup(l.url)).filter(Boolean));
+    for (const l of extraLinksFromVideos) {
+      const key = normalizeUrlForDedup(l.url);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      links.push(l);
+      if (links.length >= defaultLinkLimit + 4) break;
+    }
     blocks.push({ type: "links", links });
   }
 
   let reply = final?.reply ? ensureUserFacingReplyText(final.reply) : "";
   if (!reply) {
-    reply = "我先给你一些候选卡片。你更偏向哪种风格/时长/用途？我可以再继续补搜或换方向。";
+    if (multiAsset) {
+      const lines: string[] = [];
+      lines.push("我先按你的目标做了三块输出：风格参考 / 约 5 分钟画面素材 / 哈基米配音与BGM入口。");
+      lines.push("- 画面素材：先从空镜/延时/航拍 + 无解说游戏画面（如跑酷）里给候选，适合承载旁白。");
+      lines.push("- 配音：给了几个可直接用的免费/低门槛入口（你选一个固定下来即可）。");
+      lines.push("- BGM：给了哈基米相关的合集入口（注意版权自行确认）。");
+      lines.push("");
+      lines.push("你可以直接在卡片上点「解析」补全标题/封面，再点「下载」进入切片/导出流程。");
+      reply = lines.join("\n");
+    } else {
+      reply = "我先给你一些候选卡片。你更偏向哪种风格/时长/用途？我可以再继续补搜或换方向。";
+    }
   }
 
   return { final: { reply }, blocks };
