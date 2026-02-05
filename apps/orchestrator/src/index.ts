@@ -584,6 +584,14 @@ function isGeminiNativeBaseUrl(baseUrl: string): boolean {
   return true;
 }
 
+function isLikelyGeminiApiKey(apiKey: string): boolean {
+  const k = String(apiKey || "").trim();
+  if (!k) return false;
+  // Most Gemini API keys are "AIza..." (Google-style API keys).
+  // We keep this heuristic intentionally loose; it is only used for safe fallback routing.
+  return /^AIza[0-9A-Za-z_-]{10,}$/.test(k);
+}
+
 function chatCompletionsUrl(baseUrl: string): string {
   const b = String(baseUrl || "").trim();
   const lower = b.toLowerCase();
@@ -3313,11 +3321,12 @@ async function handleChatTurn(projectId: string, body: any) {
 
   const thinkEnabled = await getThinkEnabled(pid);
 
-  const geminiApiKey = str(body?.gemini_api_key) || str(body?.api_key) || str(process.env.GEMINI_API_KEY);
+  const geminiNativeApiKey = str(body?.gemini_api_key) || str(process.env.GEMINI_API_KEY);
+  const openAiCompatApiKey = str(body?.api_key) || str(process.env.API_KEY) || str(process.env.OPENAI_API_KEY);
   const exaApiKey = str(body?.exa_api_key) || str(body?.api_key) || str(process.env.EXA_API_KEY);
   const googleCseApiKey = str(body?.google_cse_api_key) || str(process.env.GOOGLE_CSE_API_KEY);
   const googleCseCx = str(body?.google_cse_cx) || str(process.env.GOOGLE_CSE_CX);
-  const baseUrl = str(body?.base_url) || str(process.env.BASE_URL) || "https://generativelanguage.googleapis.com";
+  let baseUrl = str(body?.base_url) || str(process.env.BASE_URL) || "https://generativelanguage.googleapis.com";
   const model = str(body?.model) || str(body?.default_model) || str(process.env.DEFAULT_MODEL) || "gemini-3-preview";
   const cookiesFromBrowser = str(body?.ytdlp_cookies_from_browser) || str(process.env.YTDLP_COOKIES_FROM_BROWSER) || "";
 
@@ -3411,7 +3420,22 @@ async function handleChatTurn(projectId: string, body: any) {
     return { ok: true, user_message: userMessage, assistant_message: assistantMessage, mock: true };
   }
 
-  const useGeminiNative = isGeminiNativeBaseUrl(baseUrl);
+  let useGeminiNative = isGeminiNativeBaseUrl(baseUrl);
+
+  // Select the API key appropriate for the chosen provider mode.
+  // - Gemini native uses geminiNativeApiKey (query param `?key=`).
+  // - OpenAI-compatible uses openAiCompatApiKey (Authorization bearer).
+  //
+  // Safe fallback: if user configured BASE_URL to an OpenAI-compatible endpoint but did not provide API_KEY/OPENAI_API_KEY,
+  // and GEMINI_API_KEY looks like a Gemini key, automatically switch back to Gemini native.
+  if (!useGeminiNative && !openAiCompatApiKey && isLikelyGeminiApiKey(geminiNativeApiKey)) {
+    baseUrl = "https://generativelanguage.googleapis.com";
+    useGeminiNative = true;
+  }
+
+  const geminiApiKey = useGeminiNative
+    ? geminiNativeApiKey
+    : openAiCompatApiKey || geminiNativeApiKey; // backward-compat fallback
 
   if (!geminiApiKey) {
     // No LLM key: provide a deterministic, best-effort bilibili-first search so the app is still usable out of the box.
