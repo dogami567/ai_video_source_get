@@ -6,14 +6,31 @@ import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { Readable } from "node:stream";
+import { fileURLToPath } from "node:url";
 
-import "dotenv/config";
 import dotenv from "dotenv";
 import Exa from "exa-js";
 import express from "express";
 import { Annotation, END, START, StateGraph } from "@langchain/langgraph";
 
-dotenv.config({ path: path.resolve(process.cwd(), "../../.env") });
+// Load .env for local dev. Use override so repo `.env` wins over any stale machine-level env vars.
+const thisDir = path.dirname(fileURLToPath(import.meta.url));
+const repoEnvPath = path.resolve(thisDir, "../../../.env");
+const dotenvPaths = [path.resolve(process.cwd(), ".env"), repoEnvPath];
+const dotenvPathsExisting = dotenvPaths.filter((p) => existsSync(p));
+const dotenvResult =
+  dotenvPathsExisting.length > 0 ? dotenv.config({ path: dotenvPathsExisting, override: true }) : { parsed: undefined, error: undefined };
+if (str(process.env.VIDUNPACK_DEBUG_DOTENV) === "1") {
+  const pathsInfo = dotenvPaths.map((p) => `${p}(${existsSync(p) ? "exists" : "missing"})`).join(" | ");
+  const loadedKeys = dotenvResult.parsed ? Object.keys(dotenvResult.parsed).slice(0, 12).join(",") : "";
+  const err = dotenvResult.error ? ` error=${dotenvResult.error.message}` : "";
+  const parsedKey = dotenvResult.parsed && typeof (dotenvResult.parsed as any).GEMINI_API_KEY === "string" ? (dotenvResult.parsed as any).GEMINI_API_KEY : "";
+  const envKey = str(process.env.GEMINI_API_KEY);
+  const mask = (v: string) => (v ? `${v.slice(0, 4)}…(len ${v.length})` : "(empty)");
+  console.log(
+    `[vidunpack][dotenv] paths=${pathsInfo}${err} loadedKeys=${loadedKeys} parsed.GEMINI_API_KEY=${mask(parsedKey)} env.GEMINI_API_KEY=${mask(envKey)}`,
+  );
+}
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
@@ -665,6 +682,12 @@ async function callChatCompletions(opts: {
   if (bearer) headers["authorization"] = bearer;
   const tools = Array.isArray(opts.tools) ? opts.tools : undefined;
   const toolChoice = opts.toolChoice ?? (tools && tools.length > 0 ? "auto" : undefined);
+  if (str(process.env.VIDUNPACK_DEBUG_AUTH) === "1") {
+    const rawKey = String(opts.apiKey || "").trim();
+    const head = rawKey.slice(0, 4);
+    const suffix = rawKey.length > 0 ? ` key=${head}…(len ${rawKey.length})` : " key=(empty)";
+    console.log(`[vidunpack][llm] POST ${url}${suffix}`);
+  }
   return fetchJson<any>(url, {
     method: "POST",
     headers,
@@ -3322,7 +3345,14 @@ async function handleChatTurn(projectId: string, body: any) {
   const thinkEnabled = await getThinkEnabled(pid);
 
   const geminiNativeApiKey = str(body?.gemini_api_key) || str(process.env.GEMINI_API_KEY);
-  const openAiCompatApiKey = str(body?.api_key) || str(process.env.API_KEY) || str(process.env.OPENAI_API_KEY);
+  // Avoid accidentally picking up a stale machine-level OPENAI_API_KEY when user intends to use GEMINI_API_KEY with a proxy.
+  // Use OPENAI_API_KEY only when the Base URL clearly targets OpenAI.
+  const wantsOpenAiKeyFromEnv = /(^|\/\/)api\.openai\.com\b|openai\.com\b/i.test(str(body?.base_url) || str(process.env.BASE_URL));
+  const openAiCompatApiKey =
+    str(body?.api_key) ||
+    str(body?.openai_api_key) ||
+    str(process.env.API_KEY) ||
+    (wantsOpenAiKeyFromEnv ? str(process.env.OPENAI_API_KEY) : "");
   const exaApiKey = str(body?.exa_api_key) || str(body?.api_key) || str(process.env.EXA_API_KEY);
   const googleCseApiKey = str(body?.google_cse_api_key) || str(process.env.GOOGLE_CSE_API_KEY);
   const googleCseCx = str(body?.google_cse_cx) || str(process.env.GOOGLE_CSE_CX);
