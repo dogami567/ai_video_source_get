@@ -1242,25 +1242,29 @@ export default function App() {
                 ? tr("stageThinking")
               : stage === "resolve"
                 ? tr("stageResolve")
-                : stage === "search"
-                  ? tr("stageSearch")
-                  : stage === "search_query"
-                    ? tr("stageSearchQuery")
-                    : stage === "review"
-                      ? tr("stageReview")
-                      : stage === "refine"
-                        ? tr("stageRefine")
-                        : stage === "saving"
-                          ? tr("stageSaving")
-                          : stage === "done"
-                            ? tr("stageDone")
-                            : stage === "mock"
-                              ? tr("stageMock")
-                              : stage === "analysis"
-                                ? tr("stageAnalysis")
-                                : stage === "download"
-                                  ? tr("stageDownload")
-                                  : stage;
+                  : stage === "search"
+                    ? tr("stageSearch")
+                    : stage === "search_query"
+                      ? tr("stageSearchQuery")
+                      : stage === "tool_call"
+                        ? tr("stageToolCall")
+                        : stage === "tool_result"
+                          ? tr("stageToolResult")
+                      : stage === "review"
+                        ? tr("stageReview")
+                        : stage === "refine"
+                          ? tr("stageRefine")
+                          : stage === "saving"
+                            ? tr("stageSaving")
+                            : stage === "done"
+                              ? tr("stageDone")
+                              : stage === "mock"
+                                ? tr("stageMock")
+                                : stage === "analysis"
+                                  ? tr("stageAnalysis")
+                                  : stage === "download"
+                                    ? tr("stageDownload")
+                                    : stage;
 
       const pass = typeof evt.pass === "number" && Number.isFinite(evt.pass) ? evt.pass : null;
       const maxPasses = typeof evt.max_passes === "number" && Number.isFinite(evt.max_passes) ? evt.max_passes : null;

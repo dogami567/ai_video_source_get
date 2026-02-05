@@ -2174,6 +2174,27 @@ function buildToolAgentTools(): OpenAIToolDef[] {
     {
       type: "function",
       function: {
+        name: "search_video_sites",
+        description:
+          "Search multiple video sites (YouTube/TikTok/Douyin/Kuaishou/Vimeo/etc). Returns candidate IDs (videos).",
+        parameters: {
+          type: "object",
+          properties: {
+            query: { type: "string" },
+            num_results: { type: "number", description: "1-20" },
+            sites: {
+              type: "array",
+              description: "Optional site domain allowlist, e.g. [\"youtube.com\",\"tiktok.com\"].",
+              items: { type: "string" },
+            },
+          },
+          required: ["query"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
         name: "search_web",
         description: "General web search. Returns candidate IDs (links).",
         parameters: {
@@ -2227,6 +2248,7 @@ async function execToolCall(
     const hasSite = /\bsite:/i.test(q);
     if (!hasSite) q = `${q} site:bilibili.com/video`;
 
+    emitChatStage({ stage: "search_query", detail: `bilibili: ${q}` });
     const { results } = await webSearch({
       query: q,
       numResults: Math.min(20, numResults),
@@ -2262,6 +2284,85 @@ async function execToolCall(
     };
   }
 
+  if (name === "search_video_sites") {
+    const consent = await getConsent(state.projectId);
+    if (!consent?.consented) {
+      return {
+        toolMessage: { role: "tool", tool_call_id: call.id, name, content: JSON.stringify({ ok: false, needs_consent: true }) },
+        candidates: [],
+        needsConsent: true,
+      };
+    }
+
+    const query = str(argsObj?.query);
+    const numResults = Math.max(1, Math.min(20, Math.floor(Number(argsObj?.num_results || 10))));
+    const sitesRaw = Array.isArray(argsObj?.sites) ? (argsObj.sites as any[]).map((s) => str(s).toLowerCase()).filter(Boolean) : [];
+    const sites = sitesRaw.length > 0
+      ? sitesRaw
+      : ["youtube.com", "youtu.be", "tiktok.com", "douyin.com", "kuaishou.com", "vimeo.com", "dailymotion.com"];
+
+    const subQueries: Array<{ site: string; q: string }> = [];
+    const push = (site: string, q: string) => {
+      const s = str(site).toLowerCase();
+      const qq = str(q);
+      if (!s || !qq) return;
+      subQueries.push({ site: s, q: qq });
+    };
+
+    for (const s of sites) {
+      if (s === "youtube.com" || s === "youtu.be") {
+        push("youtube.com", `${query} site:youtube.com (inurl:watch OR inurl:shorts)`);
+        continue;
+      }
+      push(s, `${query} site:${s}`);
+    }
+
+    const candidateByUrl = new Map<string, AgentCandidate>();
+    const candidatesOut: Array<{ id: string; url: string; title: string; snippet?: string | null }> = [];
+
+    const perSite = Math.max(3, Math.min(8, Math.ceil(numResults / Math.max(1, subQueries.length))));
+    for (const sq of subQueries) {
+      if (candidatesOut.length >= numResults) break;
+      emitChatStage({ stage: "search_query", detail: `video: ${sq.q}` });
+      const { results } = await webSearch({
+        query: sq.q,
+        numResults: Math.min(10, perSite),
+        googleApiKey: state.googleCseApiKey,
+        googleCx: state.googleCseCx,
+        exaApiKey: state.exaApiKey,
+        prefer: str(state.googleCseApiKey) && str(state.googleCseCx) ? "google_cse" : "exa",
+      });
+
+      for (const r of results) {
+        if (candidatesOut.length >= numResults) break;
+        const url = str(r.url);
+        const lower = url.toLowerCase();
+        if (!url) continue;
+        if (!isLikelyVideoUrl(url)) continue;
+        // Skip common non-video article pages even if hosted on a video platform.
+        if (lower.includes("/read") || lower.includes("/opus") || lower.includes("/article") || lower.includes("/blog")) continue;
+        const id = candidateId("video", url);
+        if (candidateByUrl.has(url)) continue;
+        const title = str(r.title) || url;
+        const snippet = typeof r.snippet === "string" ? r.snippet : null;
+        const cand: AgentCandidate = { id, kind: "video", url, title, snippet };
+        candidateByUrl.set(url, cand);
+        outCandidates.push(cand);
+        candidatesOut.push({ id, url, title, snippet });
+      }
+    }
+
+    return {
+      toolMessage: {
+        role: "tool",
+        tool_call_id: call.id,
+        name,
+        content: JSON.stringify({ ok: true, query, sites, candidates: candidatesOut }),
+      },
+      candidates: outCandidates,
+    };
+  }
+
   if (name === "search_web") {
     const consent = await getConsent(state.projectId);
     if (!consent?.consented) {
@@ -2274,6 +2375,7 @@ async function execToolCall(
 
     const query = str(argsObj?.query);
     const numResults = Math.max(1, Math.min(20, Math.floor(Number(argsObj?.num_results || 10))));
+    emitChatStage({ stage: "search_query", detail: `web: ${query}` });
     const { results } = await webSearch({
       query,
       numResults: Math.min(20, numResults),
@@ -2314,6 +2416,7 @@ async function execToolCall(
       };
     }
 
+    emitChatStage({ stage: "resolve", detail: url });
     const consent = await getConsent(state.projectId);
     if (!consent?.consented) {
       return {
@@ -2379,8 +2482,14 @@ async function chatToolAgentInitNode(state: ChatToolAgentGraphState) {
     "- If tools report needs_consent, stop and output JSON reply asking the user to confirm external content access.",
     "Tool choice guidance:",
     "- search_bilibili_videos: bilibili video discovery.",
+    "- search_video_sites: other video sites discovery (YouTube/TikTok/Douyin/Kuaishou/Vimeo/etc).",
     "- search_web: general web discovery.",
     "- resolve_url: fetch title/thumbnail/description/duration (requires consent).",
+    "",
+    "Default search strategy (maximize hit-rate):",
+    "- If intent includes videos: start with search_bilibili_videos (Chinese) then search_video_sites (external/variety), then resolve_url for top candidates.",
+    "- If intent includes audio/BGM/voiceover/SFX: use search_web with explicit site hints (e.g. freesound/pixabay/mixkit) and resolve_url for a few best links.",
+    "- Prefer video platforms by default unless user explicitly requests non-video-only assets.",
     "",
     "Output:",
     "- When you are ready to answer, output JSON ONLY (no markdown).",
@@ -2423,7 +2532,9 @@ async function chatToolAgentThinkNode(state: ChatToolAgentGraphState) {
     "Rules:",
     "- Do not rewrite the user's message; extract intent/constraints only.",
     "- If user mentions B站视频/BV, platform_preference should be bilibili.",
+    "- If user wants broad sources ('全部/外站/全网/不限平台'), set platform_preference=mixed but keep video platforms as first priority.",
     "- If user mentions licensing (免版权/可商用), include it in constraints and mention uncertainty in assumptions (do not claim verified license).",
+    "- tool_strategy should explicitly list the tool calls you plan (e.g. search_bilibili_videos -> search_video_sites -> resolve_url).",
   ].join("\n");
 
   const userText = String(state.userText || "");
@@ -2581,6 +2692,7 @@ async function chatToolAgentReviewNode(state: ChatToolAgentGraphState) {
           "REVIEW step.",
           "Evaluate whether current candidates match the user's creative intent.",
           "If not enough and remaining passes > 0, call ONE tool with a refined query to improve relevance/diversity.",
+          "- For video intent or when user asked for off-site sources, prefer search_video_sites (or search_bilibili_videos) over generic search_web.",
           "If enough OR remaining passes == 0, output JSON ONLY with { reply, select, scorecard, dedupe_groups } (no markdown) and stop calling tools.",
           "Avoid duplicates / near-duplicates in select.",
           'scorecard schema: { [id: string]: { score?: number (0..1), tags?: string[], reason?: string } }',
@@ -3104,7 +3216,7 @@ async function handleChatTurn(projectId: string, body: any) {
     ? {
         action: "chat_tool_agent",
         loop: { max_passes: TOOL_AGENT_MAX_PASSES },
-        tools: ["search_bilibili_videos", "search_web", "resolve_url"],
+        tools: ["search_bilibili_videos", "search_video_sites", "search_web", "resolve_url"],
       }
     : null;
   const planArtifact = plan ? await maybeStorePlan(pid, "chat-tool-agent", plan) : null;
