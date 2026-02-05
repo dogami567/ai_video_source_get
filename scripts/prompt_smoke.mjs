@@ -120,8 +120,9 @@ async function main() {
   const chat = await fetchJson(`${toolBase}/projects/${projectId}/chats`, { method: "POST", body: JSON.stringify({ title: "default" }) });
   const chatId = String(chat.id);
 
-  const message =
+  const defaultMessage =
     "我要做b站up主“笔给你你来写”那种风格的视频，想要大概五分钟的画面素材，然后帮我找下他的ai配音（哈基米配音）一般是从哪弄的，比较简单和免费的，bgm也选哈基米好了。";
+  const message = String(process.argv.slice(2).join(" ") || "").trim() || defaultMessage;
 
   const out = await fetchJson(`${orchBase}/api/projects/${projectId}/chat/turn`, {
     method: "POST",
@@ -144,12 +145,13 @@ async function main() {
       const raw = await fetch(`${toolBase}/projects/${projectId}/artifacts/${debugArtifact.id}/raw`);
       const text = await raw.text();
       const parsed = JSON.parse(text);
-      const baseUrl = parsed?.model?.base_url || "";
-      const useNative = !!parsed?.model?.use_gemini_native;
+      const baseUrl = parsed?.base_url || parsed?.model?.base_url || "";
+      const useNative =
+        parsed?.provider ? String(parsed.provider) === "gemini_native" : !!parsed?.model?.use_gemini_native;
       console.log("\n=== Debug (model) ===");
       console.log(`base_url=${baseUrl}`);
       console.log(`use_gemini_native=${useNative}`);
-      console.log(`mode=${parsed?.mode || ""}`);
+      console.log(`mode=${parsed?.mode || parsed?.provider || ""}`);
       console.log(`tool_agent.pass=${parsed?.tool_agent?.pass || 0}, iterations=${parsed?.tool_agent?.iterations || 0}`);
       console.log(`candidates=${Array.isArray(parsed?.tool_agent?.candidates) ? parsed.tool_agent.candidates.length : 0}`);
       const finalReply = parsed?.tool_agent?.final?.reply || "";

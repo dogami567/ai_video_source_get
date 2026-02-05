@@ -1904,6 +1904,15 @@ async function chatTurnDoSearchAndResolveNode(state: ChatTurnGraphState) {
     pushRound("alt", q);
   }
 
+  const searchErrors: string[] = [];
+  const recordSearchError = (msg: string) => {
+    const m = str(msg);
+    if (!m) return;
+    if (searchErrors.includes(m)) return;
+    if (searchErrors.length >= 3) return;
+    searchErrors.push(m);
+  };
+
   for (const { query } of rounds.slice(0, maxRounds)) {
     emitChatStage({ stage: "search_query", detail: query });
     let results: WebSearchResult[] = [];
@@ -1921,8 +1930,10 @@ async function chatTurnDoSearchAndResolveNode(state: ChatTurnGraphState) {
           ).results;
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      agentPlan.reply = `${ensureUserFacingReplyText(agentPlan.reply)}\n\n搜索失败：${msg}\n\n建议：\n- 在 Settings 配置 Exa API Key（或 Google CSE）进行稳定的全网搜索；或\n- 直接把该 UP 主主页 / BV 链接贴给我，我可以基于参考视频继续找同类素材。`;
-      return { agentPlan, blocks, videos, directResolveCache, searchPass: nextSearchPass };
+      recordSearchError(msg);
+      const biliBlocked = allowBilibiliOnly && /HTTP\s*412|risk control|风控|banned/i.test(msg);
+      if (biliBlocked) break;
+      continue;
     }
     if (results.length === 0) continue;
 
@@ -1960,6 +1971,54 @@ async function chatTurnDoSearchAndResolveNode(state: ChatTurnGraphState) {
 
   const rankedVideos = Array.from(videoCandidatesByUrl.values()).sort((a, b) => b.score - a.score);
   const rankedLinks = Array.from(linkCandidatesByUrl.values()).sort((a, b) => b.score - a.score);
+
+  if (rankedVideos.length === 0 && rankedLinks.length === 0) {
+    const biliSearchUrl = (q: string) => `https://search.bilibili.com/all?keyword=${encodeURIComponent(q)}`;
+    const ytSearchUrl = (q: string) => `https://www.youtube.com/results?search_query=${encodeURIComponent(q)}`;
+
+    const qs = uniqStrings([
+      "笔给你你来写",
+      "哈基米 配音 免费 教程",
+      "哈基米 BGM 纯音乐",
+      "5分钟 画面素材 B-roll",
+    ]);
+
+    const links: ChatLinkCard[] = [];
+    for (const q of qs.slice(0, 4)) {
+      links.push({ url: biliSearchUrl(q), title: `B站搜索：${q}`, snippet: "点开后直接在浏览器里筛选最合适的结果。" });
+    }
+    links.push({
+      url: ytSearchUrl(`${qs[0] || "笔给你你来写"} 参考 风格`),
+      title: "YouTube 搜索：风格参考",
+      snippet: "站外补搜（需要的话可在 Settings 配 Exa/Google 让它自动化）。",
+    });
+
+    const hasLinks = blocks.some((b) => b && typeof b === "object" && (b as any).type === "links");
+    if (!hasLinks) blocks.push({ type: "links", links });
+    if (hasLinks) {
+      for (const b of blocks) {
+        if (b && typeof b === "object" && (b as any).type === "links") {
+          (b as any).links = links;
+          break;
+        }
+      }
+    }
+
+    const prefix = ensureUserFacingReplyText(agentPlan.reply);
+    const errHint = searchErrors.length > 0 ? `\n\n（本轮搜索失败：${searchErrors[0]}）` : "";
+    agentPlan.reply = [
+      prefix,
+      "",
+      "我这边暂时没能拿到可直接渲染成卡片的搜索结果（常见原因：B 站接口触发风控、或未配置 Exa/Google 搜索）。",
+      "你可以先点下面这些“搜索入口链接”直接打开筛选；或者把该 UP 主主页 / 任意 BV 链接贴给我，我就能基于参考视频继续找同类素材。",
+      noWebProvider ? "（建议：Settings 里配置 Exa API Key 或 Google CSE，可显著提高命中率并支持站外多轮搜索。）" : "",
+      errHint,
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    return { agentPlan, blocks, videos, directResolveCache, searchPass: nextSearchPass };
+  }
 
   const selected: typeof rankedVideos = [];
   const selectedKeys = new Set<string>();
@@ -3277,6 +3336,10 @@ async function handleChatTurn(projectId: string, body: any) {
       `<svg xmlns="http://www.w3.org/2000/svg" width="320" height="180"><rect width="100%" height="100%" fill="#F2F2F7"/><text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" font-family="Arial" font-size="20" fill="#1D1D1F">Video</text></svg>`,
     );
     const intent = detectChatSearchIntent(userText);
+    const wantsFootage = /画面|素材|b-roll|镜头|五分钟|5分钟|5\s*min/i.test(userText);
+    const wantsVoice = /配音|旁白|tts|声音|哈基米/i.test(userText);
+    const wantsBgm = /bgm|配乐|音乐|哈基米/i.test(userText);
+    const multiAsset = intent === "video" && wantsFootage && (wantsVoice || wantsBgm);
     const detectedUrls = extractHttpUrls(userText, 2);
     const url1 = detectedUrls[0] || "https://www.bilibili.com/video/BV1xx411c7mD";
     const url2 = detectedUrls[1] || "https://www.bilibili.com/video/BV1yy411c7mE";
@@ -3321,9 +3384,30 @@ async function handleChatTurn(projectId: string, body: any) {
       },
     ];
 
-    const assistantMessage = await createChatMessage(pid, chatId, "assistant", "我先给你两条示例卡片（mock 模式）。", {
-      blocks: [{ type: "videos", videos }],
-    });
+    const blocks: any[] = [{ type: "videos", videos }];
+    if (multiAsset) {
+      const links: ChatLinkCard[] = [
+        {
+          url: "https://search.bilibili.com/all?keyword=%E5%93%88%E5%9F%BA%E7%B1%B3%20%E9%85%8D%E9%9F%B3%20%E5%85%8D%E8%B4%B9%20%E6%95%99%E7%A8%8B",
+          title: "Mock: 哈基米配音（免费教程）",
+          snippet: "（E2E mock）用于验证“视频 + 资源链接”同屏渲染。",
+        },
+        {
+          url: "https://search.bilibili.com/all?keyword=%E5%93%88%E5%9F%BA%E7%B1%B3%20BGM%20%E7%BA%AF%E9%9F%B3%E4%B9%90",
+          title: "Mock: 哈基米 BGM（纯音乐）",
+          snippet: "（E2E mock）第二条资源链接卡片。",
+        },
+      ];
+      blocks.push({ type: "links", links });
+    }
+
+    const assistantMessage = await createChatMessage(
+      pid,
+      chatId,
+      "assistant",
+      multiAsset ? "我先给你两条示例视频卡片 + 两条资源链接（mock 模式）。" : "我先给你两条示例卡片（mock 模式）。",
+      { blocks },
+    );
     return { ok: true, user_message: userMessage, assistant_message: assistantMessage, mock: true };
   }
 
